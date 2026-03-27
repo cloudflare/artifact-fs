@@ -15,6 +15,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/gitstore"
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 	"github.com/cloudflare/artifact-fs/internal/registry"
@@ -33,6 +34,12 @@ type Service struct {
 	git                  *gitstore.Store
 	mu                   sync.Mutex
 	running              map[model.RepoID]*repoRuntime
+	mountFailures        map[model.RepoID]*mountFailure
+}
+
+type mountFailure struct {
+	lastAttempt time.Time
+	backoff     time.Duration
 }
 
 type repoRuntime struct {
@@ -52,11 +59,12 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		return nil, err
 	}
 	return &Service{
-		root:     root,
-		logger:   logger,
-		registry: reg,
-		git:      gitstore.New(logger),
-		running:  map[model.RepoID]*repoRuntime{},
+		root:          root,
+		logger:        logger,
+		registry:      reg,
+		git:           gitstore.New(logger),
+		running:       map[model.RepoID]*repoRuntime{},
+		mountFailures: map[model.RepoID]*mountFailure{},
 	}, nil
 }
 
@@ -132,9 +140,25 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		if running {
 			continue
 		}
+		if mf, ok := s.mountFailures[repo.ID]; ok && time.Since(mf.lastAttempt) < mf.backoff {
+			continue
+		}
 		s.logger.Info("mounting repo", "repo", repo.Name)
 		if err := s.mountRepo(ctx, repo); err != nil {
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", err)
+			mf := s.mountFailures[repo.ID]
+			if mf == nil {
+				mf = &mountFailure{}
+				s.mountFailures[repo.ID] = mf
+			}
+			mf.lastAttempt = time.Now()
+			if mf.backoff == 0 {
+				mf.backoff = 30 * time.Second
+			} else {
+				mf.backoff = min(mf.backoff*2, 5*time.Minute)
+			}
+		} else {
+			delete(s.mountFailures, repo.ID)
 		}
 	}
 
@@ -150,6 +174,12 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	for _, id := range stale {
 		s.logger.Info("unmounting removed repo", "repo", id)
 		s.unmount(id)
+		delete(s.mountFailures, id)
+	}
+	for id := range s.mountFailures {
+		if !registered[id] {
+			delete(s.mountFailures, id)
+		}
 	}
 
 	return nil
@@ -214,12 +244,14 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 	// If we're the running daemon, use in-memory state.
 	s.mu.Lock()
 	rt, ok := s.running[cfg.ID]
-	s.mu.Unlock()
 	if ok {
 		dirty, _ := rt.overlay.DirtyCount(ctx)
 		rt.state.DirtyOverlay = dirty > 0
-		return rt.state, nil
+		st := rt.state // copy under lock
+		s.mu.Unlock()
+		return st, nil
 	}
+	s.mu.Unlock()
 
 	// One-shot CLI process: reconstruct state from persisted stores and
 	// OS-level mount check since we don't share memory with the daemon.
@@ -237,10 +269,14 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 	}
 
 	if cfg.OverlayDBPath != "" {
-		if ov, err := overlay.New(ctx, cfg); err == nil {
-			dirty, _ := ov.DirtyCount(ctx)
-			st.DirtyOverlay = dirty > 0
-			ov.Close()
+		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
+			if db, err := meta.OpenDB(cfg.OverlayDBPath); err == nil {
+				var count int64
+				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`).Scan(&count); err == nil {
+					st.DirtyOverlay = count > 0
+				}
+				db.Close()
+			}
 		}
 	}
 
@@ -344,15 +380,18 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if err != nil || gen == 0 {
 		nodes, bErr := s.git.BuildTreeIndex(ctx, cfg, headOID)
 		if bErr != nil {
+			snap.Close()
 			return bErr
 		}
 		gen, err = snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes)
 		if err != nil {
+			snap.Close()
 			return err
 		}
 	}
 	ov, err := overlay.New(ctx, cfg)
 	if err != nil {
+		snap.Close()
 		return err
 	}
 	h := hydrator.New(s.git)
