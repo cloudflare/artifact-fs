@@ -1,0 +1,305 @@
+package overlay
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/meta"
+	"github.com/cloudflare/artifact-fs/internal/model"
+)
+
+var migrations = []string{
+	`CREATE TABLE IF NOT EXISTS overlay_entries (
+	  path TEXT PRIMARY KEY,
+	  kind TEXT NOT NULL,
+	  backing_path TEXT,
+	  mode INTEGER NOT NULL,
+	  size_bytes INTEGER NOT NULL DEFAULT 0,
+	  mtime_unix_ns INTEGER NOT NULL,
+	  source_oid TEXT,
+	  target_path TEXT
+	);`,
+	`CREATE INDEX IF NOT EXISTS idx_overlay_kind ON overlay_entries(kind);`,
+}
+
+type Store struct {
+	db       *sql.DB
+	repo     model.RepoConfig
+	upperDir string
+}
+
+func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
+	db, err := meta.OpenDB(cfg.OverlayDBPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
+		return nil, err
+	}
+	upperDir := filepath.Join(cfg.OverlayDir, "upper")
+	if err := os.MkdirAll(upperDir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.OverlayDir, "whiteouts"), 0o755); err != nil {
+		return nil, err
+	}
+	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Get(path string) (model.OverlayEntry, bool) {
+	row := s.db.QueryRow(`SELECT path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path FROM overlay_entries WHERE path=?`, model.CleanPath(path))
+	var e model.OverlayEntry
+	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+		return model.OverlayEntry{}, false
+	}
+	e.RepoID = s.repo.ID
+	return e, true
+}
+
+func (s *Store) HasWhiteout(path string) bool {
+	e, ok := s.Get(path)
+	return ok && e.Kind == "delete"
+}
+
+// EnsureCopyOnWrite promotes a base file into the overlay. If the blob is not
+// cached, an empty overlay file is created and the caller must hydrate first.
+func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+	if e, ok := s.Get(path); ok && e.Kind != "delete" {
+		return e, nil
+	}
+	backing := s.backingPath(path)
+	if err := os.MkdirAll(filepath.Dir(backing), 0o755); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	tmp := backing + ".tmp"
+	if err := os.WriteFile(tmp, nil, os.FileMode(base.Mode)); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	if base.ObjectOID != "" {
+		cachePath := filepath.Join(repo.BlobCacheDir, base.ObjectOID)
+		if err := copyFileContents(cachePath, tmp, os.FileMode(base.Mode)); err != nil && !os.IsNotExist(err) {
+			os.Remove(tmp)
+			return model.OverlayEntry{}, fmt.Errorf("copy-on-write %s: %w", path, err)
+		}
+		// If the cache file doesn't exist yet, the overlay starts empty and
+		// the caller must hydrate before writing.
+	}
+	if err := os.Rename(tmp, backing); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: "modify", BackingPath: backing, Mode: base.Mode, MtimeUnixNs: time.Now().UnixNano(), SourceOID: base.ObjectOID}
+	if err := s.upsertEntry(ctx, e); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	return e, nil
+}
+
+func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model.OverlayEntry, error) {
+	backing := s.backingPath(path)
+	if err := os.MkdirAll(filepath.Dir(backing), 0o755); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	if err := os.WriteFile(backing, nil, os.FileMode(mode)); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: "create", BackingPath: backing, Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	if err := s.upsertEntry(ctx, e); err != nil {
+		return model.OverlayEntry{}, err
+	}
+	return e, nil
+}
+
+func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error) {
+	e, ok := s.Get(path)
+	if !ok || e.Kind == "delete" {
+		return 0, os.ErrNotExist
+	}
+	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	n, err := f.WriteAt(data, off)
+	if err != nil {
+		return n, err
+	}
+	st, _ := f.Stat()
+	e.SizeBytes = st.Size()
+	e.MtimeUnixNs = time.Now().UnixNano()
+	if e.Kind != "create" {
+		e.Kind = "modify"
+	}
+	return n, s.upsertEntry(ctx, e)
+}
+
+func (s *Store) Remove(ctx context.Context, path string) error {
+	path = model.CleanPath(path)
+	if e, ok := s.Get(path); ok && e.BackingPath != "" {
+		_ = os.Remove(e.BackingPath)
+	}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: "delete", Mode: 0, MtimeUnixNs: time.Now().UnixNano()}
+	return s.upsertEntry(ctx, e)
+}
+
+func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
+	oldPath = model.CleanPath(oldPath)
+	newPath = model.CleanPath(newPath)
+	e, ok := s.Get(oldPath)
+	if !ok || e.Kind == "delete" {
+		return os.ErrNotExist
+	}
+	newBacking := s.backingPath(newPath)
+	if err := os.MkdirAll(filepath.Dir(newBacking), 0o755); err != nil {
+		return err
+	}
+	// DB transaction first, then filesystem rename. If the DB commit fails,
+	// nothing has moved on disk and the overlay remains consistent.
+	now := time.Now().UnixNano()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, oldPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, newPath, "rename", newBacking, e.Mode, e.SizeBytes, now, e.SourceOID, newPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns`, oldPath, "delete", "", 0, 0, now, "", ""); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Filesystem rename after successful commit.
+	if e.BackingPath != "" {
+		if err := os.Rename(e.BackingPath, newBacking); err != nil {
+			// DB is committed but file didn't move. Attempt to roll back the DB
+			// state. If this also fails, the overlay is inconsistent -- logged
+			// upstream by the daemon.
+			s.db.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath)
+			s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, oldPath, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.SourceOID, e.TargetPath)
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
+	path = model.CleanPath(path)
+	if err := os.MkdirAll(s.backingPath(path), os.FileMode(mode)); err != nil {
+		return err
+	}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: "mkdir", BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	return s.upsertEntry(ctx, e)
+}
+
+func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
+	path = model.CleanPath(path)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE overlay_entries SET mtime_unix_ns=? WHERE path=?`,
+		t.UnixNano(), path)
+	return err
+}
+
+func (s *Store) Reconcile(_ context.Context, _ int64) error {
+	// Intentional no-op: overlay entries are kept across generations and cleaned
+	// only by explicit operations (Remove, Rename). A future reconciliation
+	// strategy may prune entries whose base node was deleted upstream.
+	return nil
+}
+
+func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`)
+	var c int64
+	err := row.Scan(&c)
+	return c, err
+}
+
+// ListByPrefix returns overlay entries that are direct children of the given
+// directory path. Uses path + "/" prefix to avoid matching sibling directories.
+func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
+	prefix = model.CleanPath(prefix)
+	var pattern string
+	if prefix == "." {
+		// Root: match all entries
+		pattern = "%"
+	} else {
+		pattern = prefix + "/%"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path FROM overlay_entries WHERE path LIKE ? ORDER BY path`, pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.OverlayEntry
+	for rows.Next() {
+		var e model.OverlayEntry
+		if err := rows.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+			return nil, err
+		}
+		e.RepoID = s.repo.ID
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
+	if e.Path == "" {
+		return errors.New("empty path")
+	}
+	_, err := s.db.ExecContext(ctx, `
+	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path)
+	VALUES(?,?,?,?,?,?,?,?)
+	ON CONFLICT(path) DO UPDATE SET
+	kind=excluded.kind,
+	backing_path=excluded.backing_path,
+	mode=excluded.mode,
+	size_bytes=excluded.size_bytes,
+	mtime_unix_ns=excluded.mtime_unix_ns,
+	source_oid=excluded.source_oid,
+	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.SourceOID, e.TargetPath)
+	return err
+}
+
+// copyFileContents copies src into dst, truncating dst first. Returns
+// os.ErrNotExist if src doesn't exist so the caller can decide whether that's
+// fatal. Other errors (permissions, I/O) are returned as-is.
+func copyFileContents(src string, dst string, mode os.FileMode) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tf, err := os.OpenFile(dst, os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(tf, f); err != nil {
+		tf.Close()
+		return err
+	}
+	if err := tf.Sync(); err != nil {
+		tf.Close()
+		return err
+	}
+	return tf.Close()
+}
+
+func (s *Store) backingPath(path string) string {
+	clean := model.CleanPath(path)
+	return filepath.Join(s.upperDir, clean)
+}
+
+func (s *Store) String() string {
+	return fmt.Sprintf("overlay[%s]", s.repo.Name)
+}
