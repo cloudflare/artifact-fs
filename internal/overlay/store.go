@@ -99,7 +99,20 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 	if err := os.Rename(tmp, backing); err != nil {
 		return model.OverlayEntry{}, err
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: "modify", BackingPath: backing, Mode: base.Mode, MtimeUnixNs: time.Now().UnixNano(), SourceOID: base.ObjectOID}
+	st, err := os.Stat(backing)
+	if err != nil {
+		return model.OverlayEntry{}, err
+	}
+	e := model.OverlayEntry{
+		RepoID:      s.repo.ID,
+		Path:        model.CleanPath(path),
+		Kind:        "modify",
+		BackingPath: backing,
+		Mode:        base.Mode,
+		SizeBytes:   st.Size(),
+		MtimeUnixNs: time.Now().UnixNano(),
+		SourceOID:   base.ObjectOID,
+	}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		return model.OverlayEntry{}, err
 	}

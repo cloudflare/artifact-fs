@@ -109,9 +109,6 @@ func TestE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Platform-specific git safe.directory config
-	configGitSafeDir(t, mountPath)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -490,7 +487,7 @@ func readFileStr(t *testing.T, path string) string {
 
 func gitCmd(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", gitArgsWithSafeDirectory(dir, args...)...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -499,6 +496,17 @@ func gitCmd(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %s failed: %v\nstderr: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return stdout.String()
+}
+
+func gitArgsWithSafeDirectory(dir string, args ...string) []string {
+	if dir == "" {
+		return args
+	}
+	out := []string{"-c", "safe.directory=" + dir}
+	if strings.HasPrefix(dir, "/tmp/") {
+		out = append(out, "-c", "safe.directory=/private"+dir)
+	}
+	return append(out, args...)
 }
 
 func assertContains(t *testing.T, items []string, want string) {

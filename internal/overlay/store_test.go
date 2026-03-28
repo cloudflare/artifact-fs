@@ -117,6 +117,41 @@ func TestRenameDBFirst(t *testing.T) {
 	if string(data) != "content" {
 		t.Fatalf("got %q, want %q", data, "content")
 	}
+	if got.SizeBytes != int64(len("content")) {
+		t.Fatalf("size = %d, want %d", got.SizeBytes, len("content"))
+	}
+}
+
+func TestEnsureCopyOnWritePreservesSize(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+
+	const oid = "abc123"
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := s.EnsureCopyOnWrite(ctx, cfg, "tracked.txt", model.BaseNode{
+		RepoID:    cfg.ID,
+		Path:      "tracked.txt",
+		Type:      "file",
+		Mode:      0o644,
+		ObjectOID: oid,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.SizeBytes != int64(len("payload")) {
+		t.Fatalf("size = %d, want %d", e.SizeBytes, len("payload"))
+	}
+
+	got, ok := s.Get("tracked.txt")
+	if !ok {
+		t.Fatal("expected tracked.txt entry")
+	}
+	if got.SizeBytes != int64(len("payload")) {
+		t.Fatalf("stored size = %d, want %d", got.SizeBytes, len("payload"))
+	}
 }
 
 func TestMkdir(t *testing.T) {
