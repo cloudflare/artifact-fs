@@ -25,8 +25,16 @@ Requires Go 1.24+ and a FUSE implementation:
 - **macOS** -- [macFUSE](https://osxfuse.github.io/)
 - **Linux** -- `fuse3` (`apt install fuse3` on Debian/Ubuntu, `dnf install fuse3` on Fedora)
 
+Install the CLI from the module:
+
 ```bash
-go build -o artifact-fs ./cmd/artifact-fs
+go install github.com/cloudflare/artifact-fs/cmd/artifact-fs@latest
+```
+
+Or build it directly from the module path:
+
+```bash
+go build -o artifact-fs github.com/cloudflare/artifact-fs/cmd/artifact-fs
 ```
 
 Quick start against a public repo:

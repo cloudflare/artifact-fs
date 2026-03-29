@@ -3,7 +3,7 @@ module github.com/cloudflare/artifact-fs
 go 1.24.0
 
 require (
-	github.com/jacobsa/fuse v0.0.0-00010101000000-000000000000
+	github.com/jacobsa/fuse v0.0.0-20260302145937-f1ba38d60fdf
 	github.com/urfave/cli v1.22.16
 	modernc.org/sqlite v1.39.1
 )
@@ -22,5 +22,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/jacobsa/fuse => github.com/vitalif/fusego v0.0.0-20241023174951-7a12c251bb93
