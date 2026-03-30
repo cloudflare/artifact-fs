@@ -1,0 +1,89 @@
+name: Low Quality Filter
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  label-summary-template:
+    runs-on: ubuntu-slim
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Label low-quality issue or PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const label = 'potential-low-quality-pr'
+            const now = Date.now()
+            const body = context.payload.issue?.body ?? context.payload.pull_request?.body ?? ''
+            const authorAssociation = context.payload.issue?.author_association ?? context.payload.pull_request?.author_association ?? ''
+            const login = context.payload.issue?.user?.login ?? context.payload.pull_request?.user?.login ?? context.payload.sender?.login
+            const isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(authorAssociation)
+            const isBot = context.payload.sender?.type === 'Bot'
+            const hasSummaryHeadingAtStart = /^\s*##?\s+Summary\b/.test(body)
+            const isPullRequest = Boolean(context.payload.pull_request)
+
+            let isLargeNewcomerPr = false
+
+            if (isPullRequest && login) {
+              const [{ data: user }, { data: pr }] = await Promise.all([
+                github.rest.users.getByUsername({
+                  username: login,
+                }),
+                github.rest.pulls.get({
+                  ...context.repo,
+                  pull_number: context.payload.pull_request.number,
+                }),
+              ])
+
+              const accountAgeDays = Math.floor((now - Date.parse(user.created_at)) / (1000 * 60 * 60 * 24))
+              const changedFiles = pr.changed_files ?? 0
+              const changedLines = (pr.additions ?? 0) + (pr.deletions ?? 0)
+
+              isLargeNewcomerPr = accountAgeDays < 90 && changedFiles > 10 && changedLines > 1000
+
+              core.info(
+                `PR heuristics: age_days=${accountAgeDays} changed_files=${changedFiles} changed_lines=${changedLines} large_newcomer=${isLargeNewcomerPr}`,
+              )
+            }
+
+            if (isBot || isMaintainer || (!hasSummaryHeadingAtStart && !isLargeNewcomerPr)) {
+              core.info(
+                `Skipping label. bot=${isBot} association=${authorAssociation || 'unknown'} summary_start=${hasSummaryHeadingAtStart} large_newcomer=${isLargeNewcomerPr}`,
+              )
+              return
+            }
+
+            try {
+              await github.rest.issues.getLabel({
+                ...context.repo,
+                name: label,
+              })
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error
+              }
+
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: label,
+                color: 'd93f0b',
+                description: 'Summary-template issue/PR or large PR from a new account',
+              })
+            }
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.issue.number,
+              labels: [label],
+            })
+
+            core.info(`Applied ${label} to #${context.issue.number}`)

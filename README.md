@@ -275,6 +275,14 @@ AFS_RUN_E2E_TESTS=1 \
 
 ## Contributing
 
+Contributions are welcome, but not all contributions will be accepted. As guidance:
+
+1. **Ensure you open an issue describing your change** - why it's a problem, how to reproduce it (if it's a bug)
+2. **Your PR should be clear and concise** - including why it should be upstreamed.
+3. **You are expected to have self-reviewed** - any PRs that are straight from automation with glaring issues, that don't build, or don't add good tests are likely to be closed.
+
+AI/LLM submissions are welcome, but overall issue/PR quality is ultimately the responsibility of the submitter, and the codebase is the responsibility (and long term maintenance burden) of the maintainers.
+
 See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Run `go test ./...` and `go vet ./...` before submitting changes.
 
 ## Credits
