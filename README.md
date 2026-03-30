@@ -8,7 +8,7 @@
 
 ArtifactFS is a Git-backed filesystem daemon (FUSE driver) in Go that mounts repositories as normal working trees while avoiding eager blob downloads.
 
-It is designed to allow fast clones that can hydrate and stream in files on-the-fly, enabling operations over the repo without blocking on the entire clone. This is especially advantageous for agents, sandboxes and ad-hoc operations over git repositories where "cold start" performance is critical.
+**It is designed to allow fast clones that can hydrate and stream in files on-the-fly, enabling operations over the repo without blocking on the entire clone. This is especially advantageous for agents, sandboxes and ad-hoc operations over git repositories where "cold start" performance is critical.**
 
 Notably:
 
