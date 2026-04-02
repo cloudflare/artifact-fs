@@ -20,9 +20,9 @@ Notably:
 
 ## What are Cloudflare Artifacts?
 
-[Cloudflare Artifacts](https://workers.cloudflare.com/product/artifacts) is a versioned filesystem that speaks git. Create a repo per user, per agent session, per sandbox... as many as you need. 
+[Cloudflare Artifacts](https://workers.cloudflare.com/product/artifacts) is a versioned filesystem that speaks git. Create a repo per user, per agent session, per sandbox... as many as you need. It's designed for agent toolchains, sandboxes, and CI/CD systems that need fast, scalable access to code repositories.
 
-It's designed for agent toolchains, sandboxes, and CI/CD systems that need fast, scalable access to code repositories. ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any git repo) as a local filesystem without waiting for a full clone.
+ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any git repo) as a local filesystem without waiting for a full clone.
 
 ## Build and Install
 

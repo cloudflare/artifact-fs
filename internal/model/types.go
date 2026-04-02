@@ -37,6 +37,8 @@ type RepoRuntimeState struct {
 	AheadCount         int
 	BehindCount        int
 	Diverged           bool
+	HydratedBlobCount  int64
+	HydratedBlobBytes  int64
 	DirtyOverlay       bool
 	State              string
 }

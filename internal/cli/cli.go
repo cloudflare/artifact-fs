@@ -102,10 +102,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(w, "repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s overlay_dirty=%t\n",
-				st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef,
-				st.AheadCount, st.BehindCount, st.Diverged,
-				st.LastFetchAt.Format(time.RFC3339), st.LastFetchResult, st.DirtyOverlay)
+			fmt.Fprintln(w, formatStatusLine(st))
 			return nil
 		}),
 		nameCommand("fetch", "fetch remote updates", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
@@ -216,6 +213,28 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 			return fn(ctx, svc, n, stdout)
 		}),
 	}
+}
+
+func formatStatusLine(st model.RepoRuntimeState) string {
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef,
+		st.AheadCount, st.BehindCount, st.Diverged,
+		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
+		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay)
+}
+
+func formatLastFetchAt(at time.Time) string {
+	if at.IsZero() {
+		return "never"
+	}
+	return at.Format(time.RFC3339)
+}
+
+func formatLastFetchResult(result string) string {
+	if strings.TrimSpace(result) == "" {
+		return "never"
+	}
+	return result
 }
 
 func stubCommand(name, usage string, stdout io.Writer) ucli.Command {

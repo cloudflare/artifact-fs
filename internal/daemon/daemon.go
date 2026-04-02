@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -257,7 +258,9 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		dirty, _ := rt.overlay.DirtyCount(ctx)
 		rt.state.DirtyOverlay = dirty > 0
 		st := rt.state // copy under lock
+		cfg = rt.cfg
 		s.mu.Unlock()
+		applyHydrationStats(&st, cfg.BlobCacheDir)
 		return st, nil
 	}
 	s.mu.Unlock()
@@ -477,7 +480,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig) model.RepoRuntimeState {
 	// One-shot CLI process: reconstruct state from persisted stores and
 	// OS-level mount check since we don't share memory with the daemon.
-	st := model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted"}
+	st := model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted", LastFetchResult: "never"}
 	if isMounted(cfg.MountPath) {
 		st.State = "mounted"
 	}
@@ -503,6 +506,7 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 		st.LastFetchAt = fi.ModTime()
 		st.LastFetchResult = "ok"
 	}
+	applyHydrationStats(&st, cfg.BlobCacheDir)
 	return st
 }
 
@@ -570,6 +574,7 @@ func newRuntimeState(repoID model.RepoID, headOID string, headRef string, gen in
 		CurrentHEADOID:     headOID,
 		CurrentHEADRef:     headRef,
 		SnapshotGeneration: gen,
+		LastFetchResult:    "never",
 		State:              "ready",
 	}
 }
@@ -602,6 +607,39 @@ func markFetchResult(st *model.RepoRuntimeState, at time.Time, result string) {
 func markFetchFailure(st *model.RepoRuntimeState, result string) {
 	st.State = "degraded"
 	st.LastFetchResult = result
+}
+
+func applyHydrationStats(st *model.RepoRuntimeState, cacheDir string) {
+	count, bytes := blobCacheStats(cacheDir)
+	st.HydratedBlobCount = count
+	st.HydratedBlobBytes = bytes
+}
+
+func blobCacheStats(cacheDir string) (int64, int64) {
+	if strings.TrimSpace(cacheDir) == "" {
+		return 0, 0
+	}
+	var count int64
+	var bytes int64
+	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		count++
+		bytes += info.Size()
+		return nil
+	})
+	return count, bytes
 }
 
 func (s *Service) unmount(id model.RepoID) {
