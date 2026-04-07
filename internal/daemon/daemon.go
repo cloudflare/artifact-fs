@@ -45,13 +45,14 @@ type mountFailure struct {
 
 type repoRuntime struct {
 	cfg      model.RepoConfig
+	ctx      context.Context
+	cancel   context.CancelFunc
 	snapshot *snapshot.Store
 	overlay  *overlay.Store
 	hydrator *hydrator.Service
 	resolver *fusefs.Resolver
 	mfs      fusefs.MountedFS
 	state    model.RepoRuntimeState
-	stop     chan struct{}
 }
 
 type aheadBehind struct {
@@ -309,50 +310,65 @@ func (s *Service) Unmount(ctx context.Context, name string) error {
 // start a FUSE mount or any background goroutines, so it's safe to call from
 // short-lived CLI commands like add-repo.
 func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
-	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
-		return err
-	}
-	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
-		return err
-	}
-	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	snap, _, _, _, err := s.ensurePreparedRepo(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer snap.Close()
-	_, err = s.publishHeadSnapshot(ctx, cfg, snap)
-	return err
+	return nil
+}
+
+// ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
+// The returned snapshot store remains open for callers that need to continue
+// into runtime startup.
+func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig) (*snapshot.Store, string, string, int64, error) {
+	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
+		return nil, "", "", 0, err
+	}
+	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
+		return nil, "", "", 0, err
+	}
+	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	storedOID, storedRef, gen, err := snap.ReadState(ctx)
+	if err != nil || gen == 0 || storedOID != headOID || storedRef != headRef {
+		gen, _, err = s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
+		if err != nil {
+			snap.Close()
+			return nil, "", "", 0, err
+		}
+	}
+	return snap, headOID, headRef, gen, nil
 }
 
 // mountRepo opens all stores, starts the FUSE server, watcher, and refresh
 // loop. Called by the daemon's Start for each registered repo.
 func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
-	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
-		return err
-	}
-	// Clone if not already present (idempotent)
-	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
-		return err
-	}
-	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+	snap, headOID, headRef, gen, err := s.ensurePreparedRepo(ctx, cfg)
 	if err != nil {
 		return err
-	}
-	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
-	if err != nil {
-		return err
-	}
-	gen, err := snap.CurrentGeneration(ctx)
-	if err != nil || gen == 0 {
-		var bErr error
-		gen, _, bErr = s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
-		if bErr != nil {
-			snap.Close()
-			return bErr
-		}
 	}
 	ov, err := overlay.New(ctx, cfg)
 	if err != nil {
+		snap.Close()
+		return err
+	}
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		return snap.GetNode(gen, path)
+	}
+	if err := ov.Reconcile(ctx, baseLookup); err != nil {
+		ov.Close()
+		snap.Close()
+		return err
+	}
+	if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
+		ov.Close()
 		snap.Close()
 		return err
 	}
@@ -378,18 +394,20 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		s.logger.Error("fuse mount failed, running without FUSE", "repo", cfg.Name, "error", err)
 		mfs = nil
 	}
+	runtimeCtx, cancel := context.WithCancel(ctx)
 
 	rt := &repoRuntime{
 		cfg:      cfg,
+		ctx:      runtimeCtx,
+		cancel:   cancel,
 		snapshot: snap,
 		overlay:  ov,
 		hydrator: h,
 		resolver: resolver,
 		mfs:      mfs,
 		state:    newRuntimeState(cfg.ID, headOID, headRef, gen),
-		stop:     make(chan struct{}),
 	}
-	s.startRuntime(ctx, rt)
+	s.startRuntime(rt)
 
 	return nil
 }
@@ -402,8 +420,18 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	}
 	s.mu.Lock()
 	prevOID := rt.state.CurrentHEADOID
+	prevRef := rt.state.CurrentHEADRef
 	s.mu.Unlock()
 	if oid == prevOID {
+		if ref == prevRef {
+			return
+		}
+		if err := rt.snapshot.UpdateHEADRef(ctx, ref); err != nil {
+			s.logger.Warn("snapshot head_ref update failed", "repo", rt.cfg.Name, "error", err)
+		}
+		s.mu.Lock()
+		rt.state.CurrentHEADRef = ref
+		s.mu.Unlock()
 		return
 	}
 	gen, phase, err := s.publishSnapshot(ctx, rt.cfg, rt.snapshot, oid, ref)
@@ -444,10 +472,10 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-rt.stop:
+		case <-rt.ctx.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
 			err := s.git.Fetch(ctx, rt.cfg)
 			if err != nil {
 				s.mu.Lock()
@@ -510,15 +538,6 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 	return st
 }
 
-func (s *Service) publishHeadSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store) (int64, error) {
-	oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
-	if err != nil {
-		return 0, err
-	}
-	gen, _, err := s.publishSnapshot(ctx, cfg, snap, oid, ref)
-	return gen, err
-}
-
 func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
 	nodes, err := s.git.BuildTreeIndex(ctx, cfg, oid)
 	if err != nil {
@@ -547,7 +566,7 @@ func (s *Service) fetchState(ctx context.Context, cfg model.RepoConfig) (aheadBe
 	return aheadBehind{ahead: ahead, behind: behind, diverged: diverged}, nil
 }
 
-func (s *Service) startRuntime(ctx context.Context, rt *repoRuntime) {
+func (s *Service) startRuntime(rt *repoRuntime) {
 	s.mu.Lock()
 	s.running[rt.cfg.ID] = rt
 	s.mu.Unlock()
@@ -555,15 +574,13 @@ func (s *Service) startRuntime(ctx context.Context, rt *repoRuntime) {
 	go s.refreshLoop(rt)
 
 	w := watcher.New(500 * time.Millisecond)
-	go w.Watch(ctx, rt.cfg.GitDir, func(sig watcher.Signal) {
-		if sig.HEADChanged {
-			s.onHEADChanged(ctx, rt)
-		}
+	go w.Watch(rt.ctx, rt.cfg.GitDir, func() {
+		s.onHEADChanged(rt.ctx, rt)
 	})
 
 	if rt.mfs != nil {
 		go func() {
-			_ = rt.mfs.Join(ctx)
+			_ = rt.mfs.Join(rt.ctx)
 		}()
 	}
 }
@@ -654,7 +671,9 @@ func (s *Service) unmount(id model.RepoID) {
 }
 
 func (s *Service) stopRuntime(rt *repoRuntime) {
-	close(rt.stop)
+	if rt.cancel != nil {
+		rt.cancel()
+	}
 	if rt.mfs != nil {
 		_ = rt.mfs.Unmount()
 	}

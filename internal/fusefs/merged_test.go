@@ -14,6 +14,10 @@ type fakeSnapshot struct {
 	kids  map[string][]model.BaseNode
 }
 
+func (f *fakeSnapshot) PublishGeneration(_ context.Context, _ string, _ string, _ []model.BaseNode) (int64, error) {
+	return 0, nil
+}
+
 func (f *fakeSnapshot) GetNode(_ int64, path string) (model.BaseNode, bool) {
 	n, ok := f.nodes[path]
 	return n, ok

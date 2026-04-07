@@ -46,9 +46,6 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	if err := os.MkdirAll(upperDir, 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(cfg.OverlayDir, "whiteouts"), 0o755); err != nil {
-		return nil, err
-	}
 	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
 }
 

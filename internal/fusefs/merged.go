@@ -34,15 +34,10 @@ func childName(parent, entryPath string) (string, bool) {
 	return rel, true
 }
 
-type SnapshotLookup interface {
-	GetNode(generation int64, path string) (model.BaseNode, bool)
-	ListChildren(generation int64, parentPath string) ([]model.BaseNode, error)
-}
-
 type Resolver struct {
 	generation atomic.Int64
 	commitTime atomic.Int64 // unix seconds of HEAD commit
-	Snapshot   SnapshotLookup
+	Snapshot   model.SnapshotStore
 	Overlay    model.OverlayStore
 }
 

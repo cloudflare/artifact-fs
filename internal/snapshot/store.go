@@ -120,6 +120,11 @@ func (s *Store) ReadState(ctx context.Context) (headOID, headRef string, generat
 	return headOID, headRef, gen, nil
 }
 
+func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO repo_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "head_ref", ref)
+	return err
+}
+
 func (s *Store) GetNode(generation int64, path string) (model.BaseNode, bool) {
 	// Uses background context for backward compat; callers with a deadline
 	// should use GetNodeCtx.
