@@ -10,17 +10,17 @@
 
 ArtifactFS is a Git-backed filesystem daemon (FUSE driver) in Go that mounts repositories as normal working trees while avoiding eager blob downloads.
 
-**It is designed to allow fast clones that can hydrate and stream in files on-the-fly, enabling operations over the repo without blocking on the entire clone. This is especially advantageous for agents, sandboxes and ad-hoc operations over git repositories where "cold start" performance is critical.**
+It exposes the tree quickly, then hydrates file contents on demand. That makes it useful for sandboxes, agents, and other short-lived environments where waiting for a full clone is too expensive.
 
-Notably:
+In practice:
 
-* The operating system sees the entire file-tree almost immediately, while the underlying FUSE driver downloads contents. It prioritizes package and dependency manifests and code over binary blobs, and is designed to reduce blocking time for agents working on repositories.
-* This project is designed as part of [Cloudflare Artifacts](http://workers.cloudflare.com/product/artifacts), a massively scalable, versioned filesystem that supports the git protocol, as well as native TypeScript SDKs and REST APIs, but works with any git repo.
-* It is optional: Artifacts can act as git repos and be cloned directly, without needing ArtifactFS. But larger repositories (e.g. 500MB+) and/or repositories with millions of objects can take some time to clone, which blocks agents until the clone completes. ArtifactFS allows you to mount the repo directly, loading blob (file) contents in the background.
+* The operating system sees the full tree almost immediately, while the FUSE driver fetches file contents in the background. It prioritizes package manifests, dependency manifests, and source files ahead of large blobs.
+* ArtifactFS is part of [Cloudflare Artifacts](http://workers.cloudflare.com/product/artifacts), a versioned filesystem that speaks git, but it also works with any git repo.
+* ArtifactFS is optional. You can clone an Artifact repo directly, but larger repos still take time to clone. ArtifactFS lets you mount the repo and fetch blob contents as they are needed.
 
 ## What are Cloudflare Artifacts?
 
-[Cloudflare Artifacts](https://workers.cloudflare.com/product/artifacts) is a versioned filesystem that speaks git. Create a repo per user, per agent session, per sandbox... as many as you need. It's designed for agent toolchains, sandboxes, and CI/CD systems that need fast, scalable access to code repositories.
+[Cloudflare Artifacts](https://workers.cloudflare.com/product/artifacts) is a versioned filesystem that speaks git. It is built for agent toolchains, sandboxes, and CI/CD systems that need fast access to code repositories.
 
 ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any git repo) as a local filesystem without waiting for a full clone.
 
