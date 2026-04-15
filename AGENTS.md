@@ -1,105 +1,50 @@
 # AGENTS.md
 
-Guide for AI coding agents working in this repo. Read this before making changes.
+Read this before changing `artifact-fs`.
 
-## Critical rules
+## Critical constraints
 
-These are non-negotiable. Violations cause security issues, data corruption, or multi-minute performance regressions.
+- Credentials must never appear in git CLI args. Use the env-based credential helper path in `internal/gitstore/gitstore.go` so tokens do not show up in `ps`, and keep log output redacted with `auth.RedactString`.
+- Blob content must stay binary-safe. Do not convert blob bytes to `string`; `BlobToCache` streams `git cat-file --batch` output to disk for a reason.
+- Keep `GIT_NO_LAZY_FETCH=1` on `git cat-file --batch-check` in `batchResolveSizes`. Without it, blobless clones turn size resolution into network round-trips.
+- `model.CleanPath()` is the only path-normalization function. Do not add local wrappers.
+- Do not reintroduce subset interfaces around snapshot, overlay, hydrator, or gitstore access. Use the canonical `model.*` interfaces.
 
-- **Credentials never appear in CLI args.** Use env-based credential helpers (`credentialEnv()` in gitstore.go) so tokens don't show in `ps` output. All log output passes through `auth.RedactString`.
-- **Blob content is never converted to `string`.** `BlobToCache` streams `git cat-file --batch` stdout to a temp file via `io.CopyN`. String conversion corrupts binary files silently.
-- **`GIT_NO_LAZY_FETCH=1` must be set on `cat-file --batch-check`** during `batchResolveSizes`. Without it, every blob OID triggers a network round-trip on blobless clones -- size resolution takes minutes instead of milliseconds.
-- **`model.CleanPath()` is the only path normalization function.** It strips leading slashes, cleans dot-segments, defaults empty/root to ".". Adding local `cleanPath` wrappers causes inconsistent path matching at overlay/snapshot boundaries.
+## Commands that matter
 
-## Build, test, lint
+- CI runs `go build ./cmd/artifact-fs`, then `go vet ./...`, then `go test ./...`. Follow that order for non-trivial changes.
+- Build the CLI with `go build ./cmd/artifact-fs`.
+- Run one package with `go test ./internal/<pkg>`.
+- Run one test with `go test -run TestName ./internal/<pkg>`.
+- Benchmarks are opt-in: `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v`.
+- FUSE e2e tests are opt-in: `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v .`.
+- E2E tests default to a local bare repo. Set `AFS_E2E_REPO` only when you intentionally want a real remote.
+- E2E benchmark coverage is separate: `AFS_RUN_E2E_BENCH=1 go test -run TestE2EBenchmarkRepos -v .`.
 
-- `go build ./cmd/artifact-fs` -- build the binary
-- `go test ./...` -- run all tests (unit + integration stubs)
-- `go test -run TestFoo ./internal/foo` -- run a single test
-- `go vet ./...` -- static analysis (no linter beyond vet)
-- `AFS_RUN_BENCH=1 go test -run TestBenchRepos -v` -- benchmarks (clones real repos; needs network)
-- `AFS_RUN_E2E_TESTS=1 go test -run TestE2E -v` -- e2e tests (needs FUSE: macFUSE on darwin, `/dev/fuse` on linux)
-- Tests live in `*_test.go` alongside source. `bench_test.go` and `e2e_test.go` are in the root package.
+## Repo shape
 
-## Running the daemon
+- `cmd/artifact-fs` is the only binary entrypoint.
+- `internal/cli` wires commands onto `daemon.Service`.
+- `internal/daemon` owns repo lifecycle: registry sync, snapshot publish, overlay reconcile, FUSE mount, watcher, refresh loop.
+- `internal/fusefs` is the merged view and writable filesystem layer.
+- `internal/gitstore` is the performance-sensitive git wrapper; most easy-to-break invariants live there.
+- `internal/snapshot` and `internal/overlay` are persistent SQLite-backed stores.
 
-`add-repo` and `daemon` are separate commands with very different lifecycles. Do not confuse them.
+## Non-obvious CLI/runtime behavior
 
-- **`add-repo`** -- one-shot. Clones the repo (blobless), builds the initial snapshot in SQLite, registers it, then exits. Does NOT mount FUSE or start goroutines.
-- **`daemon`** -- long-running. Mounts all registered repos via FUSE, starts background goroutines (watcher, hydrator, refresh loop), blocks on `<-ctx.Done()`.
+- `ARTIFACT_FS_ROOT` is the state root. `artifact-fs daemon --root` is the mount root. They are different things.
+- `add-repo` is one-shot: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
+- `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
+- `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
-```sh
-export ARTIFACT_FS_ROOT=/tmp/artifact-fs-test
-go build -o artifact-fs ./cmd/artifact-fs
-./artifact-fs add-repo --name myrepo --remote https://github.com/org/repo.git --branch main --mount-root /tmp
-./artifact-fs daemon --root /tmp --hydration-concurrency 8 &
-DAEMON_PID=$!
-# test against /tmp/myrepo/
-ls /tmp/myrepo/
-cat /tmp/myrepo/README.md
-git -C /tmp/myrepo log --oneline -5
-kill $DAEMON_PID
-```
+## Testing and environment quirks
 
-- `--hydration-concurrency N` controls parallel blob-fetch workers (default 4). Each worker gets a dedicated `git cat-file --batch` process from the batch pool.
-- Daemon logs JSON to stderr. Capture with `2>/tmp/daemon.log`.
-- After killing the daemon, clean stale mounts with `umount /tmp/myrepo`.
-- macFUSE must be installed on macOS (`/Library/Filesystems/macfuse.fs` must exist).
+- macOS e2e coverage needs macFUSE. Linux e2e coverage needs `/dev/fuse`.
+- Tests live next to code, but `bench_test.go`, `e2e_test.go`, `e2e_git_test.go`, and `e2e_bench_test.go` are in the root package.
 
-### CLI commands
+## Current code conventions worth preserving
 
-| Command | Lifecycle | Description |
-|---------|-----------|-------------|
-| `add-repo --name N --remote URL [--branch B] [--refresh 30s] [--mount-root DIR]` | one-shot | Clone + register a repo |
-| `daemon --root DIR [--hydration-concurrency N]` | long-running | Mount all repos, start background workers |
-| `list-repos` | one-shot | List registered repos |
-| `status --name N` | one-shot | Show repo state (HEAD, fetch status, overlay dirty count) |
-| `fetch --name N` | one-shot | Trigger an immediate fetch from remote |
-| `remove-repo --name N` | one-shot | Unregister a repo |
-| `remount --name N` | one-shot | Remount a repo |
-| `unmount --name N` | one-shot | Unmount a repo |
-| `set-refresh --name N --interval 30s` | one-shot | Change the background fetch interval |
-
-## Architecture
-
-Data flow: `git clone --filter=blob:none` -> `ls-tree` + `cat-file --batch-check` -> SQLite snapshot -> FUSE mount -> on-demand hydration via `cat-file --batch`.
-
-### Subsystems
-
-- **Resolver** (`fusefs/merged.go`) -- merges snapshot (base git tree) + overlay (local writes) into a unified view. Reads the current generation atomically so FUSE ops see new trees without locks.
-
-- **Engine** (`fusefs/ops.go`) -- handles writes by promoting base files to the overlay via `ensureOverlay()` (hydrate blob, copy-on-write). `PrefetchDir()` enqueues file children for speculative hydration on `OpenDir`.
-
-- **Snapshot** (`snapshot/store.go`) -- SQLite-backed store of `base_nodes` rows keyed by `(generation, path)`. `PublishGeneration` does a bulk insert in a transaction. `UpdateSize` backfills file sizes after hydration. Old generations are pruned.
-
-- **Overlay** (`overlay/store.go`) -- persistent writable layer. SQLite metadata + `upper/` directory for backing files. Whiteouts (kind="delete") hide base entries.
-
-- **Hydrator** (`hydrator/hydrator.go`) -- priority queue (heap) blob fetcher with deduped waiters. Workers block on a `workReady` channel and drain the queue on each wake. `EnsureHydrated` blocks until the blob is cached; `Enqueue` is fire-and-forget for prefetch. `OnHydrated` callback backfills file sizes in the snapshot.
-
-- **GitStore batch pool** (`gitstore/gitstore.go`) -- a pool of persistent `git cat-file --batch` processes (one pool per gitDir). `BlobToCache` acquires a process, streams the blob to a temp file, then atomic-renames it. On error, the process is discarded and retried once.
-
-- **Watcher** (`watcher/watcher.go`) -- polls git HEAD/refs/index mtimes at 500ms. On HEAD change, the daemon re-indexes the tree and atomically updates the resolver's generation.
-
-- **Refresh loop** -- periodic `git fetch` with exponential backoff (capped at 10min), reset on success. Separate from the watcher: watcher detects local HEAD changes; refresh loop pulls from remote.
-
-## Conventions
-
-- **Interfaces** -- `model.OverlayStore` is the single canonical interface for overlay operations. Do not create subset interfaces in fusefs. Same for `model.Hydrator`, `model.SnapshotStore`, `model.GitStore`.
-- **Readdir** -- `Readdir()` is a thin wrapper around `ReaddirTyped()`. Add overlay merge logic only in `ReaddirTyped`; `Readdir` delegates.
-- **SQLite** -- WAL mode + `busy_timeout=5000` (see `meta.OpenDB`). Use `modernc.org/sqlite` (pure Go, no CGo).
-- **FUSE .git gitfile** -- the root directory synthesizes a `.git` file so git commands work inside the mount. Content is computed once and stored on `ArtifactFuse`.
-- **Inodes** -- monotonically allocated at runtime (root = 1), NOT persisted. The kernel re-looks-up paths via `LookUpInode` after `ReadDir`.
-- **Snapshot generations** -- atomic int64 on the Resolver. FUSE ops read it without locks.
-
-## Do not
-
-| Don't | Do instead | Why |
-|-------|-----------|-----|
-| Add `cleanPath` wrappers | `model.CleanPath` | One normalization function prevents path mismatch bugs |
-| Create subset interfaces (e.g. `OverlayWriter`) | Use the canonical `model.*` interfaces | Subset interfaces drift and fragment call sites |
-| Use `git ls-tree -l` on blobless clones | `ls-tree` + `cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` | `-l` fetches every blob size from remote and hangs |
-| Pass credentials in git CLI args | `credentialEnv()` env-based helpers | CLI args visible in `ps` output |
-| Call `fuse.Mount` outside `daemon` | Only `daemon` mounts FUSE | `add-repo` is one-shot; mounting there leaks resources |
-| Convert blob bytes to `string` | Stream via `io.CopyN` to a file | String conversion silently corrupts binary content |
-| Use a ticker in the hydrator | Workers wake via `workReady` channel | Ticker adds up to 20ms latency per item with no benefit |
-| Spawn `git cat-file -p` per blob | Use the batch pool via `BlobToCache` | One-shot processes pay ~300ms connection overhead each |
+- `Readdir()` stays thin; merged directory logic belongs in `ReaddirTyped()`.
+- The watcher polls `HEAD` plus the current HEAD ref path. If you change it, preserve branch-switch and packed-ref behavior covered by `internal/watcher/watcher_test.go`.
+- The overlay stores deletes as SQLite entries with `kind='delete'`; there is no on-disk whiteout file layer.
+- SQLite is `modernc.org/sqlite` in WAL mode via `internal/meta`.
