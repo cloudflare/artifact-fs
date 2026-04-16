@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -293,7 +294,6 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 		}
 		results_ch := make(chan hydrateResult, len(freshBatch))
 		for _, n := range freshBatch {
-			n := n
 			go func() {
 				_, size, err := h.EnsureHydrated(ctx, cfg, n)
 				results_ch <- hydrateResult{size, err}
@@ -437,7 +437,7 @@ func percentiles(durs []time.Duration) (p50, p95, p99 time.Duration) {
 	}
 	sorted := make([]time.Duration, len(durs))
 	copy(sorted, durs)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	p50 = sorted[pctIndex(len(sorted), 50)]
 	p95 = sorted[pctIndex(len(sorted), 95)]
 	p99 = sorted[pctIndex(len(sorted), 99)]

@@ -74,7 +74,7 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 		repo:           repo,
 		resolver:       resolver,
 		engine:         engine,
-		gitfileContent: []byte(fmt.Sprintf("gitdir: %s\n", repo.GitDir)),
+		gitfileContent: fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir),
 		inodes:         make(map[fuseops.InodeID]*InodeRef),
 		pathToInode:    make(map[string]fuseops.InodeID),
 		nextInodeID:    fuseops.RootInodeID + 1,
@@ -356,10 +356,7 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 			op.BytesRead = 0
 			return nil
 		}
-		end := start + int(op.Size)
-		if end > len(fs.gitfileContent) {
-			end = len(fs.gitfileContent)
-		}
+		end := min(start+int(op.Size), len(fs.gitfileContent))
 		op.Data = [][]byte{fs.gitfileContent[start:end]}
 		op.BytesRead = end - start
 		return nil
@@ -560,7 +557,7 @@ func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (Mount
 
 func TryUnmount(mountPoint string) error {
 	var err error
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		err = fuse.Unmount(mountPoint)
 		if err == nil {
 			return nil

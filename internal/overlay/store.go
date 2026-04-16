@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -294,9 +295,9 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 	// before commit and the transaction rolled back, DB rows would reference
 	// non-existent files. Reverse order so children are removed before parents
 	// (os.Remove fails on non-empty directories).
-	for i := len(toRemove) - 1; i >= 0; i-- {
-		if toRemove[i].BackingPath != "" {
-			_ = os.Remove(toRemove[i].BackingPath)
+	for _, v := range slices.Backward(toRemove) {
+		if v.BackingPath != "" {
+			_ = os.Remove(v.BackingPath)
 		}
 	}
 	return nil

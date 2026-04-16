@@ -70,12 +70,12 @@ func (p *Poller) headRefPath(headPath string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	const prefix = "ref: "
 	line := strings.TrimSpace(string(data))
-	if !strings.HasPrefix(line, prefix) {
+	ref, ok := strings.CutPrefix(line, "ref: ")
+	if !ok {
 		return "", false
 	}
-	ref := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return "", false
 	}

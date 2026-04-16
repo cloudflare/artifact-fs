@@ -176,7 +176,7 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	const readers = 8
 	errCh := make(chan error, readers)
 	var wg sync.WaitGroup
-	for i := 0; i < readers; i++ {
+	for range readers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
