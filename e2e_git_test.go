@@ -382,7 +382,7 @@ func gitStatusShortMap(t *testing.T, dir string) map[string]string {
 	if out == "" {
 		return status
 	}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if line == "" {
 			continue
 		}
@@ -464,7 +464,7 @@ func parseStatusOutput(out string) (map[string]string, error) {
 	if out == "" {
 		return status, nil
 	}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if line == "" {
 			continue
 		}

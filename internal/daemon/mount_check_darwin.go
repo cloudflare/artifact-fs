@@ -14,7 +14,7 @@ func isMounted(path string) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if strings.Contains(line, " on "+path+" (") || strings.Contains(line, " on /private"+path+" (") {
 			return true
 		}

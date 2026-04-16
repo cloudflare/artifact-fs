@@ -81,7 +81,7 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 	}
 	s.started = true
 	s.mu.Unlock()
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go s.worker(repo)
 	}
 }
