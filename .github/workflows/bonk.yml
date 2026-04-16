@@ -31,6 +31,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Download Go dependencies
+        run: go mod download
+
       - name: Run Bonk
         uses: ask-bonk/ask-bonk/github@main
         env:
