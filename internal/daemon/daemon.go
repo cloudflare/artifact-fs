@@ -483,10 +483,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				s.mu.Unlock()
 				cancel()
 				// Exponential backoff on failure, capped at maxBackoff
-				backoff = backoff * 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
+				backoff = min(backoff*2, maxBackoff)
 				ticker.Reset(backoff)
 				continue
 			}

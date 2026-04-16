@@ -1,7 +1,6 @@
 package watcher
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,8 +26,7 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 	}
 
 	p := New(5 * time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	changed := make(chan struct{}, 1)
 	go p.Watch(ctx, gitDir, func() {
 		select {
@@ -65,8 +63,7 @@ func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
 	}
 
 	p := New(5 * time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	changed := make(chan struct{}, 1)
 	go p.Watch(ctx, gitDir, func() {
 		select {
@@ -202,8 +199,7 @@ func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 	}
 
 	p := New(5 * time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	changed := make(chan struct{}, 1)
 	go p.Watch(ctx, gitDir, func() {
 		select {

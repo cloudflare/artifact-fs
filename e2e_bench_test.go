@@ -96,7 +96,6 @@ func TestE2EBenchmarkRepos(t *testing.T) {
 	verboseRuns := os.Getenv("AFS_E2E_BENCH_VERBOSE") == "1"
 	for i := 1; i <= runs; i++ {
 		for _, repo := range repos {
-			repo := repo
 			t.Run(fmt.Sprintf("%s/run-%02d", repo.name, i), func(t *testing.T) {
 				result := runE2EBenchmarkOnce(t, repo, i, hydratorWorkers, callerWorkers)
 				runsOut = append(runsOut, result)
@@ -340,7 +339,7 @@ func hydrateColdObjects(ctx context.Context, git *gitstore.Store, cfg model.Repo
 		}
 	}
 
-	for i := 0; i < callerWorkers; i++ {
+	for range callerWorkers {
 		wg.Add(1)
 		go worker()
 	}

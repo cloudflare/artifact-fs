@@ -23,7 +23,7 @@ func isMounted(path string) bool {
 // matchProcMounts checks /proc/mounts where each line is:
 // <device> <mountpoint> <fstype> <options> <dump> <pass>
 func matchProcMounts(output, path string) bool {
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[1] == path {
 			return true
@@ -35,7 +35,7 @@ func matchProcMounts(output, path string) bool {
 // matchMountOutput checks mount(8) output where each line is:
 // <device> on <mountpoint> type <fstype> (<options>)
 func matchMountOutput(output, path string) bool {
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, " on "+path+" type ") {
 			return true
 		}

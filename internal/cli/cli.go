@@ -28,7 +28,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	app.Usage = "Git-backed FUSE filesystem with persistent writable overlay"
 	app.Writer = stdout
 	app.ErrWriter = stderr
-	app.Metadata = map[string]interface{}{"ctx": ctx, "root": root}
+	app.Metadata = map[string]any{"ctx": ctx, "root": root}
 
 	app.Commands = []ucli.Command{
 		{

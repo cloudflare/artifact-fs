@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -511,10 +512,8 @@ func gitArgsWithSafeDirectory(dir string, args ...string) []string {
 
 func assertContains(t *testing.T, items []string, want string) {
 	t.Helper()
-	for _, item := range items {
-		if item == want {
-			return
-		}
+	if slices.Contains(items, want) {
+		return
 	}
 	t.Fatalf("expected %q in %v", want, items)
 }
