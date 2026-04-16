@@ -20,17 +20,16 @@ func childName(parent, entryPath string) (string, bool) {
 	if parent == "." {
 		rel = entryPath
 	} else {
-		if !strings.HasPrefix(entryPath, parent+"/") {
+		var ok bool
+		rel, ok = strings.CutPrefix(entryPath, parent+"/")
+		if !ok {
 			return "", false
 		}
-		rel = entryPath[len(parent)+1:]
 	}
 	if rel == "" {
 		return "", false
 	}
-	if i := strings.IndexByte(rel, '/'); i != -1 {
-		rel = rel[:i]
-	}
+	rel, _, _ = strings.Cut(rel, "/")
 	return rel, true
 }
 

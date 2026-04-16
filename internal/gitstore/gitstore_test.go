@@ -182,9 +182,8 @@ func TestCredentialEnvEscapesSingleQuotes(t *testing.T) {
 	// The credential helper env var should contain escaped quote
 	found := false
 	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_CONFIG_VALUE_0=") {
+		if val, ok := strings.CutPrefix(e, "GIT_CONFIG_VALUE_0="); ok {
 			found = true
-			val := strings.TrimPrefix(e, "GIT_CONFIG_VALUE_0=")
 			if strings.Contains(val, "p@ss'word") {
 				t.Fatalf("unescaped password in helper: %s", val)
 			}
