@@ -57,6 +57,14 @@ func (s *Store) SetBatchPoolSize(n int) {
 }
 
 func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
+	return s.cloneBlobless(ctx, cfg, nil)
+}
+
+func (s *Store) CloneBloblessNonInteractive(ctx context.Context, cfg model.RepoConfig) error {
+	return s.cloneBlobless(ctx, cfg, nonInteractiveGitEnv())
+}
+
+func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEnv []string) error {
 	if _, err := os.Stat(cfg.GitDir); err == nil {
 		return nil
 	}
@@ -74,16 +82,18 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 	// Strip credentials from the CLI-visible URL; pass them via a credential helper
 	// so they don't appear in ps output.
 	safeURL, credHelper := credentialEnv(cfg.RemoteURL)
+	env := append([]string{}, extraEnv...)
+	env = append(env, credHelper...)
 
 	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--branch", cfg.Branch, safeURL, target}
-	if _, err := runGitWithEnv(ctx, "", credHelper, args...); err != nil {
-		return err
-	}
-	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
+	if _, err := runGitWithEnv(ctx, "", env, args...); err != nil {
 		return err
 	}
 	// Populate the index so git status works inside the mount.
-	if _, err := runGit(ctx, cfg.GitDir, "read-tree", "HEAD"); err != nil {
+	if _, err := runGit(ctx, filepath.Join(target, ".git"), "read-tree", "HEAD"); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
 		return err
 	}
 	return nil
@@ -92,6 +102,61 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
 	_, err := runGit(ctx, repo.GitDir, "fetch", "origin")
 	return err
+}
+
+func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
+	branch := branchName(ref)
+	if branch == "" {
+		branch = branchName(repo.Branch)
+	}
+	if branch == "" {
+		return errors.New("fetch ref is required")
+	}
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branch, branch)
+	_, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "origin", refspec)
+	return err
+}
+
+func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig, ref string) error {
+	branch := branchName(ref)
+	if branch == "" {
+		branch = branchName(repo.Branch)
+	}
+	if branch == "" {
+		return errors.New("fetch ref is required")
+	}
+	remoteRef := "refs/remotes/origin/" + branch
+	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", remoteRef+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("remote ref %s missing after fetch: %w", remoteRef, err)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "update-ref", "refs/heads/"+branch, strings.TrimSpace(oid)); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+branch, branch); err != nil {
+		s.logger.Warn("set upstream failed", "repo", repo.Name, "error", err)
+	}
+	return s.ReadTreeHEAD(ctx, repo)
+}
+
+func (s *Store) ValidatePreparedGitDir(ctx context.Context, repo model.RepoConfig) error {
+	if strings.TrimSpace(repo.GitDir) == "" {
+		return errors.New("git dir is required")
+	}
+	st, err := os.Stat(repo.GitDir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("git dir %s is not a directory", repo.GitDir)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--git-dir"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid string, ref string, err error) {
@@ -557,6 +622,22 @@ func credentialEnv(rawURL string) (safeURL string, env []string) {
 		"GIT_CONFIG_KEY_0=credential.helper",
 		"GIT_CONFIG_VALUE_0=" + helper,
 	}
+}
+
+func nonInteractiveGitEnv() []string {
+	env := []string{"GIT_TERMINAL_PROMPT=0"}
+	if os.Getenv("GIT_SSH_COMMAND") == "" {
+		env = append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+	}
+	return env
+}
+
+func branchName(ref string) string {
+	ref = strings.TrimSpace(ref)
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
+	ref = strings.TrimPrefix(ref, "origin/")
+	return ref
 }
 
 func rootNode(repoID model.RepoID) model.BaseNode {

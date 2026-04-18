@@ -13,6 +13,18 @@ func TestRedactRemoteURL(t *testing.T) {
 	}
 }
 
+func TestHasInlineCredentials(t *testing.T) {
+	if !HasInlineCredentials("https://token@example.com/org/repo.git") {
+		t.Fatal("expected inline credentials")
+	}
+	if HasInlineCredentials("git@github.com:org/repo.git") {
+		t.Fatal("scp-style SSH remote should not count as inline credentials")
+	}
+	if HasInlineCredentials("https://github.com/org/repo.git") {
+		t.Fatal("unexpected inline credentials")
+	}
+}
+
 func containsAny(s string, needles []string) bool {
 	for _, n := range needles {
 		if n != "" && len(s) >= len(n) && stringContains(s, n) {

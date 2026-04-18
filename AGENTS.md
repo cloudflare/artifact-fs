@@ -33,7 +33,8 @@ Read this before changing `artifact-fs`.
 ## Non-obvious CLI/runtime behavior
 
 - `ARTIFACT_FS_ROOT` is the state root. `artifact-fs daemon --root` is the mount root. They are different things.
-- `add-repo` is one-shot: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
+- `add-repo` is one-shot by default: register repo, clone blobless, build the initial snapshot, then exit. It does not mount FUSE or start background goroutines.
+- `add-repo --async` only registers prepare state. The daemon mounts a gated placeholder, prepares clone/fetch and snapshot in the background, then opens the gate and starts watcher/refresh.
 - `daemon` is long-running: it mounts registered repos and starts watcher, refresh, and hydrator workers.
 - `git.CloneBlobless` already populates the git index with `read-tree HEAD`; be careful about extra index resets because they can discard staged state.
 
