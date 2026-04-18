@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -469,6 +470,31 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	return nil
 }
 
+// maxSymlinkTargetBytes caps the size of a symlink target we'll hand back to
+// the kernel. Linux PATH_MAX is 4096, which is the largest target a real
+// symlink can point at anyway.
+const maxSymlinkTargetBytes = 4096
+
+// readSymlinkTarget reads a cached Git blob and returns its contents as a
+// symlink target. Git stores the target as the raw blob body, so nothing
+// stops a repo from parking a very large payload behind a mode 120000 entry.
+// We read with a bounded LimitReader and reject anything past PATH_MAX.
+func readSymlinkTarget(cachePath string) (string, error) {
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSymlinkTargetBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxSymlinkTargetBytes {
+		return "", syscall.ENAMETOOLONG
+	}
+	return string(data), nil
+}
+
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
@@ -483,11 +509,14 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 		if err != nil {
 			return syscall.EIO
 		}
-		data, err := os.ReadFile(cachePath)
+		target, err := readSymlinkTarget(cachePath)
 		if err != nil {
+			if errors.Is(err, syscall.ENAMETOOLONG) {
+				return syscall.ENAMETOOLONG
+			}
 			return syscall.EIO
 		}
-		op.Target = string(data)
+		op.Target = target
 		return nil
 	}
 	return syscall.ENOENT
