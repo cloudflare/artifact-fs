@@ -23,6 +23,7 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 	for _, want := range []string{
 		"last_fetch=never",
 		"result=never",
+		"prepare_error=none",
 		"hydrated_blobs=3",
 		"hydrated_bytes=42",
 	} {
