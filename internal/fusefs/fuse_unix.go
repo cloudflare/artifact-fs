@@ -195,7 +195,7 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
-	op.Entry.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
+	op.Entry.Attributes = inodeAttrs(mode, size, typ, mtime)
 	setChildEntryExpiry(&op.Entry, time.Second)
 	return nil
 }
@@ -216,7 +216,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 	if err != nil {
 		return syscall.ENOENT
 	}
-	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
+	op.Attributes = inodeAttrs(mode, size, typ, mtime)
 	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
 }
@@ -243,7 +243,7 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 	if op.Mtime != nil {
 		mtime = *op.Mtime
 	}
-	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
+	op.Attributes = inodeAttrs(mode, size, typ, mtime)
 	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
 }
@@ -567,7 +567,15 @@ func TryUnmount(mountPoint string) error {
 	return err
 }
 
-func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time) fuseops.InodeAttributes {
+// inodeAttrs builds the kernel-visible attributes for an inode. The size is
+// taken as a signed int64 because that's how snapshot and overlay state store
+// it; a negative value there means the on-disk row is corrupt. Publishing it
+// verbatim would wrap into a huge uint64 (e.g. -1 becomes ~18 exabytes), so
+// clamp to zero instead.
+func inodeAttrs(mode uint32, size int64, typ string, mtime time.Time) fuseops.InodeAttributes {
+	if size < 0 {
+		size = 0
+	}
 	m := os.FileMode(mode & 0o777)
 	if m == 0 {
 		if typ == "dir" {
@@ -586,7 +594,7 @@ func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time) fuseops.I
 		m |= os.ModeSymlink
 	}
 	return fuseops.InodeAttributes{
-		Size:  size,
+		Size:  uint64(size),
 		Nlink: 1,
 		Mode:  m,
 		Uid:   uint32(os.Getuid()),
