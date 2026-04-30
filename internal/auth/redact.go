@@ -28,6 +28,16 @@ func RedactRemoteURL(raw string) string {
 	return u.String()
 }
 
+func HasInlineCredentials(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return false
+	}
+	username := u.User.Username()
+	_, hasPassword := u.User.Password()
+	return username != "" || hasPassword
+}
+
 func RedactString(s string) string {
 	if s == "" {
 		return ""

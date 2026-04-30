@@ -169,6 +169,61 @@ func TestReadTreeHEAD(t *testing.T) {
 	}
 }
 
+func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	preparedGitDir := filepath.Join(tmp, "prepared.git")
+	preparedWorktree := filepath.Join(tmp, "prepared")
+
+	run(t, "git", "init", "--bare", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "master")
+	os.WriteFile(filepath.Join(work, "README.md"), []byte("hello\n"), 0o644)
+	run(t, "git", "-C", work, "add", "README.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	run(t, "git", "-C", work, "push", "origin", "master")
+
+	run(t, "git", "init", "--separate-git-dir", preparedGitDir, "--initial-branch", "master", preparedWorktree)
+	run(t, "git", "-C", preparedWorktree, "remote", "add", "origin", "file://"+bare)
+
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: preparedGitDir, Branch: "master"}
+	store := New(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := store.ValidatePreparedGitDir(ctx, cfg); err != nil {
+		t.Fatalf("ValidatePreparedGitDir: %v", err)
+	}
+	if err := store.FetchRefNonInteractive(ctx, cfg, "master"); err != nil {
+		t.Fatalf("FetchRefNonInteractive: %v", err)
+	}
+	if err := store.PrepareFetchedBranch(ctx, cfg, "master"); err != nil {
+		t.Fatalf("PrepareFetchedBranch: %v", err)
+	}
+	oid, ref, err := store.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		t.Fatalf("ResolveHEAD: %v", err)
+	}
+	if ref != "master" {
+		t.Fatalf("ref = %q, want master", ref)
+	}
+	nodes, err := store.BuildTreeIndex(ctx, cfg, oid)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	found := false
+	for _, n := range nodes {
+		if n.Path == "README.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("README.md not found in prepared tree")
+	}
+}
+
 func TestCredentialEnvEscapesSingleQuotes(t *testing.T) {
 	t.Parallel()
 	// Password with a single quote should be escaped

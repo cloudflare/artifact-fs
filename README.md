@@ -48,7 +48,7 @@ Quick start against a public repo:
 ```bash
 export ARTIFACT_FS_ROOT=/tmp/artifact-fs-test
 
-# Register and clone (returns immediately)
+# Register, clone, and build the initial snapshot
 ./artifact-fs add-repo \
   --name workers-sdk \
   --remote https://github.com/cloudflare/workers-sdk.git \
@@ -102,6 +102,44 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
 ```
 
+## Async repo preparation
+
+By default, `add-repo` waits for the blobless clone and initial snapshot before returning. Use `--async` when the daemon should prepare the repo in the background:
+
+```bash
+./artifact-fs add-repo \
+  --name workers-sdk \
+  --remote https://github.com/cloudflare/workers-sdk.git \
+  --branch main \
+  --mount-root /tmp \
+  --async
+```
+
+The daemon mounts a placeholder immediately. Operations inside that repo mount, such as `ls`, `less`, or `git -C /tmp/workers-sdk status`, wait until the clone/fetch and snapshot publish have completed. If preparation fails, those operations return an I/O error until preparation is retried:
+
+```bash
+./artifact-fs status --name workers-sdk
+./artifact-fs prepare --name workers-sdk
+```
+
+Async HTTPS remotes must use ambient credentials, such as a configured Git credential helper or repo-local Git config. Inline credentials in the remote URL are rejected for async repositories.
+
+For workflows that create the gitdir separately, `--prepared-gitdir` makes the async step fetch and prepare an existing gitdir instead of running `git clone`:
+
+```bash
+git init --separate-git-dir /tmp/workers-sdk.git --initial-branch main /tmp/workers-sdk
+git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-sdk.git
+
+./artifact-fs add-repo \
+  --name workers-sdk \
+  --branch main \
+  --mount-root /tmp \
+  --async \
+  --prepared-gitdir \
+  --git-dir /tmp/workers-sdk.git \
+  --fetch-ref main
+```
+
 ## Sandboxes and Containers
 
 [`examples/Dockerfile`](examples/Dockerfile) builds artifact-fs and starts a FUSE-mounted repo inside a container. The container requires `--cap-add SYS_ADMIN --device /dev/fuse` for FUSE access.
@@ -129,7 +167,7 @@ On hosts with AppArmor enabled (Ubuntu default), add `--security-opt apparmor:un
 
 ## Architecture
 
-ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that performs a fast blobless clone of a repo, and a long-running **daemon** that mounts it via FUSE and serves file operations.
+ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that registers and usually prepares a fast blobless clone, and a long-running **daemon** that mounts it via FUSE and serves file operations. With `add-repo --async`, setup only registers the repo; the daemon performs clone/fetch and snapshot publishing while FUSE operations wait behind a readiness gate.
 
 ```
                          ┌─────────────────────────────────────────────────┐
@@ -174,7 +212,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that perfo
 
 ### Data flow
 
-1. **Clone** -- `add-repo` runs `git clone --filter=blob:none` (blobless). Only commits, trees, and refs are fetched. No file content is downloaded.
+1. **Clone/fetch** -- `add-repo` runs `git clone --filter=blob:none` (blobless) unless `--async` is used. In async mode, the daemon performs either the blobless clone or a fetch into a prepared gitdir. Only commits, trees, and refs are fetched. No file content is downloaded.
 
 2. **Index** -- `git ls-tree -r -t -z HEAD` enumerates every path in the tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
 

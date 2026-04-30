@@ -206,6 +206,12 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 		return err
 	}
 
+	if ref.IsRoot {
+		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", time.Now())
+		op.AttributesExpiration = attrExpiry(time.Second)
+		return nil
+	}
+
 	if ref.Path == ".git" {
 		op.Attributes = fs.gitFileAttrs()
 		op.AttributesExpiration = attrExpiry(time.Minute)
@@ -533,8 +539,12 @@ func (m *mountedFSWrapper) Unmount() error {
 }
 
 func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (MountedFS, error) {
+	return MountRepoWithGate(repo, resolver, engine, nil)
+}
+
+func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
 	fsint := NewArtifactFuse(repo, resolver, engine)
-	server := fuseutil.NewFileSystemServer(fsint)
+	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
 	mountCfg := &fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,

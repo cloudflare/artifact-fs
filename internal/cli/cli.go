@@ -63,12 +63,24 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.StringFlag{Name: "branch", Value: "main", Usage: "branch to track"},
 				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "refresh interval"},
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
+				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
+				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
+				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
+				ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
 			},
 			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				remote := strings.TrimSpace(c.String("remote"))
-				if name == "" || remote == "" {
-					return fmt.Errorf("--name and --remote are required")
+				async := c.Bool("async")
+				preparedGitDir := c.Bool("prepared-gitdir")
+				if preparedGitDir && !async {
+					return fmt.Errorf("--prepared-gitdir requires --async")
+				}
+				if name == "" {
+					return fmt.Errorf("--name is required")
+				}
+				if remote == "" && !preparedGitDir {
+					return fmt.Errorf("--remote is required")
 				}
 				d, err := daemon.ParseRefresh(c.String("refresh"))
 				if err != nil {
@@ -81,10 +93,17 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					Branch:          c.String("branch"),
 					RefreshInterval: d,
 					MountRoot:       c.String("mount-root"),
+					GitDir:          c.String("git-dir"),
+					PreparedGitDir:  preparedGitDir,
+					FetchRef:        c.String("fetch-ref"),
 					Enabled:         true,
 				}
-				if err := svc.AddRepo(ctx, cfg); err != nil {
+				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {
 					return err
+				}
+				if async {
+					fmt.Fprintf(stdout, "queued %s\n", cfg.Name)
+					return nil
 				}
 				fmt.Fprintf(stdout, "added %s\n", cfg.Name)
 				return nil
@@ -110,6 +129,13 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return err
 			}
 			fmt.Fprintf(w, "fetched %s\n", name)
+			return nil
+		}),
+		nameCommand("prepare", "retry async repository preparation", ctx, root, stderr, stdout, func(c context.Context, svc *daemon.Service, name string, w io.Writer) error {
+			if err := svc.Prepare(c, name); err != nil {
+				return err
+			}
+			fmt.Fprintf(w, "preparing %s\n", name)
 			return nil
 		}),
 		{
@@ -216,10 +242,11 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 }
 
 func formatStatusLine(st model.RepoRuntimeState) string {
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
 		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
+		formatPrepareError(st.PrepareError),
 		st.HydratedBlobCount, st.HydratedBlobBytes, st.DirtyOverlay)
 }
 
@@ -235,6 +262,13 @@ func formatLastFetchResult(result string) string {
 		return "never"
 	}
 	return result
+}
+
+func formatPrepareError(err string) string {
+	if strings.TrimSpace(err) == "" {
+		return "none"
+	}
+	return strings.ReplaceAll(err, " ", "_")
 }
 
 func stubCommand(name, usage string, stdout io.Writer) ucli.Command {
