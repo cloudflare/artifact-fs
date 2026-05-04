@@ -585,13 +585,20 @@ func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time) fuseops.I
 	case "symlink":
 		m |= os.ModeSymlink
 	}
+	// Mirror mtime onto atime/ctime. Leaving them as zero time.Time produces
+	// nonsensical timestamps (Go's year-1 zero overflows when serialized into
+	// the FUSE attr struct), and a ctime that disagrees with the index makes
+	// git's stat-cache treat every base file as "potentially modified" even
+	// when content is intact.
 	return fuseops.InodeAttributes{
 		Size:  size,
 		Nlink: 1,
 		Mode:  m,
 		Uid:   uint32(os.Getuid()),
 		Gid:   uint32(os.Getgid()),
+		Atime: mtime,
 		Mtime: mtime,
+		Ctime: mtime,
 	}
 }
 
@@ -610,12 +617,15 @@ func setChildEntryExpiry(entry *fuseops.ChildInodeEntry, ttl time.Duration) {
 }
 
 func (fs *ArtifactFuse) gitFileAttrs() fuseops.InodeAttributes {
+	now := time.Now()
 	return fuseops.InodeAttributes{
 		Size:  uint64(len(fs.gitfileContent)),
 		Mode:  0o644,
 		Nlink: 1,
 		Uid:   uint32(os.Getuid()),
 		Gid:   uint32(os.Getgid()),
-		Mtime: time.Now(),
+		Atime: now,
+		Mtime: now,
+		Ctime: now,
 	}
 }
