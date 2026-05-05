@@ -3,13 +3,33 @@
 package fusefs
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/jacobsa/fuse/fuseops"
 )
+
+type fakeSymlinkHydrator struct {
+	calls     int
+	cachePath string
+	size      int64
+	err       error
+}
+
+func (f *fakeSymlinkHydrator) Enqueue(model.HydrationTask) {}
+
+func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
+	f.calls++
+	return f.cachePath, f.size, f.err
+}
+
+func (f *fakeSymlinkHydrator) QueueDepth(model.RepoID) int { return 0 }
 
 func writeBlob(t *testing.T, dir, name string, data []byte) string {
 	t.Helper()
@@ -89,5 +109,41 @@ func TestReadSymlinkTarget_MissingFile(t *testing.T) {
 	}
 	if errors.Is(err, syscall.ENAMETOOLONG) {
 		t.Fatalf("err = %v, want non-ENAMETOOLONG for missing file", err)
+	}
+}
+
+func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
+	hydrator := &fakeSymlinkHydrator{}
+	repoID := model.RepoID("repo")
+	resolver := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{
+			"link": {
+				RepoID:    repoID,
+				Path:      "link",
+				Type:      "symlink",
+				Mode:      0o120000,
+				ObjectOID: "blob",
+				SizeState: "known",
+				SizeBytes: int64(maxSymlinkTargetBytes + 1),
+			},
+		}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	)
+	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
+
+	fs.mu.Lock()
+	ref := fs.allocInode("link", "symlink", 0o120000)
+	fs.mu.Unlock()
+
+	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
+	err := fs.ReadSymlink(context.Background(), op)
+	if !errors.Is(err, syscall.ENAMETOOLONG) {
+		t.Fatalf("err = %v, want ENAMETOOLONG", err)
+	}
+	if hydrator.calls != 0 {
+		t.Fatalf("EnsureHydrated calls = %d, want 0", hydrator.calls)
+	}
+	if op.Target != "" {
+		t.Fatalf("target = %q, want empty", op.Target)
 	}
 }

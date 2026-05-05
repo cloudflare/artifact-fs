@@ -505,6 +505,9 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 		return syscall.ENOENT
 	}
 	if n.Base.ObjectOID != "" {
+		if n.Base.SizeState == "known" && n.Base.SizeBytes > maxSymlinkTargetBytes {
+			return syscall.ENAMETOOLONG
+		}
 		cachePath, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
 		if err != nil {
 			return syscall.EIO
