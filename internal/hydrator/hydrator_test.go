@@ -292,11 +292,83 @@ func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
 	}
 }
 
+func TestReadBlobRejectsKnownOversizedWithoutFetch(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "known", SizeBytes: 6}
+	fetcher := &fakeBlobFetcher{payload: []byte("target")}
+	h := New(fetcher)
+
+	_, err := h.ReadBlob(context.Background(), cfg, node, 5)
+	if !errors.Is(err, model.ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	if fetcher.Calls() != 0 {
+		t.Fatalf("BlobToCache calls = %d, want 0", fetcher.Calls())
+	}
+	if fetcher.ReadBlobCalls() != 0 {
+		t.Fatalf("ReadBlob calls = %d, want 0", fetcher.ReadBlobCalls())
+	}
+}
+
+func TestReadBlobUsesBoundedFetcherForUnknownSize(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
+	fetcher := &fakeBlobFetcher{payload: []byte("target")}
+	h := New(fetcher)
+
+	_, err := h.ReadBlob(context.Background(), cfg, node, 5)
+	if !errors.Is(err, model.ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	if fetcher.Calls() != 0 {
+		t.Fatalf("BlobToCache calls = %d, want 0", fetcher.Calls())
+	}
+	if fetcher.ReadBlobCalls() != 1 {
+		t.Fatalf("ReadBlob calls = %d, want 1", fetcher.ReadBlobCalls())
+	}
+}
+
+func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
+	cachePath := filepath.Join(tmp, node.ObjectOID)
+	if err := os.WriteFile(cachePath, []byte("oversized"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &fakeBlobFetcher{payload: []byte("ok"), verifyOK: true}
+	h := New(fetcher)
+
+	data, err := h.ReadBlob(context.Background(), cfg, node, 5)
+	if err != nil {
+		t.Fatalf("ReadBlob: %v", err)
+	}
+	if string(data) != "ok" {
+		t.Fatalf("data = %q, want ok", data)
+	}
+	if fetcher.VerifyCalls() != 0 {
+		t.Fatalf("VerifyBlob calls = %d, want 0", fetcher.VerifyCalls())
+	}
+	if fetcher.ReadBlobCalls() != 1 {
+		t.Fatalf("ReadBlob calls = %d, want 1", fetcher.ReadBlobCalls())
+	}
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("cache file should be left alone: %v", err)
+	}
+}
+
 type fakeBlobFetcher struct {
 	mu            sync.Mutex
 	calls         int
+	readBlobCalls int
 	verifyCalls   int
 	payload       []byte
+	readBlobErr   error
 	verifyOK      bool
 	verifyErr     error
 	verifyStarted chan struct{}
@@ -315,6 +387,19 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ s
 		return 0, err
 	}
 	return int64(len(f.payload)), nil
+}
+
+func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoConfig, _ string, maxBytes int64) ([]byte, error) {
+	f.mu.Lock()
+	f.readBlobCalls++
+	f.mu.Unlock()
+	if f.readBlobErr != nil {
+		return nil, f.readBlobErr
+	}
+	if int64(len(f.payload)) > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	return f.payload, nil
 }
 
 func (f *fakeBlobFetcher) VerifyBlob(_ context.Context, _ model.RepoConfig, _ string, _ string) (bool, error) {
@@ -337,6 +422,12 @@ func (f *fakeBlobFetcher) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeBlobFetcher) ReadBlobCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readBlobCalls
 }
 
 func (f *fakeBlobFetcher) VerifyCalls() int {

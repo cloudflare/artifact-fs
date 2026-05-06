@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,6 +86,50 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "line\n" {
 		t.Fatalf("expected 'line\\n', got %q", data)
+	}
+}
+
+func TestReadBlobRespectsMaxBytes(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	os.WriteFile(filepath.Join(repo, "file.txt"), []byte("line\n"), 0o644)
+	run(t, "git", "-C", repo, "add", "file.txt")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	ctx := context.Background()
+	oid, _, _ := store.ResolveHEAD(ctx, cfg)
+	nodes, _ := store.BuildTreeIndex(ctx, cfg, oid)
+	var blobOID string
+	for _, n := range nodes {
+		if n.Path == "file.txt" {
+			blobOID = n.ObjectOID
+		}
+	}
+	if blobOID == "" {
+		t.Fatal("no blob OID found")
+	}
+
+	data, err := store.ReadBlob(ctx, cfg, blobOID, 5)
+	if err != nil {
+		t.Fatalf("ReadBlob at limit: %v", err)
+	}
+	if string(data) != "line\n" {
+		t.Fatalf("data = %q, want line\\n", data)
+	}
+	_, err = store.ReadBlob(ctx, cfg, blobOID, 4)
+	if !errors.Is(err, model.ErrBlobTooLarge) {
+		t.Fatalf("err = %v, want ErrBlobTooLarge", err)
+	}
+	data, err = store.ReadBlob(ctx, cfg, blobOID, 5)
+	if err != nil {
+		t.Fatalf("ReadBlob after oversized read: %v", err)
+	}
+	if string(data) != "line\n" {
+		t.Fatalf("data after oversized read = %q, want line\\n", data)
 	}
 }
 

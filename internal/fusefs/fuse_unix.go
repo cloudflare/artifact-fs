@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -478,26 +477,6 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 // symlink can point at anyway.
 const maxSymlinkTargetBytes = 4096
 
-// readSymlinkTarget reads a cached Git blob and returns its contents as a
-// symlink target. Git stores the target as the raw blob body, so nothing
-// stops a repo from parking a very large payload behind a mode 120000 entry.
-// We read with a bounded LimitReader and reject anything past PATH_MAX.
-func readSymlinkTarget(cachePath string) (string, error) {
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxSymlinkTargetBytes+1))
-	if err != nil {
-		return "", err
-	}
-	if len(data) > maxSymlinkTargetBytes {
-		return "", syscall.ENAMETOOLONG
-	}
-	return string(data), nil
-}
-
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
@@ -508,24 +487,33 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 		return syscall.ENOENT
 	}
 	if n.Base.ObjectOID != "" {
-		if n.Base.SizeState == "known" && n.Base.SizeBytes > maxSymlinkTargetBytes {
-			return syscall.ENAMETOOLONG
+		if err := validateKnownSymlinkTargetSize(n.Base); err != nil {
+			return err
 		}
-		cachePath, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
+		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, maxSymlinkTargetBytes)
 		if err != nil {
-			return syscall.EIO
-		}
-		target, err := readSymlinkTarget(cachePath)
-		if err != nil {
-			if errors.Is(err, syscall.ENAMETOOLONG) {
+			if errors.Is(err, model.ErrBlobTooLarge) {
 				return syscall.ENAMETOOLONG
 			}
 			return syscall.EIO
 		}
-		op.Target = target
+		op.Target = string(data)
 		return nil
 	}
 	return syscall.ENOENT
+}
+
+func validateKnownSymlinkTargetSize(node model.BaseNode) error {
+	if node.SizeState != "known" {
+		return nil
+	}
+	if node.SizeBytes < 0 {
+		return syscall.EIO
+	}
+	if node.SizeBytes > maxSymlinkTargetBytes {
+		return syscall.ENAMETOOLONG
+	}
+	return nil
 }
 
 func (fs *ArtifactFuse) FlushFile(_ context.Context, _ *fuseops.FlushFileOp) error {

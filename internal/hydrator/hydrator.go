@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 type BlobFetcher interface {
 	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
 	VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (ok bool, err error)
 }
 
@@ -133,6 +135,48 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	case r := <-ch:
 		return r.cachePath, r.size, r.err
 	}
+}
+
+func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node model.BaseNode, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
+	}
+	if node.SizeState == "known" && node.SizeBytes > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	cachePath := cachePathFor(repo, node.ObjectOID)
+	if st, err := os.Stat(cachePath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	} else if st.Size() > maxBytes {
+		return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
+	}
+	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
+		return nil, err
+	} else if ok {
+		return readCachedBlob(cachePath, size, maxBytes)
+	}
+	return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
+}
+
+func readCachedBlob(cachePath string, size int64, maxBytes int64) ([]byte, error) {
+	if size > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	return data, nil
 }
 
 func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig, cachePath string, node model.BaseNode) (size int64, ok bool, err error) {
