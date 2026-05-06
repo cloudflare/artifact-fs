@@ -32,6 +32,8 @@ type readBlobResult struct {
 	err  error
 }
 
+const maxReadBlobBytes int64 = 1<<31 - 1
+
 func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
@@ -512,7 +514,13 @@ func (b *batchCatFile) readBlob(oid string, maxBytes int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if size < 0 {
+		return nil, fmt.Errorf("negative blob size: %d", size)
+	}
 	if size > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	if size > maxReadBlobBytes {
 		return nil, model.ErrBlobTooLarge
 	}
 	data := make([]byte, int(size))
