@@ -112,21 +112,39 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 	return e.Overlay.Remove(ctx, path)
 }
 
-// SetMtime updates the mtime for a path in the overlay. No-op for base files
-// not yet promoted to the overlay (their mtime comes from the generation epoch).
-func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) {
-	_ = e.Overlay.SetMtime(ctx, path, t)
+// SetMtime promotes base files/directories before updating mtime so the
+// caller-controlled timestamp never overwrites base snapshot attrs.
+func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) error {
+	path = model.CleanPath(path)
+	if path == "." {
+		return fs.ErrInvalid
+	}
+	if _, ok := e.Overlay.Get(path); !ok {
+		n, err := e.Resolver.ResolvePath(path)
+		if err != nil {
+			return err
+		}
+		switch n.Base.Type {
+		case "dir":
+			if err := e.Overlay.Mkdir(ctx, path, n.Base.Mode); err != nil {
+				return err
+			}
+		case "file":
+			if err := e.ensureOverlay(ctx, path); err != nil {
+				return err
+			}
+		default:
+			return fs.ErrInvalid
+		}
+	}
+	return e.Overlay.SetMtime(ctx, path, t)
 }
 
 func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 	if err := e.ensureOverlay(ctx, path); err != nil {
 		return err
 	}
-	ov, ok := e.Overlay.Get(path)
-	if !ok {
-		return os.ErrNotExist
-	}
-	return os.Truncate(ov.BackingPath, size)
+	return e.Overlay.Truncate(ctx, path, size)
 }
 
 // PrefetchDir enqueues file children of a directory for speculative hydration.

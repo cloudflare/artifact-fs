@@ -73,15 +73,16 @@ func (r *Resolver) Lookup(parent, name string) (ResolvedNode, error) {
 	return r.ResolvePath(p)
 }
 
-func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, err error) {
+func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
 	n, err := r.ResolvePath(path)
 	if err != nil {
-		return 0, 0, "", time.Time{}, err
+		return 0, 0, "", time.Time{}, time.Time{}, err
 	}
 	if n.FromOverlay {
 		typ := n.Overlay.NodeType()
 		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
-		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, nil
+		ct := time.Unix(0, n.Overlay.CtimeUnixNs)
+		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, nil
 	}
 	mode = normalizeMode(n.Base.Mode, n.Base.Type)
 	// Base files use the HEAD commit timestamp for mtime so tools like
@@ -91,7 +92,7 @@ func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType strin
 		ct = r.Generation() // fallback: commit time unavailable
 	}
 	mt := time.Unix(ct, 0)
-	return mode, n.Base.SizeBytes, n.Base.Type, mt, nil
+	return mode, n.Base.SizeBytes, n.Base.Type, mt, mt, nil
 }
 
 // normalizeMode ensures sane permission bits. Git tree entries have mode 040000
@@ -141,6 +142,9 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	ovEntries, err := r.Overlay.ListByPrefix(ctx, path)
 	if err == nil {
 		for _, e := range ovEntries {
+			if e.Path == path {
+				continue
+			}
 			name, ok := childName(path, e.Path)
 			if !ok {
 				continue

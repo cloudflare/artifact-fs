@@ -23,6 +23,7 @@ var migrations = []string{
 	  mode INTEGER NOT NULL,
 	  size_bytes INTEGER NOT NULL DEFAULT 0,
 	  mtime_unix_ns INTEGER NOT NULL,
+	  ctime_unix_ns INTEGER NOT NULL,
 	  source_oid TEXT,
 	  target_path TEXT
 	);`,
@@ -43,6 +44,9 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
 		return nil, err
 	}
+	if err := ensureOverlaySchema(ctx, db); err != nil {
+		return nil, err
+	}
 	upperDir := filepath.Join(cfg.OverlayDir, "upper")
 	if err := os.MkdirAll(upperDir, 0o755); err != nil {
 		return nil, err
@@ -50,16 +54,48 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 	return &Store{db: db, repo: cfg, upperDir: upperDir}, nil
 }
 
+func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(overlay_entries)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasCtime := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == "ctime_unix_ns" {
+			hasCtime = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasCtime {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN ctime_unix_ns INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	_, err = db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=? WHERE ctime_unix_ns=0`, time.Now().UnixNano())
+	return err
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
 // the Scan call in queryEntries and the single-row scan in Get.
-const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path`
+const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path`
 
 func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 	row := s.db.QueryRow(`SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
 	var e model.OverlayEntry
-	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
 		return model.OverlayEntry{}, false
 	}
 	e.RepoID = s.repo.ID
@@ -96,6 +132,7 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 	if err != nil {
 		return model.OverlayEntry{}, err
 	}
+	now := time.Now().UnixNano()
 	e := model.OverlayEntry{
 		RepoID:      s.repo.ID,
 		Path:        model.CleanPath(path),
@@ -103,7 +140,8 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 		BackingPath: backing,
 		Mode:        base.Mode,
 		SizeBytes:   st.Size(),
-		MtimeUnixNs: time.Now().UnixNano(),
+		MtimeUnixNs: now,
+		CtimeUnixNs: now,
 		SourceOID:   base.ObjectOID,
 	}
 	if err := s.upsertEntry(ctx, e); err != nil {
@@ -120,7 +158,8 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 	if err := os.WriteFile(backing, nil, os.FileMode(mode)); err != nil {
 		return model.OverlayEntry{}, err
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: model.OverlayKindCreate, BackingPath: backing, Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: model.OverlayKindCreate, BackingPath: backing, Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		return model.OverlayEntry{}, err
 	}
@@ -142,12 +181,32 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 		return n, err
 	}
 	st, _ := f.Stat()
+	now := time.Now().UnixNano()
 	e.SizeBytes = st.Size()
-	e.MtimeUnixNs = time.Now().UnixNano()
+	e.MtimeUnixNs = now
+	e.CtimeUnixNs = now
 	if e.Kind != model.OverlayKindCreate {
 		e.Kind = model.OverlayKindModify
 	}
 	return n, s.upsertEntry(ctx, e)
+}
+
+func (s *Store) Truncate(ctx context.Context, path string, size int64) error {
+	e, ok := s.Get(path)
+	if !ok || e.IsDeleted() {
+		return os.ErrNotExist
+	}
+	if err := os.Truncate(e.BackingPath, size); err != nil {
+		return err
+	}
+	now := time.Now().UnixNano()
+	e.SizeBytes = size
+	e.MtimeUnixNs = now
+	e.CtimeUnixNs = now
+	if e.Kind != model.OverlayKindCreate {
+		e.Kind = model.OverlayKindModify
+	}
+	return s.upsertEntry(ctx, e)
 }
 
 func (s *Store) Remove(ctx context.Context, path string) error {
@@ -155,7 +214,8 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 	if e, ok := s.Get(path); ok && e.BackingPath != "" {
 		_ = os.Remove(e.BackingPath)
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindDelete, Mode: 0, MtimeUnixNs: time.Now().UnixNano()}
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindDelete, Mode: 0, MtimeUnixNs: now, CtimeUnixNs: now}
 	return s.upsertEntry(ctx, e)
 }
 
@@ -181,10 +241,10 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, oldPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindRename, newBacking, e.Mode, e.SizeBytes, now, e.SourceOID, newPath); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindRename, newBacking, e.Mode, e.SizeBytes, now, now, e.SourceOID, newPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns`, oldPath, model.OverlayKindDelete, "", 0, 0, now, "", ""); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", ""); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -197,7 +257,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 			// state. If this also fails, the overlay is inconsistent -- logged
 			// upstream by the daemon.
 			s.db.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath)
-			s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, oldPath, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.SourceOID, e.TargetPath)
+			s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, oldPath, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.TargetPath)
 			return err
 		}
 	}
@@ -209,15 +269,16 @@ func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
 	if err := os.MkdirAll(s.backingPath(path), os.FileMode(mode)); err != nil {
 		return err
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
 	return s.upsertEntry(ctx, e)
 }
 
 func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 	path = model.CleanPath(path)
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE overlay_entries SET mtime_unix_ns=? WHERE path=?`,
-		t.UnixNano(), path)
+		`UPDATE overlay_entries SET mtime_unix_ns=?, ctime_unix_ns=? WHERE path=?`,
+		t.UnixNano(), time.Now().UnixNano(), path)
 	return err
 }
 
@@ -333,7 +394,7 @@ func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]
 	var out []model.OverlayEntry
 	for rows.Next() {
 		var e model.OverlayEntry
-		if err := rows.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+		if err := rows.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
 			return nil, err
 		}
 		e.RepoID = s.repo.ID
@@ -347,16 +408,17 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 		return errors.New("empty path")
 	}
 	_, err := s.db.ExecContext(ctx, `
-	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path)
-	VALUES(?,?,?,?,?,?,?,?)
+	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path)
+	VALUES(?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(path) DO UPDATE SET
 	kind=excluded.kind,
 	backing_path=excluded.backing_path,
 	mode=excluded.mode,
 	size_bytes=excluded.size_bytes,
 	mtime_unix_ns=excluded.mtime_unix_ns,
+	ctime_unix_ns=excluded.ctime_unix_ns,
 	source_oid=excluded.source_oid,
-	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.SourceOID, e.TargetPath)
+	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.TargetPath)
 	return err
 }
 

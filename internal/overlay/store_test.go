@@ -50,11 +50,37 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+
+	if _, err := s.CreateFile(ctx, "old.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=0 WHERE path=?`, "old.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	got, ok := reopened.Get("old.txt")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if got.CtimeUnixNs == 0 {
+		t.Fatal("expected zero ctime to be repaired")
+	}
+}
+
 func TestWriteAndRead(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
 	s.CreateFile(ctx, "f.txt", 0o644)
+	created, _ := s.Get("f.txt")
 	n, err := s.WriteFile(ctx, "f.txt", 0, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -70,6 +96,12 @@ func TestWriteAndRead(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Fatalf("got %q, want %q", data, "hello")
+	}
+	if e.CtimeUnixNs < created.CtimeUnixNs {
+		t.Fatalf("ctime moved backward: got %d before %d", e.CtimeUnixNs, created.CtimeUnixNs)
+	}
+	if e.MtimeUnixNs != e.CtimeUnixNs {
+		t.Fatalf("write should set mtime and ctime together: mtime=%d ctime=%d", e.MtimeUnixNs, e.CtimeUnixNs)
 	}
 }
 
@@ -164,6 +196,39 @@ func TestMkdir(t *testing.T) {
 	e, ok := s.Get("subdir")
 	if !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("expected mkdir entry, got %+v", e)
+	}
+}
+
+func TestTruncateUpdatesSizeAndTimes(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if _, err := s.CreateFile(ctx, "trunc.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "trunc.txt", 0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	if err := s.SetMtime(ctx, "trunc.txt", target); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Truncate(ctx, "trunc.txt", 2); err != nil {
+		t.Fatal(err)
+	}
+
+	e, ok := s.Get("trunc.txt")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if e.SizeBytes != 2 {
+		t.Fatalf("size = %d, want 2", e.SizeBytes)
+	}
+	if e.MtimeUnixNs == target.UnixNano() || e.CtimeUnixNs == target.UnixNano() {
+		t.Fatalf("truncate should replace user mtime with mutation time: mtime=%d ctime=%d", e.MtimeUnixNs, e.CtimeUnixNs)
+	}
+	if e.MtimeUnixNs != e.CtimeUnixNs {
+		t.Fatalf("truncate should set mtime and ctime together: mtime=%d ctime=%d", e.MtimeUnixNs, e.CtimeUnixNs)
 	}
 }
 
@@ -335,5 +400,11 @@ func TestSetMtime(t *testing.T) {
 	got := time.Unix(0, e.MtimeUnixNs)
 	if !got.Equal(target) {
 		t.Fatalf("mtime = %v, want %v", got, target)
+	}
+	if e.CtimeUnixNs == target.UnixNano() {
+		t.Fatalf("ctime should not be caller-controlled: ctime=%v target=%v", time.Unix(0, e.CtimeUnixNs), target)
+	}
+	if e.CtimeUnixNs == 0 {
+		t.Fatal("ctime should be non-zero")
 	}
 }

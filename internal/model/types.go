@@ -74,6 +74,7 @@ type OverlayEntry struct {
 	Mode        uint32
 	SizeBytes   int64
 	MtimeUnixNs int64
+	CtimeUnixNs int64
 	SourceOID   string
 	TargetPath  string
 }
@@ -159,6 +160,7 @@ type OverlayStore interface {
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
+	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string) error
 	Mkdir(ctx context.Context, path string, mode uint32) error

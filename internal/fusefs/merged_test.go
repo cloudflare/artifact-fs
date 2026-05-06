@@ -3,6 +3,7 @@ package fusefs
 import (
 	"context"
 	"errors"
+	iofs "io/fs"
 	"testing"
 	"time"
 
@@ -43,8 +44,14 @@ func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
 func (f *fakeOverlay) ListByPrefix(_ context.Context, _ string) ([]model.OverlayEntry, error) {
 	return f.list, nil
 }
-func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, _ string, _ model.BaseNode) (model.OverlayEntry, error) {
-	return model.OverlayEntry{}, nil
+func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+	if f.entries == nil {
+		f.entries = map[string]model.OverlayEntry{}
+	}
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, Mode: base.Mode, MtimeUnixNs: now, CtimeUnixNs: now, SourceOID: base.ObjectOID}
+	f.entries[e.Path] = e
+	return e, nil
 }
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil
@@ -52,10 +59,24 @@ func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.O
 func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, _ []byte) (int, error) {
 	return 0, nil
 }
-func (f *fakeOverlay) Remove(_ context.Context, _ string) error                { return nil }
-func (f *fakeOverlay) Rename(_ context.Context, _, _ string) error             { return nil }
-func (f *fakeOverlay) Mkdir(_ context.Context, _ string, _ uint32) error       { return nil }
-func (f *fakeOverlay) SetMtime(_ context.Context, _ string, _ time.Time) error { return nil }
+func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
+func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
+func (f *fakeOverlay) Rename(_ context.Context, _, _ string) error         { return nil }
+func (f *fakeOverlay) Mkdir(_ context.Context, path string, mode uint32) error {
+	if f.entries == nil {
+		f.entries = map[string]model.OverlayEntry{}
+	}
+	now := time.Now().UnixNano()
+	f.entries[model.CleanPath(path)] = model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindMkdir, Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
+	return nil
+}
+func (f *fakeOverlay) SetMtime(_ context.Context, path string, t time.Time) error {
+	e := f.entries[model.CleanPath(path)]
+	e.MtimeUnixNs = t.UnixNano()
+	e.CtimeUnixNs = time.Now().UnixNano()
+	f.entries[model.CleanPath(path)] = e
+	return nil
+}
 func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
 	return nil
 }
@@ -94,18 +115,22 @@ func TestResolveOverlayTakesPrecedence(t *testing.T) {
 
 func TestGetattrReturnsMtime(t *testing.T) {
 	mtime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	ctime := time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC).UnixNano()
 	r := newResolver(
-		&fakeSnapshot{},
+		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {}}},
 		&fakeOverlay{
-			entries: map[string]model.OverlayEntry{"x.txt": {Path: "x.txt", Kind: model.OverlayKindCreate, Mode: 0o644, SizeBytes: 10, MtimeUnixNs: mtime}},
+			entries: map[string]model.OverlayEntry{"x.txt": {Path: "x.txt", Kind: model.OverlayKindCreate, Mode: 0o644, SizeBytes: 10, MtimeUnixNs: mtime, CtimeUnixNs: ctime}},
 		},
 	)
-	_, _, _, mt, err := r.Getattr("x.txt")
+	_, _, _, mt, ct, err := r.Getattr("x.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if mt.UnixNano() != mtime {
 		t.Fatalf("mtime = %v, want %v", mt, time.Unix(0, mtime))
+	}
+	if ct.UnixNano() != ctime {
+		t.Fatalf("ctime = %v, want %v", ct, time.Unix(0, ctime))
 	}
 }
 
@@ -118,13 +143,16 @@ func TestGetattrBaseFileUsesCommitTime(t *testing.T) {
 	commitTS := int64(1700000000) // 2023-11-14
 	r.SetCommitTime(commitTS)
 
-	_, _, _, mt, err := r.Getattr("b.txt")
+	_, _, _, mt, ct, err := r.Getattr("b.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := time.Unix(commitTS, 0)
 	if !mt.Equal(expected) {
 		t.Fatalf("mtime = %v, want %v", mt, expected)
+	}
+	if !ct.Equal(expected) {
+		t.Fatalf("ctime = %v, want %v", ct, expected)
 	}
 }
 
@@ -134,13 +162,63 @@ func TestGetattrBaseFileFallsBackToGeneration(t *testing.T) {
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
 	// Don't set commit time -- should fall back to generation.
-	_, _, _, mt, err := r.Getattr("b.txt")
+	_, _, _, mt, ct, err := r.Getattr("b.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	expected := time.Unix(1, 0) // generation = 1
 	if !mt.Equal(expected) {
 		t.Fatalf("mtime = %v, want %v", mt, expected)
+	}
+	if !ct.Equal(expected) {
+		t.Fatalf("ctime = %v, want %v", ct, expected)
+	}
+}
+
+func TestSetMtimePromotesBaseFileWithSeparateCtime(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"b.txt": {Path: "b.txt", Type: "file", Mode: 0o644, SizeState: "known", SizeBytes: 5}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := engine.SetMtime(context.Background(), "b.txt", target); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ov.entries["b.txt"]
+	if !ok {
+		t.Fatal("expected base file to be promoted")
+	}
+	if got.MtimeUnixNs != target.UnixNano() {
+		t.Fatalf("mtime = %v, want %v", time.Unix(0, got.MtimeUnixNs), target)
+	}
+	if got.CtimeUnixNs == target.UnixNano() || got.CtimeUnixNs == 0 {
+		t.Fatalf("ctime should be non-zero and independent from caller mtime: %v", time.Unix(0, got.CtimeUnixNs))
+	}
+}
+
+func TestSetMtimeRejectsRootAndBaseSymlink(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{
+			".":    {Path: ".", Type: "dir", Mode: 0o755},
+			"link": {Path: "link", Type: "symlink", Mode: 0o120000},
+		}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := engine.SetMtime(context.Background(), ".", target); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("root SetMtime err = %v, want ErrInvalid", err)
+	}
+	if _, ok := ov.entries["."]; ok {
+		t.Fatal("root SetMtime should not create an overlay entry")
+	}
+	if err := engine.SetMtime(context.Background(), "link", target); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("symlink SetMtime err = %v, want ErrInvalid", err)
 	}
 }
 
@@ -169,6 +247,26 @@ func TestReaddirMergesSnapshotAndOverlay(t *testing.T) {
 	}
 	if !set["a.txt"] || !set["b.txt"] || !set["c.txt"] {
 		t.Fatalf("expected a.txt, b.txt, c.txt, got %v", names)
+	}
+}
+
+func TestReaddirSkipsOverlayEntryForListedDirectory(t *testing.T) {
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {}}},
+		&fakeOverlay{
+			entries: map[string]model.OverlayEntry{".": {Path: ".", Kind: model.OverlayKindMkdir}},
+			list:    []model.OverlayEntry{{Path: ".", Kind: model.OverlayKindMkdir}},
+		},
+	)
+
+	names, err := r.Readdir(context.Background(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if name == "." {
+			t.Fatal("root overlay entry should not appear as a child")
+		}
 	}
 }
 
