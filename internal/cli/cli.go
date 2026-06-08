@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -75,6 +76,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				preparedGitDir := c.Bool("prepared-gitdir")
 				if preparedGitDir && !async {
 					return fmt.Errorf("--prepared-gitdir requires --async")
+				}
+				if preparedGitDir && strings.TrimSpace(c.String("git-dir")) == "" {
+					return fmt.Errorf("--git-dir is required with --prepared-gitdir")
 				}
 				if name == "" {
 					return fmt.Errorf("--name is required")
@@ -268,7 +272,7 @@ func formatPrepareError(err string) string {
 	if strings.TrimSpace(err) == "" {
 		return "none"
 	}
-	return strings.ReplaceAll(err, " ", "_")
+	return strings.Join(strings.Fields(auth.RedactString(err)), "_")
 }
 
 func stubCommand(name, usage string, stdout io.Writer) ucli.Command {

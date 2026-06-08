@@ -207,7 +207,15 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 	}
 
 	if ref.IsRoot {
-		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", time.Now())
+		if fs.resolver != nil {
+			if mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(ref.Path); err == nil {
+				op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
+				op.AttributesExpiration = attrExpiry(time.Second)
+				return nil
+			}
+		}
+		now := time.Now()
+		op.Attributes = inodeAttrs(ref.Mode, 4096, "dir", now, now)
 		op.AttributesExpiration = attrExpiry(time.Second)
 		return nil
 	}

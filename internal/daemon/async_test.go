@@ -2,14 +2,17 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
@@ -56,7 +59,13 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer svc.Close()
+	defer func() {
+		svc.mu.Lock()
+		delete(svc.running, model.RepoID("repo"))
+		delete(svc.preparing, model.RepoID("repo"))
+		svc.mu.Unlock()
+		_ = svc.Close()
+	}()
 
 	cfg := model.RepoConfig{
 		Name:      "repo",
@@ -67,6 +76,141 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	}
 	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
 		t.Fatal("expected inline credential error")
+	}
+}
+
+func TestAddRepoPreparedGitDirValidation(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	cfg := model.RepoConfig{
+		Name:           "repo",
+		ID:             "repo",
+		Branch:         "master",
+		PreparedGitDir: true,
+		Enabled:        true,
+	}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{}); err == nil {
+		t.Fatal("expected --prepared-gitdir requires --async error")
+	}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err == nil {
+		t.Fatal("expected --git-dir required error")
+	}
+}
+
+func TestSyncReposResetsFailedGateForRegistryRetry(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		svc.mu.Lock()
+		delete(svc.running, model.RepoID("repo"))
+		delete(svc.preparing, model.RepoID("repo"))
+		svc.mu.Unlock()
+		_ = svc.Close()
+	}()
+
+	cfg := model.RepoConfig{
+		Name:      "repo",
+		ID:        "repo",
+		RemoteURL: "https://github.com/example/repo.git",
+		Branch:    "master",
+		Enabled:   true,
+	}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate := fusefs.NewReadyGate(false)
+	gate.MarkFailed(errors.New("old failure"))
+	rt := &repoRuntime{
+		cfg:    cfg,
+		gate:   gate,
+		active: false,
+		state: model.RepoRuntimeState{
+			RepoID:       cfg.ID,
+			State:        model.PrepareStateFailed,
+			PrepareError: "old failure",
+		},
+	}
+	svc.mu.Lock()
+	svc.running[cfg.ID] = rt
+	svc.preparing[cfg.ID] = true // keep this unit test from starting a real worker
+	svc.mu.Unlock()
+
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rt.state.State != model.PrepareStatePreparing {
+		t.Fatalf("runtime state = %q, want preparing", rt.state.State)
+	}
+	if rt.state.PrepareError != "" {
+		t.Fatalf("runtime prepare error = %q, want cleared", rt.state.PrepareError)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if err := gate.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("gate wait = %v, want deadline after reset instead of old failure", err)
+	}
+}
+
+func TestRunPrepareFailurePersistsRedactedError(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	cfg := model.RepoConfig{
+		Name:           "repo",
+		ID:             "repo",
+		Branch:         "master",
+		GitDir:         filepath.Join(t.TempDir(), "missing.git"),
+		PreparedGitDir: true,
+		FetchRef:       "master",
+		Enabled:        true,
+	}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.runPrepare(ctx, got); err == nil {
+		t.Fatal("expected runPrepare failure")
+	}
+	got, err = svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrepareState != model.PrepareStateFailed {
+		t.Fatalf("PrepareState = %q, want failed", got.PrepareState)
+	}
+	if got.PrepareError == "" {
+		t.Fatal("PrepareError is empty, want persisted failure")
+	}
+
+	if err := svc.setPrepareState(ctx, got, model.PrepareStateFailed, errors.New("clone https://token@example.com/org/repo.git failed")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.PrepareError, "token") {
+		t.Fatalf("PrepareError was not redacted: %q", got.PrepareError)
 	}
 }
 

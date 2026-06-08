@@ -17,8 +17,23 @@ func TestHasInlineCredentials(t *testing.T) {
 	if !HasInlineCredentials("https://token@example.com/org/repo.git") {
 		t.Fatal("expected inline credentials")
 	}
+	if !HasInlineCredentials("https://github.com/org/repo.git?access_token=secret") {
+		t.Fatal("expected token query parameter credentials")
+	}
+	if !HasInlineCredentials("https://github.com/org/repo.git?x-token-auth=secret") {
+		t.Fatal("expected token-like query parameter credentials")
+	}
 	if HasInlineCredentials("git@github.com:org/repo.git") {
 		t.Fatal("scp-style SSH remote should not count as inline credentials")
+	}
+	if HasInlineCredentials("ssh://git@github.com/org/repo.git") {
+		t.Fatal("standard SSH URL username should use ambient auth, not count as inline credentials")
+	}
+	if !HasInlineCredentials("ssh://git:secret@github.com/org/repo.git") {
+		t.Fatal("expected SSH URL password to count as inline credentials")
+	}
+	if HasInlineCredentials("https://github.com/org/repo.git?ref=main") {
+		t.Fatal("unexpected credentials in benign query")
 	}
 	if HasInlineCredentials("https://github.com/org/repo.git") {
 		t.Fatal("unexpected inline credentials")

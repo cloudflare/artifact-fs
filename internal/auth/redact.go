@@ -30,12 +30,23 @@ func RedactRemoteURL(raw string) string {
 
 func HasInlineCredentials(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
+	if err != nil {
+		return tokenLike.MatchString(raw)
+	}
+	if tokenLike.MatchString(u.RawQuery) {
+		return true
+	}
+	if u.User == nil {
 		return false
 	}
 	username := u.User.Username()
 	_, hasPassword := u.User.Password()
-	return username != "" || hasPassword
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return username != "" || hasPassword
+	default:
+		return hasPassword
+	}
 }
 
 func RedactString(s string) string {

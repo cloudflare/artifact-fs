@@ -164,6 +164,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.mu.Unlock()
 		if running {
 			if repo.PrepareState == model.PrepareStatePreparing && rt != nil && !rt.active {
+				s.resetRunningPrepareState(repo)
 				s.startPrepareWorker(ctx, repo)
 			}
 			continue
@@ -238,14 +239,21 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	if cfg.RefreshInterval <= 0 {
 		cfg.RefreshInterval = 30 * time.Second
 	}
+	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
 	s.fillPaths(&cfg)
 	if strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = cfg.Branch
 	}
 	cloneURL := cfg.RemoteURL
+	if cfg.PreparedGitDir && !opts.Async {
+		return fmt.Errorf("--prepared-gitdir requires --async")
+	}
 	if opts.Async {
 		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
 			return fmt.Errorf("--remote is required unless --prepared-gitdir is set")
+		}
+		if cfg.PreparedGitDir && !explicitGitDir {
+			return fmt.Errorf("--git-dir is required with --prepared-gitdir")
 		}
 		if auth.HasInlineCredentials(cfg.RemoteURL) {
 			return fmt.Errorf("async repositories must use ambient credentials; remove credentials from --remote")
@@ -364,17 +372,7 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	if err := s.registry.AddRepo(ctx, cfg); err != nil {
 		return err
 	}
-	var running bool
-	s.mu.Lock()
-	if rt, ok := s.running[cfg.ID]; ok && rt.gate != nil {
-		running = true
-		rt.gate.Reset()
-		rt.cfg = cfg
-		rt.state.State = model.PrepareStatePreparing
-		rt.state.PrepareError = ""
-	}
-	s.mu.Unlock()
-	if running {
+	if s.resetRunningPrepareState(cfg) {
 		s.startPrepareWorker(ctx, cfg)
 	}
 	return nil
@@ -591,6 +589,10 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 		s.mu.Unlock()
 		return
 	}
+	workerCtx := ctx
+	if rt := s.running[cfg.ID]; rt != nil && rt.ctx != nil {
+		workerCtx = rt.ctx
+	}
 	s.preparing[cfg.ID] = true
 	s.mu.Unlock()
 
@@ -600,10 +602,24 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 			delete(s.preparing, cfg.ID)
 			s.mu.Unlock()
 		}()
-		if err := s.runPrepare(ctx, cfg); err != nil {
+		if err := s.runPrepare(workerCtx, cfg); err != nil {
 			s.logger.Error("repo prepare failed", "repo", cfg.Name, "error", err)
 		}
 	}()
+}
+
+func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rt, ok := s.running[cfg.ID]
+	if !ok || rt.gate == nil {
+		return false
+	}
+	rt.gate.Reset()
+	rt.cfg = cfg
+	rt.state.State = model.PrepareStatePreparing
+	rt.state.PrepareError = ""
+	return true
 }
 
 func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {

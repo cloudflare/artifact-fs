@@ -3,8 +3,12 @@
 package fusefs
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/jacobsa/fuse/fuseops"
 )
 
 func TestInodeAttrsPreservesSeparateTimes(t *testing.T) {
@@ -44,5 +48,50 @@ func TestGitFileAttrsUsesOneTimestamp(t *testing.T) {
 	}
 	if !attr.Atime.Equal(attr.Mtime) || !attr.Ctime.Equal(attr.Mtime) {
 		t.Fatalf("expected .git attrs to use one timestamp: atime=%v mtime=%v ctime=%v", attr.Atime, attr.Mtime, attr.Ctime)
+	}
+}
+
+func TestRootInodeAttributesDoNotRequireResolver(t *testing.T) {
+	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, nil, nil)
+	op := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+
+	if err := fs.GetInodeAttributes(context.Background(), op); err != nil {
+		t.Fatalf("GetInodeAttributes(root): %v", err)
+	}
+	if !op.Attributes.Mode.IsDir() {
+		t.Fatalf("root mode = %#o, want directory", op.Attributes.Mode)
+	}
+	if op.Attributes.Size == 0 {
+		t.Fatal("root size = 0, want non-zero placeholder size")
+	}
+}
+
+func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
+	resolver := &Resolver{
+		Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{
+			".": {Path: ".", Type: "dir", Mode: 0o755, SizeBytes: 4096},
+		}},
+		Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	}
+	resolver.SetGeneration(7)
+	resolver.SetCommitTime(1_700_000_000)
+	fs := NewArtifactFuse(model.RepoConfig{Name: "repo", GitDir: "/tmp/repo.git"}, resolver, nil)
+
+	first := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+	if err := fs.GetInodeAttributes(context.Background(), first); err != nil {
+		t.Fatalf("first GetInodeAttributes(root): %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	second := &fuseops.GetInodeAttributesOp{Inode: fuseops.RootInodeID}
+	if err := fs.GetInodeAttributes(context.Background(), second); err != nil {
+		t.Fatalf("second GetInodeAttributes(root): %v", err)
+	}
+
+	want := time.Unix(1_700_000_000, 0)
+	if !first.Attributes.Mtime.Equal(want) || !second.Attributes.Mtime.Equal(want) {
+		t.Fatalf("root mtime = %v then %v, want stable %v", first.Attributes.Mtime, second.Attributes.Mtime, want)
+	}
+	if !first.Attributes.Ctime.Equal(second.Attributes.Ctime) {
+		t.Fatalf("root ctime changed: %v then %v", first.Attributes.Ctime, second.Attributes.Ctime)
 	}
 }
