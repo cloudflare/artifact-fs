@@ -27,6 +27,13 @@ type Store struct {
 	pools       map[string]*batchPool // gitDir -> pool
 }
 
+type readBlobResult struct {
+	data []byte
+	err  error
+}
+
+const maxReadBlobBytes int64 = 1<<31 - 1
+
 func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
@@ -316,6 +323,58 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	return size, err
 }
 
+func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
+	}
+	pool := s.getPool(repo.GitDir)
+	batch, err := pool.acquire()
+	if err != nil {
+		return nil, err
+	}
+	data, err := readBatchBlob(ctx, batch, objectOID, maxBytes)
+	if err == nil {
+		pool.release(batch)
+		return data, nil
+	}
+	if errors.Is(err, model.ErrBlobTooLarge) {
+		batch.kill()
+		return nil, err
+	}
+	batch.close()
+
+	batch, err = pool.acquire()
+	if err != nil {
+		return nil, err
+	}
+	data, err = readBatchBlob(ctx, batch, objectOID, maxBytes)
+	if err != nil {
+		if errors.Is(err, model.ErrBlobTooLarge) {
+			batch.kill()
+			return nil, err
+		}
+		batch.close()
+		return nil, err
+	}
+	pool.release(batch)
+	return data, nil
+}
+
+func readBatchBlob(ctx context.Context, batch *batchCatFile, objectOID string, maxBytes int64) ([]byte, error) {
+	ch := make(chan readBlobResult, 1)
+	go func() {
+		data, err := batch.readBlob(objectOID, maxBytes)
+		ch <- readBlobResult{data: data, err: err}
+	}()
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-ctx.Done():
+		batch.kill()
+		return nil, ctx.Err()
+	}
+}
+
 func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (bool, error) {
 	out, err := runGit(ctx, repo.GitDir, "hash-object", "--no-filters", cachePath)
 	if err != nil {
@@ -447,6 +506,13 @@ func (b *batchCatFile) close() {
 	}
 }
 
+func (b *batchCatFile) kill() {
+	if b.cmd != nil && b.cmd.Process != nil {
+		_ = b.cmd.Process.Kill()
+	}
+	b.close()
+}
+
 // fetchToFile writes oid to the batch process stdin, reads the response header
 // and streams the blob content directly to dstPath. Binary-safe (no string
 // conversion of blob content).
@@ -460,25 +526,9 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 		return 0, fmt.Errorf("batch write: %w", err)
 	}
 
-	// Read response header: "<oid> SP <type> SP <size> LF" or "<oid> SP missing LF"
-	header, err := b.stdout.ReadString('\n')
+	size, err := b.readObjectSize(oid)
 	if err != nil {
-		return 0, fmt.Errorf("batch read header: %w", err)
-	}
-	header = strings.TrimRight(header, "\n")
-	fields := strings.Fields(header)
-	if len(fields) < 2 {
-		return 0, fmt.Errorf("unexpected batch header: %q", header)
-	}
-	if fields[1] == "missing" {
-		return 0, fmt.Errorf("object %s missing", oid)
-	}
-	if len(fields) < 3 {
-		return 0, fmt.Errorf("unexpected batch header: %q", header)
-	}
-	size, err := strconv.ParseInt(fields[2], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse size %q: %w", fields[2], err)
+		return 0, err
 	}
 
 	// Stream blob content to a temp file, then atomic rename. The blob cache is
@@ -514,6 +564,60 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 	if err := os.Rename(tmp, dstPath); err != nil {
 		os.Remove(tmp)
 		return 0, err
+	}
+	return size, nil
+}
+
+func (b *batchCatFile) readBlob(oid string, maxBytes int64) ([]byte, error) {
+	if b.cmd == nil || b.stdin == nil {
+		return nil, errors.New("batch cat-file process not running")
+	}
+	if _, err := fmt.Fprintf(b.stdin, "%s\n", oid); err != nil {
+		return nil, fmt.Errorf("batch write: %w", err)
+	}
+	size, err := b.readObjectSize(oid)
+	if err != nil {
+		return nil, err
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("negative blob size: %d", size)
+	}
+	if size > maxBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	if size > maxReadBlobBytes {
+		return nil, model.ErrBlobTooLarge
+	}
+	data := make([]byte, int(size))
+	if _, err := io.ReadFull(b.stdout, data); err != nil {
+		return nil, fmt.Errorf("batch read content: %w", err)
+	}
+	if _, err := b.stdout.ReadByte(); err != nil {
+		return nil, fmt.Errorf("batch read trailing LF: %w", err)
+	}
+	return data, nil
+}
+
+func (b *batchCatFile) readObjectSize(oid string) (int64, error) {
+	// Read response header: "<oid> SP <type> SP <size> LF" or "<oid> SP missing LF"
+	header, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("batch read header: %w", err)
+	}
+	header = strings.TrimRight(header, "\n")
+	fields := strings.Fields(header)
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("unexpected batch header: %q", header)
+	}
+	if fields[1] == "missing" {
+		return 0, fmt.Errorf("object %s missing", oid)
+	}
+	if len(fields) < 3 {
+		return 0, fmt.Errorf("unexpected batch header: %q", header)
+	}
+	size, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse size %q: %w", fields[2], err)
 	}
 	return size, nil
 }

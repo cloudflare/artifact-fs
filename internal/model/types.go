@@ -2,11 +2,14 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+var ErrBlobTooLarge = errors.New("blob too large")
 
 type RepoID string
 
@@ -85,6 +88,7 @@ type OverlayEntry struct {
 	Mode        uint32
 	SizeBytes   int64
 	MtimeUnixNs int64
+	CtimeUnixNs int64
 	SourceOID   string
 	TargetPath  string
 }
@@ -156,6 +160,7 @@ type GitStore interface {
 	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)
 	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
 	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	ReadBlob(ctx context.Context, repo RepoConfig, objectOID string, maxBytes int64) ([]byte, error)
 	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
 	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
 	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
@@ -174,8 +179,10 @@ type OverlayStore interface {
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
+	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string) error
+	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
@@ -186,5 +193,6 @@ type OverlayStore interface {
 type Hydrator interface {
 	Enqueue(task HydrationTask)
 	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
+	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
 	QueueDepth(repoID RepoID) int
 }
