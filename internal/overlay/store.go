@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -226,9 +228,46 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if !ok || e.IsDeleted() {
 		return os.ErrNotExist
 	}
+	if oldPath == newPath {
+		return nil
+	}
 	newBacking := s.backingPath(newPath)
 	if err := os.MkdirAll(filepath.Dir(newBacking), 0o755); err != nil {
 		return err
+	}
+	newKind := model.OverlayKindRename
+	newTargetPath := oldPath
+	writeSourceWhiteout := true
+	if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
+		newTargetPath = e.TargetPath
+	}
+	mode := e.Mode
+	normalizedDirMode := false
+	var deletedDescendants []model.OverlayEntry
+	switch e.Kind {
+	case model.OverlayKindCreate, model.OverlayKindSymlink:
+		newKind = e.Kind
+		newTargetPath = ""
+		writeSourceWhiteout = false
+	case model.OverlayKindMkdir:
+		hasDescendants, err := s.hasOverlayDescendants(ctx, oldPath)
+		if err != nil {
+			return err
+		}
+		if hasDescendants {
+			return iofs.ErrInvalid
+		}
+		deletedDescendants, err = s.deletedDescendants(ctx, oldPath)
+		if err != nil {
+			return err
+		}
+		newKind = model.OverlayKindMkdir
+		newTargetPath = ""
+		writeSourceWhiteout = false
+		if normalizedMode, normalized := normalizeGitDirMode(mode); normalized {
+			mode = normalizedMode
+			normalizedDirMode = true
+		}
 	}
 	// DB transaction first, then filesystem rename. If the DB commit fails,
 	// nothing has moved on disk and the overlay remains consistent.
@@ -241,21 +280,87 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, oldPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindRename, newBacking, e.Mode, e.SizeBytes, now, now, e.SourceOID, newPath); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, mode, e.SizeBytes, e.MtimeUnixNs, now, e.SourceOID, newTargetPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", ""); err != nil {
-		return err
+	if e.Kind == model.OverlayKindMkdir {
+		prefix := oldPath + "/"
+		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE kind=? AND substr(path, 1, length(?))=?`, model.OverlayKindDelete, prefix, prefix); err != nil {
+			return err
+		}
+	}
+	if writeSourceWhiteout {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns,target_path=excluded.target_path`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", newTargetPath); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	// Filesystem rename after successful commit.
 	if e.BackingPath != "" {
+		restoreDB := func() {
+			s.db.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath)
+			s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, oldPath, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.TargetPath)
+			for _, d := range deletedDescendants {
+				s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, d.Path, d.Kind, d.BackingPath, d.Mode, d.SizeBytes, d.MtimeUnixNs, d.CtimeUnixNs, d.SourceOID, d.TargetPath)
+			}
+		}
 		if err := os.Rename(e.BackingPath, newBacking); err != nil {
 			// DB is committed but file didn't move. Attempt to roll back the DB
 			// state. If this also fails, the overlay is inconsistent -- logged
 			// upstream by the daemon.
+			restoreDB()
+			return err
+		}
+		if normalizedDirMode {
+			if err := os.Chmod(newBacking, os.FileMode(mode)); err != nil {
+				restoreDB()
+				_ = os.Rename(newBacking, e.BackingPath)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) deletedDescendants(ctx context.Context, path string) ([]model.OverlayEntry, error) {
+	prefix := model.CleanPath(path) + "/"
+	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE kind=? AND substr(path, 1, length(?))=? ORDER BY path`, model.OverlayKindDelete, prefix, prefix)
+}
+
+func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error {
+	oldPath = model.CleanPath(oldPath)
+	newPath = model.CleanPath(newPath)
+	e, ok := s.Get(oldPath)
+	if !ok || e.IsDeleted() {
+		return os.ErrNotExist
+	}
+	if oldPath == newPath {
+		_, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, target_path='' WHERE path=?`, model.OverlayKindModify, sourceOID, oldPath)
+		return err
+	}
+	newBacking := s.backingPath(newPath)
+	if err := os.MkdirAll(filepath.Dir(newBacking), 0o755); err != nil {
+		return err
+	}
+	now := time.Now().UnixNano()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, oldPath); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindModify, newBacking, e.Mode, e.SizeBytes, e.MtimeUnixNs, now, sourceOID, ""); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if e.BackingPath != "" {
+		if err := os.Rename(e.BackingPath, newBacking); err != nil {
 			s.db.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath)
 			s.db.ExecContext(ctx, `INSERT OR REPLACE INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, oldPath, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.TargetPath)
 			return err
@@ -264,18 +369,62 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	return nil
 }
 
+func (s *Store) hasOverlayDescendants(ctx context.Context, path string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	prefix := path + "/"
+	for rows.Next() {
+		var candidate string
+		if err := rows.Scan(&candidate); err != nil {
+			return false, err
+		}
+		if strings.HasPrefix(candidate, prefix) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
 	path = model.CleanPath(path)
-	if err := os.MkdirAll(s.backingPath(path), os.FileMode(mode)); err != nil {
+	mode, normalized := normalizeGitDirMode(mode)
+	backing := s.backingPath(path)
+	if err := os.MkdirAll(backing, os.FileMode(mode)); err != nil {
 		return err
 	}
+	if normalized {
+		if err := os.Chmod(backing, os.FileMode(mode)); err != nil {
+			return err
+		}
+	}
 	now := time.Now().UnixNano()
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: backing, Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
 	return s.upsertEntry(ctx, e)
+}
+
+func normalizeGitDirMode(mode uint32) (uint32, bool) {
+	if mode&0o170000 == 0o40000 && mode&0o777 == 0 {
+		return 0o755, true
+	}
+	return mode, false
 }
 
 func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 	path = model.CleanPath(path)
+	if e, ok := s.Get(path); ok && e.Kind == model.OverlayKindMkdir {
+		if mode, normalized := normalizeGitDirMode(e.Mode); normalized {
+			if err := os.Chmod(e.BackingPath, os.FileMode(mode)); err != nil {
+				return err
+			}
+			_, err := s.db.ExecContext(ctx,
+				`UPDATE overlay_entries SET mode=?, mtime_unix_ns=?, ctime_unix_ns=? WHERE path=?`,
+				mode, t.UnixNano(), time.Now().UnixNano(), path)
+			return err
+		}
+	}
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE overlay_entries SET mtime_unix_ns=?, ctime_unix_ns=? WHERE path=?`,
 		t.UnixNano(), time.Now().UnixNano(), path)
@@ -286,8 +435,9 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 // snapshot. Called after a generation change (commit, branch switch, fetch).
 //
 // Rules for each overlay entry:
-//   - modify/rename with source_oid matching the new base OID: base unchanged, KEEP
-//   - modify/rename with source_oid != new base OID: base changed, REMOVE
+//   - modify with source_oid matching the base OID at path: base unchanged, KEEP
+//   - rename with source_oid matching the base OID at original path: base unchanged, KEEP
+//   - modify/rename with source_oid mismatch: base changed, REMOVE
 //   - create where base now has the path: was committed or exists on new branch, REMOVE
 //   - create where base doesn't have the path: user-created, KEEP
 //   - delete (whiteout) where base doesn't have the path: irrelevant, REMOVE
@@ -303,26 +453,42 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 		return fmt.Errorf("reconcile list: %w", err)
 	}
 	var toRemove []model.OverlayEntry
+	staleRenameSources := map[string]bool{}
 	for _, e := range entries {
 		base, baseExists := baseLookup(e.Path)
-		switch {
-		case e.Kind == model.OverlayKindDelete:
-			if !baseExists {
-				toRemove = append(toRemove, e)
-			}
-		case e.Kind == model.OverlayKindCreate:
-			if baseExists {
-				toRemove = append(toRemove, e)
-			}
-		case e.Kind == model.OverlayKindMkdir:
-			if baseExists && base.Type == "dir" {
-				toRemove = append(toRemove, e)
-			}
-		case e.Kind == model.OverlayKindModify || e.Kind == model.OverlayKindRename:
+		switch e.Kind {
+		case model.OverlayKindModify:
 			// Keep only if the base file still exists with the same OID the
 			// overlay was derived from. Otherwise the base changed (commit,
 			// branch switch) or disappeared and the overlay is stale.
 			if !baseExists || e.SourceOID != base.ObjectOID {
+				toRemove = append(toRemove, e)
+			}
+		case model.OverlayKindRename:
+			sourcePath := e.TargetPath
+			if sourcePath == "" {
+				sourcePath = e.Path
+			}
+			sourceBase, sourceExists := baseLookup(sourcePath)
+			if !sourceExists || e.SourceOID != sourceBase.ObjectOID {
+				toRemove = append(toRemove, e)
+				staleRenameSources[sourcePath] = true
+			}
+		}
+	}
+	for _, e := range entries {
+		base, baseExists := baseLookup(e.Path)
+		switch e.Kind {
+		case model.OverlayKindDelete:
+			if staleRenameSources[e.Path] || staleRenameSources[e.TargetPath] || !baseExists {
+				toRemove = append(toRemove, e)
+			}
+		case model.OverlayKindCreate:
+			if baseExists {
+				toRemove = append(toRemove, e)
+			}
+		case model.OverlayKindMkdir:
+			if baseExists && base.Type == "dir" {
 				toRemove = append(toRemove, e)
 			}
 		}
@@ -344,9 +510,14 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 		return err
 	}
 	defer stmt.Close()
+	deleted := make([]model.OverlayEntry, 0, len(toRemove))
 	for _, e := range toRemove {
-		if _, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.MtimeUnixNs); err != nil {
+		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.MtimeUnixNs)
+		if err != nil {
 			return err
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			deleted = append(deleted, e)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -356,7 +527,7 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 	// before commit and the transaction rolled back, DB rows would reference
 	// non-existent files. Reverse order so children are removed before parents
 	// (os.Remove fails on non-empty directories).
-	for _, v := range slices.Backward(toRemove) {
+	for _, v := range slices.Backward(deleted) {
 		if v.BackingPath != "" {
 			_ = os.Remove(v.BackingPath)
 		}

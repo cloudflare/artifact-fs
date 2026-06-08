@@ -2,6 +2,8 @@ package overlay
 
 import (
 	"context"
+	"errors"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -122,11 +124,24 @@ func TestRemoveCreatesWhiteout(t *testing.T) {
 }
 
 func TestRenameDBFirst(t *testing.T) {
-	s, _ := testStore(t)
+	s, cfg := testStore(t)
 	ctx := context.Background()
 
-	s.CreateFile(ctx, "old.txt", 0o644)
-	s.WriteFile(ctx, "old.txt", 0, []byte("content"))
+	base := model.BaseNode{Path: "old.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "old.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "old.txt", 0, []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	if err := s.SetMtime(ctx, "old.txt", target); err != nil {
+		t.Fatal(err)
+	}
+	before, ok := s.Get("old.txt")
+	if !ok {
+		t.Fatal("expected old entry")
+	}
 
 	if err := s.Rename(ctx, "old.txt", "new.txt"); err != nil {
 		t.Fatal(err)
@@ -135,6 +150,10 @@ func TestRenameDBFirst(t *testing.T) {
 	// Old path should have a whiteout
 	if e, ok := s.Get("old.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("expected whiteout at old path")
+	} else {
+		if e.MtimeUnixNs == target.UnixNano() || e.CtimeUnixNs == target.UnixNano() {
+			t.Fatalf("whiteout times should not inherit user mtime: %+v", e)
+		}
 	}
 	// New path should exist
 	got, ok := s.Get("new.txt")
@@ -151,6 +170,329 @@ func TestRenameDBFirst(t *testing.T) {
 	}
 	if got.SizeBytes != int64(len("content")) {
 		t.Fatalf("size = %d, want %d", got.SizeBytes, len("content"))
+	}
+	if got.MtimeUnixNs != target.UnixNano() {
+		t.Fatalf("mtime = %v, want %v", time.Unix(0, got.MtimeUnixNs), target)
+	}
+	if got.CtimeUnixNs == target.UnixNano() || got.CtimeUnixNs == 0 {
+		t.Fatalf("ctime should advance independently from mtime: %v", time.Unix(0, got.CtimeUnixNs))
+	}
+	if got.CtimeUnixNs == before.CtimeUnixNs {
+		t.Fatalf("rename should bump ctime: before=%v after=%v", time.Unix(0, before.CtimeUnixNs), time.Unix(0, got.CtimeUnixNs))
+	}
+}
+
+func TestRenameSamePathNoop(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if _, err := s.CreateFile(ctx, "same.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "same.txt", "same.txt"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Get("same.txt")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if got.IsDeleted() {
+		t.Fatalf("same-path rename should not create whiteout: %+v", got)
+	}
+}
+
+func TestRenameSameMissingPathReturnsNotExist(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Rename(ctx, "missing.txt", "missing.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestRenameCreateRemainsCreateAcrossReconcile(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if _, err := s.CreateFile(ctx, "tmp.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "tmp.txt", 0, []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "tmp.txt", "kept.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	before, ok := s.Get("kept.txt")
+	if !ok {
+		t.Fatal("expected renamed create entry")
+	}
+	if before.Kind != model.OverlayKindCreate {
+		t.Fatalf("kind = %q, want create", before.Kind)
+	}
+	if _, ok := s.Get("tmp.txt"); ok {
+		t.Fatal("untracked create rename should not leave a source whiteout")
+	}
+
+	baseLookup := func(string) (model.BaseNode, bool) { return model.BaseNode{}, false }
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+	after, ok := s.Get("kept.txt")
+	if !ok || after.IsDeleted() {
+		t.Fatalf("reconcile should keep renamed create, got %+v ok=%v", after, ok)
+	}
+}
+
+func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o40000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(s.backingPath("src"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := s.Get("dst")
+	if !ok {
+		t.Fatal("expected renamed entry")
+	}
+	if got.Kind != model.OverlayKindMkdir || got.NodeType() != "dir" {
+		t.Fatalf("expected renamed directory entry, got %+v", got)
+	}
+	if got.Mode != 0o755 {
+		t.Fatalf("mode = %#o, want 0755", got.Mode)
+	}
+	st, err := os.Stat(got.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("backing mode = %#o, want 0755", st.Mode().Perm())
+	}
+}
+
+func TestRenameRejectsNonEmptyOverlayDirectory(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("err = %v, want fs.ErrInvalid", err)
+	}
+	if _, ok := s.Get("src"); !ok {
+		t.Fatal("source directory should remain after rejected rename")
+	}
+	if _, ok := s.Get("dst"); ok {
+		t.Fatal("destination directory should not exist after rejected rename")
+	}
+}
+
+func TestRenameOverlayDirectoryIgnoresDeletedDescendants(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "a_b", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "a_b/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "a_b/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "axb/secret.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a_b", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Get("dst")
+	if !ok || got.Kind != model.OverlayKindMkdir {
+		t.Fatalf("expected renamed directory, got %+v ok=%v", got, ok)
+	}
+	if e, ok := s.Get("a_b/a.txt"); ok {
+		t.Fatalf("deleted descendant tombstone should be removed after directory rename, got %+v", e)
+	}
+	if e, ok := s.Get("axb/secret.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("unrelated wildcard-like tombstone should remain, got %+v ok=%v", e, ok)
+	}
+}
+
+func TestRenameOverlayDirectoryCleansUTF8DeletedDescendants(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	dir := "\u00e9"
+	child := dir + "/a.txt"
+
+	if err := s.Mkdir(ctx, dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, child, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, dir, "dst"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get(child); ok {
+		t.Fatalf("UTF-8 deleted descendant tombstone should be removed after directory rename, got %+v", e)
+	}
+}
+
+func TestRenameOverlayDirectoryRollbackRestoresDeletedDescendants(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "src/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(s.backingPath("dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.backingPath("dst"), "file.txt"), []byte("busy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Rename(ctx, "src", "dst"); err == nil {
+		t.Fatal("expected filesystem rename failure")
+	}
+	if e, ok := s.Get("src/a.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("deleted descendant tombstone should be restored on rollback, got %+v ok=%v", e, ok)
+	}
+}
+
+func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "b.txt", "c.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	before, ok := s.Get("c.txt")
+	if !ok {
+		t.Fatal("expected final rename entry")
+	}
+	if before.TargetPath != "a.txt" {
+		t.Fatalf("target path = %q, want original source a.txt", before.TargetPath)
+	}
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		if path == "a.txt" {
+			return base, true
+		}
+		return model.BaseNode{}, false
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+
+	after, ok := s.Get("c.txt")
+	if !ok || after.IsDeleted() {
+		t.Fatalf("reconcile should keep chained rename, got %+v ok=%v", after, ok)
+	}
+	if after.TargetPath != "a.txt" {
+		t.Fatalf("target path after reconcile = %q, want a.txt", after.TargetPath)
+	}
+}
+
+func TestReconcileRemovesSourceWhiteoutForStaleRename(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("expected source whiteout before reconcile, got %+v ok=%v", e, ok)
+	}
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		if path == "a.txt" {
+			return model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "bbb"}, true
+		}
+		return model.BaseNode{}, false
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("b.txt"); ok {
+		t.Fatalf("stale rename should be removed, got %+v", e)
+	}
+	if e, ok := s.Get("a.txt"); ok {
+		t.Fatalf("paired source whiteout should be removed with stale rename, got %+v", e)
+	}
+}
+
+func TestReconcileRemovesIntermediateWhiteoutsForStaleChainedRename(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "b.txt", "c.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("b.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("expected intermediate whiteout before reconcile, got %+v ok=%v", e, ok)
+	}
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "a.txt":
+			return model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "bbb"}, true
+		case "b.txt":
+			return model.BaseNode{Path: "b.txt", Type: "file", Mode: 0o644, ObjectOID: "new-b"}, true
+		default:
+			return model.BaseNode{}, false
+		}
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"a.txt", "b.txt", "c.txt"} {
+		if e, ok := s.Get(path); ok {
+			t.Fatalf("%s should be removed after stale chained rename reconcile, got %+v", path, e)
+		}
 	}
 }
 
@@ -196,6 +538,72 @@ func TestMkdir(t *testing.T) {
 	e, ok := s.Get("subdir")
 	if !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("expected mkdir entry, got %+v", e)
+	}
+}
+
+func TestMkdirNormalizesGitTreeMode(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o40000); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get("src")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if e.Mode != 0o755 {
+		t.Fatalf("mode = %#o, want 0755", e.Mode)
+	}
+}
+
+func TestMkdirPreservesExplicitZeroMode(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "private", 0); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get("private")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if e.Mode != 0 {
+		t.Fatalf("mode = %#o, want 0", e.Mode)
+	}
+}
+
+func TestSetMtimeRepairsGitTreeDirectoryMode(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o40000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(s.backingPath("src"), 0); err != nil {
+		t.Fatal(err)
+	}
+	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	if err := s.SetMtime(ctx, "src", target); err != nil {
+		t.Fatal(err)
+	}
+
+	e, ok := s.Get("src")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	if e.Mode != 0o755 {
+		t.Fatalf("mode = %#o, want 0755", e.Mode)
+	}
+	st, err := os.Stat(e.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("backing mode = %#o, want 0755", st.Mode().Perm())
 	}
 }
 

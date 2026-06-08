@@ -167,6 +167,7 @@ type OverlayStore interface {
 	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string) error
+	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error

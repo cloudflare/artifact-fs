@@ -61,7 +61,25 @@ func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, _ []byte) 
 }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
 func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
-func (f *fakeOverlay) Rename(_ context.Context, _, _ string) error         { return nil }
+func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
+	oldPath = model.CleanPath(oldPath)
+	newPath = model.CleanPath(newPath)
+	e := f.entries[oldPath]
+	delete(f.entries, oldPath)
+	e.Path = newPath
+	f.entries[newPath] = e
+	return nil
+}
+func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, newPath string, sourceOID string) error {
+	if err := f.Rename(context.Background(), oldPath, newPath); err != nil {
+		return err
+	}
+	e := f.entries[model.CleanPath(newPath)]
+	e.Kind = model.OverlayKindModify
+	e.SourceOID = sourceOID
+	f.entries[model.CleanPath(newPath)] = e
+	return nil
+}
 func (f *fakeOverlay) Mkdir(_ context.Context, path string, mode uint32) error {
 	if f.entries == nil {
 		f.entries = map[string]model.OverlayEntry{}
@@ -219,6 +237,163 @@ func TestSetMtimeRejectsRootAndBaseSymlink(t *testing.T) {
 	}
 	if err := engine.SetMtime(context.Background(), "link", target); !errors.Is(err, iofs.ErrInvalid) {
 		t.Fatalf("symlink SetMtime err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameRejectsBaseDirectory(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40000}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename base dir err = %v, want ErrInvalid", err)
+	}
+	if _, ok := ov.entries["src"]; ok {
+		t.Fatal("base directory rename should not create source overlay entry")
+	}
+	if _, ok := ov.entries["dst"]; ok {
+		t.Fatal("base directory rename should not create destination overlay entry")
+	}
+}
+
+func TestRenameBaseFileRejectsBaseDirectoryDestination(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{
+			"a.txt": {Path: "a.txt", Type: "file", Mode: 0o644},
+			"dst":   {Path: "dst", Type: "dir", Mode: 0o40000},
+		}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "a.txt", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename base file over base dir err = %v, want ErrInvalid", err)
+	}
+	if _, ok := ov.entries["a.txt"]; ok {
+		t.Fatal("invalid rename should not promote source into overlay")
+	}
+}
+
+func TestRenameAllowsOverlayFileShadowingBaseDirectory(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src": {Path: "src", Kind: model.OverlayKindCreate, Mode: 0o644},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40000}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatalf("Rename overlay file shadowing base dir: %v", err)
+	}
+}
+
+func TestRenameCreateOverBaseBecomesModify(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"tmp.txt": {Path: "tmp.txt", Kind: model.OverlayKindCreate, Mode: 0o644},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"dst.txt": {Path: "dst.txt", Type: "file", Mode: 0o644, ObjectOID: "dst-oid"}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "tmp.txt", "dst.txt"); err != nil {
+		t.Fatalf("Rename create over base: %v", err)
+	}
+	got, ok := ov.entries["dst.txt"]
+	if !ok {
+		t.Fatal("expected destination overlay entry")
+	}
+	if got.Kind != model.OverlayKindModify || got.SourceOID != "dst-oid" {
+		t.Fatalf("destination entry = %+v, want modify from dst-oid", got)
+	}
+}
+
+func TestRenameModifyRejectsBaseDirectoryDestination(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src.txt": {Path: "src.txt", Kind: model.OverlayKindModify, Mode: 0o644, SourceOID: "src-oid"},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"dst": {Path: "dst", Type: "dir", Mode: 0o40000}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src.txt", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename modify over base dir err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameRejectsOverlayMkdirShadowingBaseDirectory(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src": {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40000}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename overlay mkdir shadowing base dir err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameRejectsOverlayMkdirShadowingBaseFile(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src": {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "file", Mode: 0o644}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename overlay mkdir shadowing base file err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameOverlayMkdirRejectsBaseFileDestination(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"tmpdir": {Path: "tmpdir", Kind: model.OverlayKindMkdir, Mode: 0o755},
+	}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"dst.txt": {Path: "dst.txt", Type: "file", Mode: 0o644}}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "tmpdir", "dst.txt"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("Rename overlay mkdir over base file err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameSameBasePathNoop(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{
+			"a.txt": {Path: "a.txt", Type: "file", Mode: 0o644},
+			"src":   {Path: "src", Type: "dir", Mode: 0o40000},
+		}},
+		ov,
+	)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "a.txt", "a.txt"); err != nil {
+		t.Fatalf("Rename same file path: %v", err)
+	}
+	if err := engine.Rename(context.Background(), "src", "src"); err != nil {
+		t.Fatalf("Rename same dir path: %v", err)
+	}
+	if len(ov.entries) != 0 {
+		t.Fatalf("same-path rename should not mutate overlay: %+v", ov.entries)
 	}
 }
 

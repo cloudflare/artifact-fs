@@ -23,6 +23,18 @@ func TestInodeAttrsPreservesSeparateTimes(t *testing.T) {
 	}
 }
 
+func TestInodeAttrsPreservesExplicitZeroDirMode(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	attr := inodeAttrs(0, 4096, "dir", now, now)
+	if attr.Mode.Perm() != 0 {
+		t.Fatalf("mode perms = %#o, want 0", attr.Mode.Perm())
+	}
+	if !attr.Mode.IsDir() {
+		t.Fatalf("expected directory mode, got %#o", attr.Mode)
+	}
+}
+
 func TestGitFileAttrsUsesOneTimestamp(t *testing.T) {
 	fs := &ArtifactFuse{gitfileContent: []byte("gitdir: /tmp/repo/.git\n")}
 

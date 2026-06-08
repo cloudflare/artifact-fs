@@ -467,6 +467,9 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
+		if errors.Is(err, iofs.ErrInvalid) {
+			return syscall.ENOTSUP
+		}
 		return syscall.EIO
 	}
 	return nil
@@ -592,13 +595,6 @@ func TryUnmount(mountPoint string) error {
 
 func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time, ctime time.Time) fuseops.InodeAttributes {
 	m := os.FileMode(mode & 0o777)
-	if m == 0 {
-		if typ == "dir" {
-			m = 0o755
-		} else {
-			m = 0o644
-		}
-	}
 	switch typ {
 	case "dir":
 		m |= os.ModeDir
