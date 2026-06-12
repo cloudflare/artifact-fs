@@ -34,6 +34,14 @@ type readBlobResult struct {
 
 const maxReadBlobBytes int64 = 1<<31 - 1
 
+const fetchedFullRefRemoteTrackingRef = "refs/remotes/artifact-fs/fetch-ref"
+
+type fetchRefInfo struct {
+	sourceRef string
+	remoteRef string
+	branch    string
+}
+
 func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
@@ -64,6 +72,14 @@ func (s *Store) SetBatchPoolSize(n int) {
 }
 
 func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
+	return s.cloneBlobless(ctx, cfg, nil)
+}
+
+func (s *Store) CloneBloblessNonInteractive(ctx context.Context, cfg model.RepoConfig) error {
+	return s.cloneBlobless(ctx, cfg, nonInteractiveGitEnv())
+}
+
+func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEnv []string) error {
 	if _, err := os.Stat(cfg.GitDir); err == nil {
 		return nil
 	}
@@ -80,17 +96,22 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 
 	// Strip credentials from the CLI-visible URL; pass them via a credential helper
 	// so they don't appear in ps output.
-	safeURL, credHelper := credentialEnv(cfg.RemoteURL)
-
-	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--branch", cfg.Branch, safeURL, target}
-	if _, err := runGitWithEnv(ctx, "", credHelper, args...); err != nil {
+	safeURL, credHelper, err := credentialEnv(cfg.RemoteURL)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
+	env := append([]string{}, extraEnv...)
+	env = append(env, credHelper...)
+
+	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--branch", cfg.Branch, safeURL, target}
+	if _, err := runGitWithEnv(ctx, "", env, args...); err != nil {
 		return err
 	}
 	// Populate the index so git status works inside the mount.
-	if _, err := runGit(ctx, cfg.GitDir, "read-tree", "HEAD"); err != nil {
+	if _, err := runGit(ctx, filepath.Join(target, ".git"), "read-tree", "HEAD"); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
 		return err
 	}
 	return nil
@@ -99,6 +120,94 @@ func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
 	_, err := runGit(ctx, repo.GitDir, "fetch", "origin")
 	return err
+}
+
+func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
+	target, err := fetchRefTarget(repo, ref)
+	if err != nil {
+		return err
+	}
+	refspec := "+" + target.sourceRef + ":" + target.remoteRef
+	if target.branch != "" {
+		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
+	}
+	_, err = runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "origin", refspec)
+	return err
+}
+
+func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	if strings.TrimSpace(repo.RemoteURL) == "" {
+		return errors.New("remote URL is required")
+	}
+	safeURL, _, err := credentialEnv(repo.RemoteURL)
+	if err != nil {
+		return err
+	}
+	if safeURL != repo.RemoteURL {
+		return errors.New("existing clone remote must use ambient credentials")
+	}
+	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(remoteURL) != strings.TrimSpace(repo.RemoteURL) {
+		if _, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "remote", "set-url", "origin", repo.RemoteURL); err != nil {
+			return err
+		}
+	}
+	if err := s.FetchRefNonInteractive(ctx, repo, repo.FetchRef); err != nil {
+		return err
+	}
+	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
+}
+
+func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig, ref string) error {
+	target, err := fetchRefTarget(repo, ref)
+	if err != nil {
+		return err
+	}
+	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", target.remoteRef+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("remote ref %s missing after fetch: %w", target.remoteRef, err)
+	}
+	oid = strings.TrimSpace(oid)
+	if target.branch == "" {
+		if _, err := runGit(ctx, repo.GitDir, "update-ref", "--no-deref", "HEAD", oid); err != nil {
+			return err
+		}
+		return s.ReadTreeHEAD(ctx, repo)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "update-ref", "refs/heads/"+target.branch, oid); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", "refs/heads/"+target.branch); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
+		s.logger.Warn("set upstream failed", "repo", repo.Name, "error", err)
+	}
+	return s.ReadTreeHEAD(ctx, repo)
+}
+
+func (s *Store) ValidatePreparedGitDir(ctx context.Context, repo model.RepoConfig) error {
+	if strings.TrimSpace(repo.GitDir) == "" {
+		return errors.New("git dir is required")
+	}
+	st, err := os.Stat(repo.GitDir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("git dir %s is not a directory", repo.GitDir)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "rev-parse", "--git-dir"); err != nil {
+		return err
+	}
+	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
+	if err == nil && remoteHasInlineCredentials(remoteURL) {
+		return errors.New("prepared git dir origin must use ambient credentials")
+	}
+	return nil
 }
 
 func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid string, ref string, err error) {
@@ -626,41 +735,320 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 
 // credentialEnv returns a sanitized URL (safe for ps) and env vars that
 // configure a one-shot git credential helper to supply the real credentials.
-func credentialEnv(rawURL string) (safeURL string, env []string) {
+func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	if rawURL == "" {
-		return "", nil
+		return "", nil, nil
+	}
+	if strings.ContainsAny(rawURL, "?#") {
+		return "", nil, errors.New("remote URL must not include query or fragment")
 	}
 	u, err := url.Parse(rawURL)
-	if err != nil || u.User == nil {
-		return rawURL, nil
+	if err != nil {
+		if remoteHasInlineCredentials(rawURL) {
+			return "", nil, errors.New("malformed remote URL")
+		}
+		if rawUserinfoCandidateHasPassword(rawURL) {
+			return "", nil, errors.New("malformed remote URL")
+		}
+		if strings.Contains(rawURL, "://") {
+			return "", nil, errors.New("malformed remote URL")
+		}
+		return rawURL, nil, nil
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(rawURL, "#") {
+		return "", nil, errors.New("remote URL must not include query or fragment")
+	}
+	if u.User == nil && strings.Contains(rawURL, "@") && (auth.HasInlineCredentials(rawURL) || malformedUserinfoInRemote(rawURL, u)) {
+		return "", nil, errors.New("malformed remote URL")
+	}
+	if u.User == nil {
+		return rawURL, nil, nil
+	}
+	if !isHTTPRemote(rawURL, u.Scheme) {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			return "", nil, errors.New("remote URL includes unsupported inline credentials")
+		}
+		return rawURL, nil, nil
 	}
 	username := u.User.Username()
 	password, hasPassword := u.User.Password()
 	if username == "" && !hasPassword {
-		return rawURL, nil
+		return rawURL, nil, nil
 	}
 
-	// Build a credential helper that prints credentials to stdout.
-	// Uses printf to avoid shell quoting issues with single quotes in passwords.
-	var lines []string
+	credentialUsername := username
+	credentialPassword := password
 	if hasPassword {
-		lines = append(lines, "username="+username, "password="+password)
+		credentialPassword = password
 	} else if username != "" {
 		// Token-as-username pattern (e.g., https://ghp_xxx@github.com)
-		lines = append(lines, "username="+username, "password="+username)
+		credentialPassword = username
 	}
-	// Escape single quotes in the credential payload to prevent shell injection.
-	payload := strings.Join(lines, "\n")
-	payload = strings.ReplaceAll(payload, "'", "'\\''")
-	helper := fmt.Sprintf("!f() { printf '%%s\\n' '%s'; }; f", payload)
+	helper := "!f() { printf '%s\\n' \"username=$ARTIFACT_FS_GIT_USERNAME\" \"password=$ARTIFACT_FS_GIT_PASSWORD\"; }; f"
 
 	u.User = nil
 	return u.String(), []string{
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_COUNT=1",
+		"ARTIFACT_FS_GIT_USERNAME=" + credentialUsername,
+		"ARTIFACT_FS_GIT_PASSWORD=" + credentialPassword,
+		"GIT_CONFIG_COUNT=2",
 		"GIT_CONFIG_KEY_0=credential.helper",
-		"GIT_CONFIG_VALUE_0=" + helper,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=credential.helper",
+		"GIT_CONFIG_VALUE_1=" + helper,
+	}, nil
+}
+
+func isHTTPRemote(rawURL string, scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https":
+		return true
 	}
+	lower := strings.ToLower(strings.TrimSpace(rawURL))
+	return strings.HasPrefix(lower, "http:/") || strings.HasPrefix(lower, "https:/") ||
+		strings.HasPrefix(lower, "http//") || strings.HasPrefix(lower, "https//") ||
+		strings.HasPrefix(lower, "http:") || strings.HasPrefix(lower, "https:")
+}
+
+func isMalformedHTTPUserinfo(rawURL string, u *url.URL) bool {
+	if !isHTTPRemote(rawURL, u.Scheme) {
+		return false
+	}
+	if u.Host == "" {
+		return true
+	}
+	return strings.HasPrefix(u.Path, "/@")
+}
+
+func remoteHasInlineCredentials(rawURL string) bool {
+	if strings.ContainsAny(rawURL, "?#") {
+		return true
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return auth.HasInlineCredentials(rawURL) || rawUserinfoCandidateHasPassword(rawURL)
+	}
+	if u.User != nil {
+		_, hasPassword := u.User.Password()
+		return isHTTPRemote(rawURL, u.Scheme) || hasPassword
+	}
+	return strings.Contains(rawURL, "@") && malformedUserinfoInRemote(rawURL, u)
+}
+
+func malformedUserinfoInRemote(rawURL string, u *url.URL) bool {
+	if isHTTPRemote(rawURL, u.Scheme) {
+		return auth.HasInlineCredentials(rawURL)
+	}
+	if isMalformedHTTPUserinfo(rawURL, u) {
+		return true
+	}
+	if isHTTPRemote(rawURL, u.Scheme) && strings.Contains(u.Hostname(), ".") {
+		return false
+	}
+	return rawUserinfoCandidateHasPassword(rawURL)
+}
+
+func rawUserinfoCandidateHasPassword(raw string) bool {
+	prefix := raw
+	start := -1
+	if i := strings.LastIndex(prefix, "://"); i >= 0 {
+		start = i + len("://")
+	} else if i := strings.Index(prefix, ":/"); i >= 0 {
+		start = i + len(":/")
+	} else if i := strings.Index(prefix, "//"); i >= 0 {
+		start = i + len("//")
+	} else if i := strings.Index(prefix, ":"); i >= 0 {
+		start = i + len(":")
+	}
+	if start < 0 || start >= len(raw) {
+		return false
+	}
+	endChars := "?#"
+	if strings.Contains(raw, "://") {
+		endChars = "/?#"
+	}
+	end := len(raw)
+	if relEnd := strings.IndexAny(raw[start:], endChars); relEnd >= 0 {
+		end = start + relEnd
+	}
+	at := strings.LastIndex(raw[start:end], "@")
+	if at < 0 {
+		return false
+	}
+	at += start
+	return strings.Contains(raw[start:at], ":")
+}
+
+func nonInteractiveGitEnv() []string {
+	return []string{"GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=" + sshBatchModeCommand(os.Getenv("GIT_SSH_COMMAND"))}
+}
+
+func sshBatchModeCommand(existing string) string {
+	existing = strings.TrimSpace(existing)
+	if existing == "" {
+		return "ssh -o BatchMode=yes"
+	}
+	tokens := splitShellFields(existing)
+	filtered := make([]string, 0, len(tokens)+2)
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		lower := strings.ToLower(tok)
+		if lower == "-o" && i+1 < len(tokens) && isBatchModeOption(tokens[i+1]) {
+			i++
+			continue
+		}
+		if strings.HasPrefix(lower, "-obatchmode=") {
+			continue
+		}
+		filtered = append(filtered, tok)
+	}
+	if len(filtered) == 0 {
+		filtered = append(filtered, "ssh")
+	}
+	filtered = append(filtered, "-o", "BatchMode=yes")
+	for i, tok := range filtered {
+		filtered[i] = shellQuote(tok)
+	}
+	return strings.Join(filtered, " ")
+}
+
+func splitShellFields(s string) []string {
+	var fields []string
+	var b strings.Builder
+	var quote rune
+	escaped := false
+	for _, r := range s {
+		if escaped {
+			if r == '$' {
+				b.WriteString(`\$`)
+			} else {
+				b.WriteRune(r)
+			}
+			escaped = false
+			continue
+		}
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else if r == '$' && quote == '\'' {
+				b.WriteString(`\$`)
+			} else if r == '\\' && quote == '"' {
+				escaped = true
+			} else {
+				b.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == '\\':
+			escaped = true
+		case r == ' ' || r == '\t' || r == '\n':
+			if b.Len() > 0 {
+				fields = append(fields, b.String())
+				b.Reset()
+			}
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if escaped {
+		b.WriteRune('\\')
+	}
+	if b.Len() > 0 {
+		fields = append(fields, b.String())
+	}
+	return fields
+}
+
+func isBatchModeOption(opt string) bool {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(opt)))
+	if len(parts) == 0 {
+		return false
+	}
+	return parts[0] == "batchmode" || strings.HasPrefix(parts[0], "batchmode=")
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.Contains(s, "$") {
+		return doubleQuote(s)
+	}
+	if isShellSafe(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func doubleQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '$' {
+			b.WriteString(`\$`)
+			i++
+			continue
+		}
+		switch s[i] {
+		case '\\', '"', '`':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func isShellSafe(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		if strings.ContainsRune("@%_+=:,./-~$", r) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = strings.TrimSpace(repo.Branch)
+	}
+	if ref == "" {
+		return fetchRefInfo{}, errors.New("fetch ref is required")
+	}
+	if branch := branchName(ref); branch != "" {
+		return fetchRefInfo{
+			sourceRef: "refs/heads/" + branch,
+			remoteRef: "refs/remotes/origin/" + branch,
+			branch:    branch,
+		}, nil
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		return fetchRefInfo{sourceRef: ref, remoteRef: fetchedFullRefRemoteTrackingRef}, nil
+	}
+	return fetchRefInfo{}, errors.New("fetch ref is required")
+}
+
+func branchName(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if strings.HasPrefix(ref, "refs/heads/") {
+		return strings.TrimPrefix(ref, "refs/heads/")
+	}
+	if strings.HasPrefix(ref, "refs/remotes/origin/") {
+		return strings.TrimPrefix(ref, "refs/remotes/origin/")
+	}
+	if strings.HasPrefix(ref, "origin/") {
+		return strings.TrimPrefix(ref, "origin/")
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		return ""
+	}
+	return ref
 }
 
 func rootNode(repoID model.RepoID) model.BaseNode {
