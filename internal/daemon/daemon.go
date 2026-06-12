@@ -27,6 +27,11 @@ import (
 const DefaultHydrationConcurrency = 4
 
 const (
+	defaultPrepareTimeout    = 30 * time.Minute
+	prepareStateWriteTimeout = 5 * time.Second
+)
+
+const (
 	repoStateMounted   = "mounted"
 	repoStateUnmounted = "unmounted"
 	repoStateDegraded  = "degraded"
@@ -36,12 +41,14 @@ type Service struct {
 	root                 string
 	mountRoot            string
 	hydrationConcurrency int
+	prepareTimeout       time.Duration
 	logger               *slog.Logger
 	registry             *registry.Store
 	git                  *gitstore.Store
 	mu                   sync.Mutex
 	running              map[model.RepoID]*repoRuntime
-	preparing            map[model.RepoID]bool
+	preparing            map[model.RepoID]int64
+	prepareSeq           int64
 	mountFailures        map[model.RepoID]*mountFailure
 }
 
@@ -80,13 +87,14 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 		return nil, err
 	}
 	svc := &Service{
-		root:          root,
-		logger:        logger,
-		registry:      reg,
-		git:           gitstore.New(logger),
-		running:       map[model.RepoID]*repoRuntime{},
-		preparing:     map[model.RepoID]bool{},
-		mountFailures: map[model.RepoID]*mountFailure{},
+		root:           root,
+		logger:         logger,
+		registry:       reg,
+		git:            gitstore.New(logger),
+		prepareTimeout: defaultPrepareTimeout,
+		running:        map[model.RepoID]*repoRuntime{},
+		preparing:      map[model.RepoID]int64{},
+		mountFailures:  map[model.RepoID]*mountFailure{},
 	}
 	svc.git.SetBatchPoolSize(DefaultHydrationConcurrency)
 	return svc, nil
@@ -161,12 +169,10 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		}
 		s.mu.Lock()
 		rt, running := s.running[repo.ID]
+		_, alreadyPreparing := s.preparing[repo.ID]
 		s.mu.Unlock()
 		if running {
-			if repo.PrepareState == model.PrepareStatePreparing && rt != nil && !rt.active {
-				s.resetRunningPrepareState(repo)
-				s.startPrepareWorker(ctx, repo)
-			}
+			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
 			continue
 		}
 		if shouldMountAsync(repo) {
@@ -222,6 +228,66 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model.RepoConfig, rt *repoRuntime, alreadyPreparing bool) {
+	if repo.PrepareState != model.PrepareStatePreparing || rt == nil {
+		return
+	}
+	latest, err := s.registry.GetRepo(ctx, repo.Name)
+	if err != nil {
+		s.logger.Error("repo prepare state refresh failed", "repo", repo.Name, "error", err)
+		return
+	}
+	if latest.PrepareState != model.PrepareStatePreparing {
+		return
+	}
+	configMatches := samePrepareConfig(rt.cfg, latest)
+	if alreadyPreparing && configMatches {
+		return
+	}
+	if rt.active || !configMatches {
+		s.unmount(latest.ID)
+		if err := s.mountAsyncRepo(ctx, latest); err != nil {
+			s.logger.Error("repo async remount failed", "repo", latest.Name, "error", err)
+			return
+		}
+		s.supersedePrepare(latest.ID)
+		s.startPrepareWorker(ctx, latest)
+		return
+	}
+	if alreadyPreparing {
+		return
+	}
+	if s.resetRunningPrepareState(latest) {
+		s.startPrepareWorker(ctx, latest)
+	}
+}
+
+func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
+	return a.Branch == b.Branch &&
+		a.RemoteURL == b.RemoteURL &&
+		a.PreparedGitDir == b.PreparedGitDir &&
+		a.FetchRef == b.FetchRef &&
+		a.GitDir == b.GitDir &&
+		a.MetaDBPath == b.MetaDBPath &&
+		a.OverlayDir == b.OverlayDir &&
+		a.OverlayDBPath == b.OverlayDBPath &&
+		a.BlobCacheDir == b.BlobCacheDir &&
+		a.MountPath == b.MountPath
+}
+
+func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
+	latest, err := s.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		s.logger.Error("repo prepare state refresh failed", "repo", cfg.Name, "error", err)
+		return false
+	}
+	s.fillPaths(&latest)
+	if strings.TrimSpace(latest.FetchRef) == "" {
+		latest.FetchRef = latest.Branch
+	}
+	return samePrepareConfig(cfg, latest)
 }
 
 func (s *Service) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
@@ -369,9 +435,11 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	if strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = cfg.Branch
 	}
-	if err := s.registry.AddRepo(ctx, cfg); err != nil {
+	if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, model.PrepareStatePreparing, ""); err != nil {
 		return err
 	}
+	cfg.PrepareState = model.PrepareStatePreparing
+	cfg.PrepareError = ""
 	if s.resetRunningPrepareState(cfg) {
 		s.startPrepareWorker(ctx, cfg)
 	}
@@ -585,27 +653,46 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 
 func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) {
 	s.mu.Lock()
-	if s.preparing[cfg.ID] {
+	if _, ok := s.preparing[cfg.ID]; ok {
 		s.mu.Unlock()
 		return
 	}
+	s.prepareSeq++
+	token := s.prepareSeq
 	workerCtx := ctx
 	if rt := s.running[cfg.ID]; rt != nil && rt.ctx != nil {
 		workerCtx = rt.ctx
 	}
-	s.preparing[cfg.ID] = true
+	s.preparing[cfg.ID] = token
 	s.mu.Unlock()
 
 	go func() {
 		defer func() {
 			s.mu.Lock()
-			delete(s.preparing, cfg.ID)
+			if s.preparing[cfg.ID] == token {
+				delete(s.preparing, cfg.ID)
+			}
 			s.mu.Unlock()
 		}()
-		if err := s.runPrepare(workerCtx, cfg); err != nil {
+		prepareCtx, cancel := context.WithTimeout(workerCtx, s.prepareTimeoutDuration())
+		defer cancel()
+		if err := s.runPrepare(prepareCtx, cfg); err != nil {
 			s.logger.Error("repo prepare failed", "repo", cfg.Name, "error", err)
 		}
 	}()
+}
+
+func (s *Service) supersedePrepare(id model.RepoID) {
+	s.mu.Lock()
+	delete(s.preparing, id)
+	s.mu.Unlock()
+}
+
+func (s *Service) prepareTimeoutDuration() time.Duration {
+	if s.prepareTimeout > 0 {
+		return s.prepareTimeout
+	}
+	return defaultPrepareTimeout
 }
 
 func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
@@ -629,10 +716,19 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	}
 
 	fail := func(err error) error {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 			return err
 		}
-		_ = s.setPrepareState(ctx, cfg, model.PrepareStateFailed, err)
+		stateErr := err
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			stateErr = errors.New("prepare timed out")
+		}
+		stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+		defer cancel()
+		if !s.prepareConfigStillCurrent(stateCtx, cfg) {
+			return err
+		}
+		_ = s.setPrepareState(stateCtx, cfg, model.PrepareStateFailed, stateErr)
 		return err
 	}
 
@@ -650,8 +746,17 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 		if strings.TrimSpace(cfg.RemoteURL) == "" {
 			return fail(errors.New("remote URL is required for async clone"))
 		}
-		if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
-			return fail(err)
+		if _, err := os.Stat(cfg.GitDir); err == nil {
+			if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+				return fail(err)
+			}
+		} else {
+			if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
+				return fail(err)
+			}
+			if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+				return fail(err)
+			}
 		}
 	}
 
@@ -670,11 +775,22 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	if err != nil {
 		return fail(err)
 	}
-	if err := s.completePreparedRuntime(ctx, cfg, headOID, headRef, gen); err != nil {
+	latest, err := s.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
 		return fail(err)
 	}
-	if err := s.setPrepareState(ctx, cfg, model.PrepareStateReady, nil); err != nil {
-		return err
+	s.fillPaths(&latest)
+	if strings.TrimSpace(latest.FetchRef) == "" {
+		latest.FetchRef = latest.Branch
+	}
+	if !samePrepareConfig(cfg, latest) {
+		return errors.New("prepare superseded by newer repo config")
+	}
+	if err := s.setPrepareStateBeforeReadyGate(ctx, cfg); err != nil {
+		return fail(err)
+	}
+	if err := s.completePreparedRuntime(ctx, cfg, headOID, headRef, gen); err != nil {
+		return fail(err)
 	}
 	return nil
 }
@@ -696,9 +812,19 @@ func (s *Service) snapshotForPrepare(ctx context.Context, cfg model.RepoConfig) 
 func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoConfig, headOID string, headRef string, gen int64) error {
 	s.mu.Lock()
 	rt := s.running[cfg.ID]
+	if rt != nil && !samePrepareConfig(rt.cfg, cfg) {
+		s.mu.Unlock()
+		return registry.ErrRepoChanged
+	}
 	s.mu.Unlock()
 	if rt == nil {
 		return nil
+	}
+	if !s.prepareConfigStillCurrent(ctx, cfg) {
+		return registry.ErrRepoChanged
+	}
+	if !s.prepareConfigStillCurrent(ctx, cfg) {
+		return registry.ErrRepoChanged
 	}
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		return rt.snapshot.GetNode(gen, path)
@@ -706,13 +832,16 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if err := rt.overlay.Reconcile(ctx, baseLookup); err != nil {
 		return err
 	}
-	if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
-		return err
+	if !s.prepareConfigStillCurrent(ctx, cfg) {
+		return registry.ErrRepoChanged
 	}
 	s.refreshCommitTime(ctx, cfg, headOID, rt.resolver, "commit timestamp unavailable")
 	rt.resolver.SetGeneration(gen)
-	rt.gate.MarkReady()
 	s.mu.Lock()
+	if s.running[cfg.ID] != rt || !samePrepareConfig(rt.cfg, cfg) {
+		s.mu.Unlock()
+		return registry.ErrRepoChanged
+	}
 	rt.cfg = cfg
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
@@ -720,30 +849,47 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	rt.state.State = repoStateMounted
 	rt.state.PrepareError = ""
 	s.mu.Unlock()
+	rt.gate.MarkReady()
 	s.startRepoBackground(rt)
 	return nil
 }
 
 func (s *Service) setPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error) error {
+	return s.applyPrepareState(ctx, cfg, state, stateErr, true)
+}
+
+func (s *Service) setPrepareStateBeforeReadyGate(ctx context.Context, cfg model.RepoConfig) error {
+	return s.applyPrepareState(ctx, cfg, model.PrepareStateReady, nil, false)
+}
+
+func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, state string, stateErr error, applyReadyRuntime bool) error {
 	msg := ""
 	if stateErr != nil {
 		msg = auth.RedactString(stateErr.Error())
 	}
-	if err := s.registry.UpdatePrepareState(ctx, cfg.ID, state, msg); err != nil {
+	if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, state, msg); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	if rt, ok := s.running[cfg.ID]; ok {
+		if !samePrepareConfig(rt.cfg, cfg) {
+			s.mu.Unlock()
+			return nil
+		}
 		rt.cfg.PrepareState = state
 		rt.cfg.PrepareError = msg
-		rt.state.State = runtimeStateForPrepareState(state)
 		rt.state.PrepareError = msg
+		if state != model.PrepareStateReady || applyReadyRuntime {
+			rt.state.State = runtimeStateForPrepareState(state)
+		}
 		if rt.gate != nil {
 			switch state {
 			case model.PrepareStateFailed:
 				rt.gate.MarkFailed(prepareGateError(msg))
 			case model.PrepareStateReady:
-				rt.gate.MarkReady()
+				if applyReadyRuntime {
+					rt.gate.MarkReady()
+				}
 			default:
 				rt.gate.Reset()
 			}
@@ -1024,14 +1170,21 @@ func (s *Service) stopRuntime(rt *repoRuntime) {
 	if rt.cancel != nil {
 		rt.cancel()
 	}
+	if rt.gate != nil {
+		rt.gate.MarkFailed(context.Canceled)
+	}
 	if rt.mfs != nil {
 		_ = rt.mfs.Unmount()
 	}
 	if rt.hydrator != nil {
 		rt.hydrator.Stop()
 	}
-	_ = rt.snapshot.Close()
-	_ = rt.overlay.Close()
+	if rt.snapshot != nil {
+		_ = rt.snapshot.Close()
+	}
+	if rt.overlay != nil {
+		_ = rt.overlay.Close()
+	}
 }
 
 func (s *Service) fillPaths(cfg *model.RepoConfig) {

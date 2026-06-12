@@ -11,6 +11,8 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+var ErrRepoChanged = errors.New("repo config changed")
+
 var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS repos (
 	  repo_id TEXT PRIMARY KEY,
@@ -93,6 +95,35 @@ func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, sta
 	WHERE repo_id=?
 	`, state, prepareErr, time.Now().UnixNano(), string(repoID))
 	return err
+}
+
+func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state string, prepareErr string) error {
+	res, err := s.db.ExecContext(ctx, `
+	UPDATE repos
+	SET prepare_state=?, prepare_error=?, updated_at_ns=?
+	WHERE repo_id=?
+	  AND branch=?
+	  AND remote_url=?
+	  AND prepared_gitdir=?
+	  AND fetch_ref=?
+	  AND git_dir=?
+	  AND overlay_dir=?
+	  AND blob_cache_dir=?
+	  AND meta_db_path=?
+	  AND overlay_db_path=?
+	  AND mount_path=?
+	`, state, prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrRepoChanged
+	}
+	return nil
 }
 
 func (s *Store) RemoveRepo(ctx context.Context, name string) error {
