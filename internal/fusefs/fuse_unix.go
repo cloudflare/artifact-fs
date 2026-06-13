@@ -163,7 +163,7 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 	return nil
 }
 
-func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) error {
+func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
 	parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
 	if err != nil {
 		return err
@@ -182,7 +182,7 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 		return nil
 	}
 
-	mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(childPath)
+	mode, size, typ, mtime, ctime, err := fs.resolveAttrs(ctx, childPath)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
 			return syscall.ENOENT
@@ -200,7 +200,7 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 	return nil
 }
 
-func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeAttributesOp) error {
+func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -212,13 +212,48 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 		return nil
 	}
 
-	mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(ref.Path)
+	mode, size, typ, mtime, ctime, err := fs.resolveAttrs(ctx, ref.Path)
 	if err != nil {
-		return syscall.ENOENT
+		if errors.Is(err, iofs.ErrNotExist) {
+			return syscall.ENOENT
+		}
+		return syscall.EIO
 	}
 	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime, ctime)
 	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
+}
+
+func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
+	n, err := fs.resolver.ResolvePath(path)
+	if err != nil {
+		return 0, 0, "", time.Time{}, time.Time{}, err
+	}
+	if n.FromOverlay {
+		typ := n.Overlay.NodeType()
+		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
+		ct := time.Unix(0, n.Overlay.CtimeUnixNs)
+		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, ct, nil
+	}
+
+	mode = normalizeMode(n.Base.Mode, n.Base.Type)
+	size = n.Base.SizeBytes
+	if n.Base.Type == "file" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
+		_, hydratedSize, hErr := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
+		if hErr != nil {
+			return 0, 0, "", time.Time{}, time.Time{}, hErr
+		}
+		size = hydratedSize
+	}
+
+	// Base files use the HEAD commit timestamp for mtime so tools like
+	// make see a stable, meaningful value.
+	ct := fs.resolver.CommitTime()
+	if ct == 0 {
+		ct = fs.resolver.Generation() // fallback: commit time unavailable
+	}
+	mt := time.Unix(ct, 0)
+	return mode, size, n.Base.Type, mt, mt, nil
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
