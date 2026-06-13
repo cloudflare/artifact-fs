@@ -36,6 +36,7 @@ type Service struct {
 	workReady  chan struct{} // signaled when new work is enqueued
 	onHydrated OnHydratedFunc
 	verified   map[string]struct{}
+	active     map[string]struct{}
 }
 
 type result struct {
@@ -57,6 +58,7 @@ func New(fetcher BlobFetcher) *Service {
 		stopCh:    make(chan struct{}),
 		workReady: make(chan struct{}, 1),
 		verified:  map[string]struct{}{},
+		active:    map[string]struct{}{},
 	}
 }
 
@@ -107,14 +109,22 @@ func (s *Service) Enqueue(task model.HydrationTask) {
 
 func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (cachePath string, size int64, err error) {
 	cachePath = cachePathFor(repo, node.ObjectOID)
+	key := taskKey(repo.ID, node.ObjectOID)
+	if ch, ok := s.joinInflight(key); ok {
+		return s.awaitHydration(ctx, key, ch)
+	}
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
 		return "", 0, err
 	} else if ok {
 		return cachePath, size, nil
 	}
-	key := taskKey(repo.ID, node.ObjectOID)
 	ch := make(chan result, 1)
 	s.mu.Lock()
+	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
+		s.wait.add(key, ch)
+		s.mu.Unlock()
+		return s.awaitHydration(ctx, key, ch)
+	}
 	first := s.wait.add(key, ch)
 	if first {
 		heap.Push(&s.pq, &taskItem{task: explicitReadTask(repo.ID, node.Path, node.ObjectOID)})
@@ -123,7 +133,21 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	if first {
 		s.signalWork()
 	}
+	return s.awaitHydration(ctx, key, ch)
+}
 
+func (s *Service) joinInflight(key string) (chan result, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.active[key]; !ok && len(s.wait[key]) == 0 {
+		return nil, false
+	}
+	ch := make(chan result, 1)
+	s.wait.add(key, ch)
+	return ch, true
+}
+
+func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result) (cachePath string, size int64, err error) {
 	select {
 	case <-ctx.Done():
 		// Remove our channel from the wait list so the worker doesn't
@@ -220,12 +244,6 @@ func (s *Service) isVerified(key string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.verified[key]
 	return ok
-}
-
-func (s *Service) markVerified(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.verified[key] = struct{}{}
 }
 
 func (s *Service) clearVerified(key string) {
@@ -335,12 +353,16 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	}
 	item := heap.Pop(&s.pq).(*taskItem)
 	key := taskKey(item.task.RepoID, item.task.ObjectOID)
-	waits := s.wait.take(key)
+	if _, ok := s.active[key]; ok {
+		s.mu.Unlock()
+		return true
+	}
+	s.active[key] = struct{}{}
 	s.mu.Unlock()
 
 	cachePath := cachePathFor(repo, item.task.ObjectOID)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		notifyWaiters(waits, result{err: err})
+		s.finishHydration(key, result{err: err})
 		return true
 	}
 	// Use a timeout context derived from stopCh so stuck blob fetches don't
@@ -356,10 +378,14 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	}()
 	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
 	if err != nil {
-		notifyWaiters(waits, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
+		s.finishHydration(key, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
 		return true
 	}
-	s.markVerified(taskKey(item.task.RepoID, item.task.ObjectOID))
+	s.mu.Lock()
+	s.verified[key] = struct{}{}
+	waits := s.wait.take(key)
+	delete(s.active, key)
+	s.mu.Unlock()
 	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
 	s.mu.Lock()
 	fn := s.onHydrated
@@ -368,6 +394,14 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		fn(item.task.RepoID, item.task.ObjectOID, size)
 	}
 	return true
+}
+
+func (s *Service) finishHydration(key string, r result) {
+	s.mu.Lock()
+	waits := s.wait.take(key)
+	delete(s.active, key)
+	s.mu.Unlock()
+	notifyWaiters(waits, r)
 }
 
 func taskKey(repoID model.RepoID, oid string) string {

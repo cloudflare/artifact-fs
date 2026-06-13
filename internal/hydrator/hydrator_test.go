@@ -202,6 +202,46 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	}
 }
 
+func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: int64(len(payload))}
+	releaseFetch := make(chan struct{})
+	fetchStarted := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: payload, fetchStarted: fetchStarted, fetchWait: releaseFetch}
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const readers = 8
+	errCh := make(chan error, readers+1)
+	go func() {
+		_, _, err := h.EnsureHydrated(ctx, cfg, node)
+		errCh <- err
+	}()
+	<-fetchStarted
+	for range readers {
+		go func() {
+			_, _, err := h.EnsureHydrated(ctx, cfg, node)
+			errCh <- err
+		}()
+	}
+	runtime.Gosched()
+	close(releaseFetch)
+	for i := 0; i < readers+1; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	}
+	if fetcher.Calls() != 1 {
+		t.Fatalf("fetch calls = %d, want 1", fetcher.Calls())
+	}
+}
+
 func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -371,8 +411,12 @@ type fakeBlobFetcher struct {
 	readBlobErr   error
 	verifyOK      bool
 	verifyErr     error
+	fetchStarted  chan struct{}
+	fetchWait     <-chan struct{}
+	fetchDelay    time.Duration
 	verifyStarted chan struct{}
 	verifyWait    <-chan struct{}
+	fetchOnce     sync.Once
 	verifyOnce    sync.Once
 }
 
@@ -380,6 +424,15 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ s
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
+	if f.fetchStarted != nil {
+		f.fetchOnce.Do(func() { close(f.fetchStarted) })
+	}
+	if f.fetchWait != nil {
+		<-f.fetchWait
+	}
+	if f.fetchDelay > 0 {
+		time.Sleep(f.fetchDelay)
+	}
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return 0, err
 	}
