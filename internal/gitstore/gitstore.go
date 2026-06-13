@@ -171,8 +171,8 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	// pack metadata and doesn't trigger network fetches on blobless clones.
 	if err := s.batchResolveSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
 		// Non-fatal: sizes remain "unknown" and reads will still work via
-		// hydration. Log so operators can diagnose size=0 issues.
-		s.logger.Warn("batch size resolution failed, files will show size 0 until hydrated", "repo", repo.Name, "error", err)
+		// hydration. Log so operators can diagnose unexpected attr hydration.
+		s.logger.Warn("batch size resolution failed, some file sizes will resolve on demand", "repo", repo.Name, "error", err)
 	}
 	return addImplicitDirs(repo.ID, nodes), nil
 }
@@ -198,13 +198,15 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	var writeErr error
 	for _, oid := range oids {
-		fmt.Fprintln(stdin, oid)
+		if _, err := fmt.Fprintln(stdin, oid); err != nil {
+			writeErr = err
+			break
+		}
 	}
-	stdin.Close()
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
+	closeErr := stdin.Close()
+	waitErr := cmd.Wait()
 	// Output format: "<oid> <type> <size>" or "<oid> missing"
 	scan := bufio.NewScanner(&outBuf)
 	for scan.Scan() {
@@ -223,7 +225,16 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 			nodes[idx].SizeState = "known"
 		}
 	}
-	return scan.Err()
+	if err := scan.Err(); err != nil {
+		return err
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return waitErr
 }
 
 // BlobToCache fetches a git object and writes it to dstPath in a binary-safe manner.
