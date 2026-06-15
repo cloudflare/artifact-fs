@@ -253,7 +253,7 @@ func TestEnqueueDedupesAndUpgradesPriority(t *testing.T) {
 	if got := h.QueueDepth("repo"); got != 1 {
 		t.Fatalf("QueueDepth after duplicate enqueue = %d, want 1", got)
 	}
-	h.Enqueue(high)
+	h.EnqueueBatch([]model.HydrationTask{low, high})
 	if got := h.QueueDepth("repo"); got != 1 {
 		t.Fatalf("QueueDepth after priority upgrade = %d, want 1", got)
 	}

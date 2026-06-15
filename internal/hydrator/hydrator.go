@@ -111,6 +111,23 @@ func (s *Service) Enqueue(task model.HydrationTask) {
 	}
 }
 
+func (s *Service) EnqueueBatch(tasks []model.HydrationTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	s.mu.Lock()
+	enqueued := 0
+	for _, task := range tasks {
+		if s.enqueueLocked(task) {
+			enqueued++
+		}
+	}
+	s.mu.Unlock()
+	for range enqueued {
+		s.signalWork()
+	}
+}
+
 func (s *Service) enqueueLocked(task model.HydrationTask) bool {
 	key := taskKey(task.RepoID, task.ObjectOID)
 	if _, ok := s.active[key]; ok {

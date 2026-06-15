@@ -194,6 +194,7 @@ type OverlayStore interface {
 
 type Hydrator interface {
 	Enqueue(task HydrationTask)
+	EnqueueBatch(tasks []HydrationTask)
 	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
 	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
 	QueueDepth(repoID RepoID) int

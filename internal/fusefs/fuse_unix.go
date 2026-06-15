@@ -59,14 +59,21 @@ type DirHandle struct {
 }
 
 type FileHandle struct {
-	inode *InodeRef
-	path  string
+	mu              sync.Mutex
+	inode           *InodeRef
+	path            string
+	cacheFile       *os.File
+	cacheGeneration int64
+	invalidateSeq   uint64
 }
 
-// ReaddirEntry holds a child name and type, avoiding per-child Getattr calls.
+// ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
 type ReaddirEntry struct {
-	Name string
-	Type string // file, dir, symlink
+	Name      string
+	Type      string // file, dir, symlink
+	ObjectOID string
+	SizeState string
+	SizeBytes int64
 }
 
 func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) *ArtifactFuse {
@@ -145,6 +152,83 @@ func (fs *ArtifactFuse) fileHandle(handleID fuseops.HandleID) (*FileHandle, erro
 		return nil, syscall.EBADF
 	}
 	return fh, nil
+}
+
+func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
+	fs.mu.RLock()
+	var handles []*FileHandle
+	for _, fh := range fs.fileHandles {
+		if fh.path == path {
+			handles = append(handles, fh)
+		}
+	}
+	fs.mu.RUnlock()
+	for _, fh := range handles {
+		fh.closeCachedFile()
+	}
+}
+
+func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size int) ([]byte, error) {
+	currentGen := engine.Resolver.Generation()
+	fh.mu.Lock()
+	if fh.cacheFile != nil && fh.cacheGeneration == currentGen {
+		defer fh.mu.Unlock()
+		return readFileChunkFrom(fh.cacheFile, off, size)
+	}
+	if fh.cacheFile != nil {
+		f := fh.cacheFile
+		fh.cacheFile = nil
+		fh.cacheGeneration = 0
+		fh.invalidateSeq++
+		fh.mu.Unlock()
+		_ = f.Close()
+		fh.mu.Lock()
+	}
+	seq := fh.invalidateSeq
+	fh.mu.Unlock()
+
+	cachePath, gen, ok, err := engine.BaseCachePath(ctx, fh.path)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return engine.Read(ctx, fh.path, off, size)
+	}
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return nil, err
+	}
+
+	fh.mu.Lock()
+	if fh.invalidateSeq != seq || gen != engine.Resolver.Generation() {
+		fh.mu.Unlock()
+		_ = f.Close()
+		return engine.Read(ctx, fh.path, off, size)
+	}
+	if fh.cacheFile != nil && fh.cacheGeneration == gen {
+		_ = f.Close()
+		f = fh.cacheFile
+	} else {
+		if fh.cacheFile != nil {
+			_ = fh.cacheFile.Close()
+		}
+		fh.cacheFile = f
+		fh.cacheGeneration = gen
+	}
+	defer fh.mu.Unlock()
+	return readFileChunkFrom(f, off, size)
+}
+
+func (fh *FileHandle) closeCachedFile() {
+	fh.mu.Lock()
+	f := fh.cacheFile
+	fh.cacheFile = nil
+	fh.cacheGeneration = 0
+	fh.invalidateSeq++
+	fh.mu.Unlock()
+	if f != nil {
+		_ = f.Close()
+	}
 }
 
 // --- FUSE operations ---
@@ -241,18 +325,22 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		return err
 	}
 	if op.Size != nil {
+		fs.closeCachedFilesForPath(ref.Path)
 		if err := fs.engine.Truncate(ctx, ref.Path, int64(*op.Size)); err != nil {
 			return syscall.EIO
 		}
+		fs.closeCachedFilesForPath(ref.Path)
 	}
 	// Handle mtime updates (e.g., from touch)
 	if op.Mtime != nil {
+		fs.closeCachedFilesForPath(ref.Path)
 		if err := fs.engine.SetMtime(ctx, ref.Path, *op.Mtime); err != nil {
 			if errors.Is(err, iofs.ErrInvalid) {
 				return syscall.ENOTSUP
 			}
 			return syscall.EIO
 		}
+		fs.closeCachedFilesForPath(ref.Path)
 	}
 	mode, size, typ, mtime, ctime, err := fs.resolver.Getattr(ref.Path)
 	if err != nil {
@@ -377,7 +465,7 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 		return nil
 	}
 
-	data, err := fs.engine.Read(ctx, fh.path, op.Offset, int(op.Size))
+	data, err := fh.read(ctx, fs.engine, op.Offset, int(op.Size))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return syscall.ENOENT
@@ -394,10 +482,12 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 	if err != nil {
 		return err
 	}
+	fs.closeCachedFilesForPath(fh.path)
 	_, err = fs.engine.Write(ctx, fh.path, op.Offset, op.Data)
 	if err != nil {
 		return syscall.EIO
 	}
+	fs.closeCachedFilesForPath(fh.path)
 	return nil
 }
 
@@ -463,9 +553,11 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 	if err != nil {
 		return err
 	}
+	fs.closeCachedFilesForPath(childPath)
 	if err := fs.engine.Unlink(ctx, childPath); err != nil {
 		return syscall.EIO
 	}
+	fs.closeCachedFilesForPath(childPath)
 	return nil
 }
 
@@ -480,12 +572,16 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
+	fs.closeCachedFilesForPath(oldPath)
+	fs.closeCachedFilesForPath(newPath)
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		if errors.Is(err, iofs.ErrInvalid) {
 			return syscall.ENOTSUP
 		}
 		return syscall.EIO
 	}
+	fs.closeCachedFilesForPath(oldPath)
+	fs.closeCachedFilesForPath(newPath)
 	return nil
 }
 
@@ -543,8 +639,12 @@ func (fs *ArtifactFuse) SyncFile(_ context.Context, _ *fuseops.SyncFileOp) error
 
 func (fs *ArtifactFuse) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {
 	fs.mu.Lock()
+	fh := fs.fileHandles[op.Handle]
 	delete(fs.fileHandles, op.Handle)
 	fs.mu.Unlock()
+	if fh != nil {
+		fh.closeCachedFile()
+	}
 	return nil
 }
 
