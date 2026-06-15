@@ -193,6 +193,8 @@ func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 			RepoID:     e.Repo.ID,
 			Path:       childPath,
 			ObjectOID:  n.ObjectOID,
+			SizeState:  n.SizeState,
+			SizeBytes:  n.SizeBytes,
 			Priority:   pri,
 			Reason:     "prefetch",
 			EnqueuedAt: time.Now(),

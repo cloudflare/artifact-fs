@@ -78,6 +78,52 @@ func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	}
 }
 
+func TestRunPrepareRejectsPersistedInlineCredentialsBeforeClone(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	cfg := model.RepoConfig{
+		Name:            "repo",
+		ID:              "repo",
+		RemoteURL:       "https://token@example.com/org/repo.git",
+		Branch:          "master",
+		FetchRef:        "master",
+		PrepareState:    model.PrepareStatePreparing,
+		RefreshInterval: time.Minute,
+		Enabled:         true,
+	}
+	svc.fillPaths(&cfg)
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.runPrepare(ctx, got); err == nil {
+		t.Fatal("expected runPrepare failure")
+	}
+	if _, err := os.Stat(got.GitDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("git dir stat = %v, want not exist", err)
+	}
+	got, err = svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrepareState != model.PrepareStateFailed {
+		t.Fatalf("PrepareState = %q, want failed", got.PrepareState)
+	}
+	if strings.Contains(got.PrepareError, "token") {
+		t.Fatalf("PrepareError was not redacted: %q", got.PrepareError)
+	}
+}
+
 func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -392,6 +438,123 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 	}
 	if _, ok := snap.GetNode(gen, "README.md"); !ok {
 		t.Fatal("README.md not found in snapshot")
+	}
+}
+
+func TestSizeUpdateBatcherFlushesOnStop(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	snap, err := snapshot.New(ctx, filepath.Join(tmp, "snap.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	gen, err := snap.PublishGeneration(ctx, "head", "master", []model.BaseNode{
+		{RepoID: "repo", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: "repo", Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "a", SizeState: "unknown"},
+		{RepoID: "repo", Path: "b.txt", Type: "file", Mode: 0o644, ObjectOID: "b", SizeState: "unknown"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	batcher := newSizeUpdateBatcher(snap, slog.New(slog.NewTextHandler(io.Discard, nil)), "repo")
+	batcher.Start(runCtx)
+	batcher.Add(gen, "a", 10)
+	batcher.Add(gen, "b", 20)
+	cancel()
+	batcher.Stop()
+
+	n, ok := snap.GetNode(gen, "a.txt")
+	if !ok {
+		t.Fatal("a.txt not found")
+	}
+	if n.SizeState != "known" || n.SizeBytes != 10 {
+		t.Fatalf("a.txt size = %s/%d, want known/10", n.SizeState, n.SizeBytes)
+	}
+	n, ok = snap.GetNode(gen, "b.txt")
+	if !ok {
+		t.Fatal("b.txt not found")
+	}
+	if n.SizeState != "known" || n.SizeBytes != 20 {
+		t.Fatalf("b.txt size = %s/%d, want known/20", n.SizeState, n.SizeBytes)
+	}
+}
+
+func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+
+	runCmd(t, "git", "init", "--bare", bare)
+	runCmd(t, "git", "clone", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-b", "master")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", work, "add", "README.md")
+	runCmd(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	runCmd(t, "git", "-C", work, "push", "origin", "master")
+
+	for _, fetchRef := range []string{"master", "refs/heads/master", "origin/master", "refs/remotes/origin/master"} {
+		t.Run(fetchRef, func(t *testing.T) {
+			svc, err := New(ctx, filepath.Join(tmp, "artifact-fs", strings.ReplaceAll(fetchRef, "/", "-")), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer svc.Close()
+
+			cfg := model.RepoConfig{
+				Name:      "repo",
+				ID:        "repo",
+				RemoteURL: "file://" + bare,
+				Branch:    "master",
+				FetchRef:  fetchRef,
+				Enabled:   true,
+			}
+			if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := svc.registry.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			bin := filepath.Join(t.TempDir(), "bin")
+			if err := os.Mkdir(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			logPath := filepath.Join(t.TempDir(), "git.log")
+			fakeGit := filepath.Join(bin, "git")
+			if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec /usr/bin/git \"$@\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GIT_COMMAND_LOG", logPath)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			if err := svc.runPrepare(ctx, got); err != nil {
+				t.Fatalf("runPrepare: %v", err)
+			}
+			logData, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range strings.Split(string(logData), "\n") {
+				if strings.HasPrefix(line, "fetch ") {
+					t.Fatalf("fresh branch clone ran redundant fetch; git log:\n%s", logData)
+				}
+			}
+
+			got, err = svc.registry.GetRepo(ctx, "repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.PrepareState != model.PrepareStateReady {
+				t.Fatalf("PrepareState = %q, want ready", got.PrepareState)
+			}
+		})
 	}
 }
 

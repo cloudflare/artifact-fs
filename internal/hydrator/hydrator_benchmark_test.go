@@ -98,6 +98,122 @@ func BenchmarkAsyncHydrationDuplicateReads(b *testing.B) {
 	}
 }
 
+func BenchmarkQueuedDuplicatePrefetch(b *testing.B) {
+	const (
+		objects         = 512
+		repeats         = 8
+		hydratorWorkers = 8
+	)
+	payload := []byte("small blob payload\n")
+	tasks := make([]model.HydrationTask, 0, objects*repeats)
+	for i := range objects {
+		oid := fmt.Sprintf("%040x", i+1)
+		for r := range repeats {
+			tasks = append(tasks, model.HydrationTask{
+				RepoID:     "repo",
+				Path:       fmt.Sprintf("dir/file-%04d-%02d.txt", i, r),
+				ObjectOID:  oid,
+				Priority:   PriorityLikelyText,
+				Reason:     "prefetch",
+				EnqueuedAt: time.Now(),
+			})
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		fetcher := &fakeBlobFetcher{payload: payload}
+		h := New(fetcher)
+		for _, task := range tasks {
+			h.Enqueue(task)
+		}
+		h.Start(hydratorWorkers, cfg)
+		waitBenchmarkHydratorIdle(b, h, cfg.ID)
+		h.Stop()
+		b.ReportMetric(float64(fetcher.Calls()), "fetches/op")
+	}
+}
+
+func BenchmarkQueuedCachedPrefetch(b *testing.B) {
+	const (
+		objects         = 512
+		hydratorWorkers = 8
+	)
+	payload := []byte("small blob payload\n")
+	tasks := make([]model.HydrationTask, 0, objects)
+	for i := range objects {
+		oid := fmt.Sprintf("%040x", i+1)
+		tasks = append(tasks, model.HydrationTask{
+			RepoID:     "repo",
+			Path:       fmt.Sprintf("dir/file-%04d.txt", i),
+			ObjectOID:  oid,
+			Priority:   PriorityLikelyText,
+			Reason:     "prefetch",
+			EnqueuedAt: time.Now(),
+		})
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		if err := os.MkdirAll(cfg.BlobCacheDir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for _, task := range tasks {
+			if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, task.ObjectOID), payload, 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+		fetcher := &fakeBlobFetcher{payload: []byte("new payload"), verifyOK: true}
+		h := New(fetcher)
+		for _, task := range tasks {
+			h.Enqueue(task)
+		}
+		h.Start(hydratorWorkers, cfg)
+		waitBenchmarkHydratorIdle(b, h, cfg.ID)
+		h.Stop()
+		b.ReportMetric(float64(fetcher.Calls()), "fetches/op")
+		b.ReportMetric(float64(fetcher.VerifyCalls()), "verifies/op")
+	}
+}
+
+func BenchmarkQueuedPrefetchWorkerRamp(b *testing.B) {
+	const (
+		objects         = 8
+		hydratorWorkers = 8
+	)
+	payload := []byte("small blob payload\n")
+	tasks := make([]model.HydrationTask, 0, objects)
+	for i := range objects {
+		tasks = append(tasks, model.HydrationTask{
+			RepoID:     "repo",
+			Path:       fmt.Sprintf("dir/file-%04d.txt", i),
+			ObjectOID:  fmt.Sprintf("%040x", i+1),
+			Priority:   PriorityLikelyText,
+			Reason:     "prefetch",
+			EnqueuedAt: time.Now(),
+		})
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: b.TempDir()}
+		fetcher := &fakeBlobFetcher{payload: payload, fetchDelay: 10 * time.Millisecond}
+		h := New(fetcher)
+		for _, task := range tasks {
+			h.Enqueue(task)
+		}
+		h.Start(hydratorWorkers, cfg)
+		waitBenchmarkHydratorIdle(b, h, cfg.ID)
+		h.Stop()
+		b.ReportMetric(float64(fetcher.Calls()), "fetches/op")
+	}
+}
+
 func BenchmarkAsyncHydrationGitStore(b *testing.B) {
 	const (
 		objects         = 2048
@@ -166,6 +282,27 @@ func hydrateBenchmarkNodes(b *testing.B, h *Service, cfg model.RepoConfig, nodes
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+func waitBenchmarkHydratorIdle(b *testing.B, h *Service, repoID model.RepoID) {
+	b.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		queued := 0
+		for _, item := range h.pq {
+			if item.task.RepoID == repoID {
+				queued++
+			}
+		}
+		idle := queued == 0 && len(h.active) == 0
+		h.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	b.Fatalf("hydrator did not become idle")
 }
 
 func createBenchmarkGitRepo(b *testing.B, objects int) (workDir string, gitDir string) {

@@ -112,6 +112,8 @@ type HydrationTask struct {
 	RepoID     RepoID
 	Path       string
 	ObjectOID  string
+	SizeState  string
+	SizeBytes  int64
 	Priority   int
 	Reason     string
 	EnqueuedAt time.Time

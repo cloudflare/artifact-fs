@@ -110,7 +110,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	env := append([]string{}, extraEnv...)
 	env = append(env, credHelper...)
 
-	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--branch", cfg.Branch, safeURL, target}
+	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target}
 	if _, err := runGitWithEnv(ctx, "", env, args...); err != nil {
 		return err
 	}
@@ -125,7 +125,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 }
 
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
-	_, err := runGit(ctx, repo.GitDir, "fetch", "origin")
+	_, err := runGit(ctx, repo.GitDir, "fetch", "--no-tags", "origin")
 	return err
 }
 
@@ -138,20 +138,13 @@ func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfi
 	if target.branch != "" {
 		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
 	}
-	_, err = runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "origin", refspec)
+	_, err = runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
 	return err
 }
 
 func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	if strings.TrimSpace(repo.RemoteURL) == "" {
-		return errors.New("remote URL is required")
-	}
-	safeURL, _, err := credentialEnv(repo.RemoteURL)
-	if err != nil {
+	if err := s.ValidateAmbientRemote(repo); err != nil {
 		return err
-	}
-	if safeURL != repo.RemoteURL {
-		return errors.New("existing clone remote must use ambient credentials")
 	}
 	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
 	if err != nil {
@@ -166,6 +159,20 @@ func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo mod
 		return err
 	}
 	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
+}
+
+func (s *Store) ValidateAmbientRemote(repo model.RepoConfig) error {
+	if strings.TrimSpace(repo.RemoteURL) == "" {
+		return errors.New("remote URL is required")
+	}
+	safeURL, _, err := credentialEnv(repo.RemoteURL)
+	if err != nil {
+		return err
+	}
+	if safeURL != repo.RemoteURL {
+		return errors.New("remote must use ambient credentials")
+	}
+	return nil
 }
 
 func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig, ref string) error {
@@ -256,55 +263,24 @@ func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid str
 
 func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headOID string) ([]model.BaseNode, error) {
 	// -z: NUL-delimited output with raw paths (no C-quoting of non-ASCII names).
-	out, err := runGit(ctx, repo.GitDir, "ls-tree", "-r", "-t", "-z", headOID)
-	if err != nil {
-		return nil, err
-	}
-	records := strings.Split(out, "\x00")
 	nodes := []model.BaseNode{rootNode(repo.ID)}
 	var blobOIDs []string
 	blobIndex := map[string][]int{} // oid -> indices into nodes
-	for _, line := range records {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		meta := strings.Fields(parts[0])
-		if len(meta) < 3 {
-			continue
-		}
-		modeStr := meta[0]
-		typ := meta[1]
-		oid := meta[2]
-		path := parts[1]
-		mode64, _ := strconv.ParseUint(modeStr, 8, 32)
-		mode := uint32(mode64)
-
-		nodeType := normalizeGitType(typ, mode)
-		if typ == "commit" {
-			continue
-		}
-
-		n := model.BaseNode{
-			RepoID:    repo.ID,
-			Path:      path,
-			Type:      nodeType,
-			Mode:      mode,
-			ObjectOID: oid,
-			SizeState: "unknown",
-			SizeBytes: 0,
+	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
+		n, typ, ok := parseTreeRecord(repo.ID, line)
+		if !ok {
+			return
 		}
 		idx := len(nodes)
 		nodes = append(nodes, n)
-		if typ == "blob" && oid != "" {
-			blobIndex[oid] = append(blobIndex[oid], idx)
-			if len(blobIndex[oid]) == 1 {
-				blobOIDs = append(blobOIDs, oid)
+		if typ == "blob" && n.ObjectOID != "" {
+			blobIndex[n.ObjectOID] = append(blobIndex[n.ObjectOID], idx)
+			if len(blobIndex[n.ObjectOID]) == 1 {
+				blobOIDs = append(blobOIDs, n.ObjectOID)
 			}
 		}
+	}); err != nil {
+		return nil, err
 	}
 
 	// Batch-resolve sizes using cat-file --batch-check. This reads from local
@@ -315,6 +291,80 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 		s.logger.Warn("batch size resolution failed, files will show size 0 until hydrated", "repo", repo.Name, "error", err)
 	}
 	return addImplicitDirs(repo.ID, nodes), nil
+}
+
+func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
+	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	errBuf := &bytes.Buffer{}
+	cmd.Stderr = errBuf
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	readErr := readNullDelimited(stdout, fn)
+	waitErr := cmd.Wait()
+	if readErr != nil {
+		return readErr
+	}
+	if waitErr != nil {
+		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
+		if msg == "" {
+			msg = auth.RedactString(waitErr.Error())
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func readNullDelimited(r io.Reader, fn func(string)) error {
+	reader := bufio.NewReader(r)
+	for {
+		record, err := reader.ReadString('\x00')
+		if record != "" {
+			record = strings.TrimSuffix(record, "\x00")
+			if record != "" {
+				fn(record)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func parseTreeRecord(repoID model.RepoID, line string) (model.BaseNode, string, bool) {
+	parts := strings.SplitN(line, "\t", 2)
+	if len(parts) != 2 {
+		return model.BaseNode{}, "", false
+	}
+	meta := strings.Fields(parts[0])
+	if len(meta) < 3 {
+		return model.BaseNode{}, "", false
+	}
+	modeStr := meta[0]
+	typ := meta[1]
+	oid := meta[2]
+	mode64, _ := strconv.ParseUint(modeStr, 8, 32)
+	mode := uint32(mode64)
+	if typ == "commit" {
+		return model.BaseNode{}, typ, false
+	}
+	return model.BaseNode{
+		RepoID:    repoID,
+		Path:      parts[1],
+		Type:      normalizeGitType(typ, mode),
+		Mode:      mode,
+		ObjectOID: oid,
+		SizeState: "unknown",
+		SizeBytes: 0,
+	}, typ, true
 }
 
 func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, nodes []model.BaseNode, oids []string, index map[string][]int) error {
@@ -332,38 +382,67 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	if err != nil {
 		return err
 	}
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &bytes.Buffer{}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	errBuf := &bytes.Buffer{}
+	cmd.Stderr = errBuf
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	for _, oid := range oids {
-		fmt.Fprintln(stdin, oid)
-	}
-	stdin.Close()
-	if err := cmd.Wait(); err != nil {
-		return err
-	}
+	writeErrCh := make(chan error, 1)
+	go func() {
+		var writeErr error
+		for _, oid := range oids {
+			if _, writeErr = fmt.Fprintln(stdin, oid); writeErr != nil {
+				break
+			}
+		}
+		if closeErr := stdin.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		writeErrCh <- writeErr
+	}()
 	// Output format: "<oid> <type> <size>" or "<oid> missing"
-	scan := bufio.NewScanner(&outBuf)
+	scan := bufio.NewScanner(stdout)
 	for scan.Scan() {
-		fields := strings.Fields(scan.Text())
-		if len(fields) < 3 {
-			continue
-		}
-		oid := fields[0]
-		sizeStr := fields[2]
-		sz, err := strconv.ParseInt(sizeStr, 10, 64)
-		if err != nil {
-			continue
-		}
-		for _, idx := range index[oid] {
-			nodes[idx].SizeBytes = sz
-			nodes[idx].SizeState = "known"
-		}
+		applyBatchCheckLine(nodes, index, scan.Text())
 	}
-	return scan.Err()
+	scanErr := scan.Err()
+	writeErr := <-writeErrCh
+	waitErr := cmd.Wait()
+	if writeErr != nil {
+		return writeErr
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+	if waitErr != nil {
+		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
+		if msg == "" {
+			msg = auth.RedactString(waitErr.Error())
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func applyBatchCheckLine(nodes []model.BaseNode, index map[string][]int, line string) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return
+	}
+	oid := fields[0]
+	sizeStr := fields[2]
+	sz, err := strconv.ParseInt(sizeStr, 10, 64)
+	if err != nil {
+		return
+	}
+	for _, idx := range index[oid] {
+		nodes[idx].SizeBytes = sz
+		nodes[idx].SizeState = "known"
+	}
 }
 
 // BlobToCache fetches a git object and writes it to dstPath in a binary-safe manner.

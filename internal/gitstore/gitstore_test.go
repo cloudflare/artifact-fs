@@ -375,7 +375,9 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	run(t, "git", "init", "--bare", bare)
 	run(t, "git", "clone", bare, work)
 	run(t, "git", "-C", work, "checkout", "-b", "master")
-	os.WriteFile(filepath.Join(work, "README.md"), []byte("master\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("master\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	run(t, "git", "-C", work, "add", "README.md")
 	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "master")
 	run(t, "git", "-C", work, "push", "origin", "master")
@@ -416,6 +418,69 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("DEV.md not found after existing clone prepare")
+	}
+}
+
+func TestCloneAndFetchRefSkipTags(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	gitDir := filepath.Join(tmp, "repo.git")
+
+	run(t, "git", "init", "--bare", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "master")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("master\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", "README.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "master")
+	run(t, "git", "-C", work, "push", "origin", "master")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmp, "git.log")
+	fakeGit := filepath.Join(bin, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_COMMAND_LOG\"\nexec \"$REAL_GIT\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_COMMAND_LOG", logPath)
+	t.Setenv("REAL_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	store := New(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir, RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}
+	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
+		t.Fatalf("CloneBloblessNonInteractive: %v", err)
+	}
+	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+		t.Fatalf("FetchRefNonInteractive: %v", err)
+	}
+	if err := store.Fetch(ctx, cfg); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "clone --filter=blob:none --no-checkout --single-branch --no-tags --branch master") {
+		t.Fatalf("clone did not include --no-tags; git log:\n%s", logText)
+	}
+	if !strings.Contains(logText, "fetch --filter=blob:none --no-tags origin +refs/heads/master:refs/remotes/origin/master") {
+		t.Fatalf("fetch did not include --no-tags; git log:\n%s", logText)
+	}
+	if !strings.Contains(logText, "fetch --no-tags origin") {
+		t.Fatalf("refresh fetch did not include --no-tags; git log:\n%s", logText)
 	}
 }
 

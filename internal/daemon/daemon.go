@@ -29,6 +29,7 @@ const DefaultHydrationConcurrency = 4
 const (
 	defaultPrepareTimeout    = 30 * time.Minute
 	prepareStateWriteTimeout = 5 * time.Second
+	sizeUpdateFlushInterval  = 100 * time.Millisecond
 )
 
 const (
@@ -64,6 +65,7 @@ type repoRuntime struct {
 	snapshot *snapshot.Store
 	overlay  *overlay.Store
 	hydrator *hydrator.Service
+	sizes    *sizeUpdateBatcher
 	resolver *fusefs.Resolver
 	mfs      fusefs.MountedFS
 	gate     *fusefs.ReadyGate
@@ -544,9 +546,12 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
 	s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
+	runtimeCtx, cancel := context.WithCancel(ctx)
+	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
+	sizes.Start(runtimeCtx)
 
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
-		snap.UpdateSize(resolver.Generation(), objectOID, size)
+		sizes.Add(resolver.Generation(), objectOID, size)
 	})
 	h.Start(s.hydrationWorkers(), cfg)
 	engine := &fusefs.Engine{
@@ -561,8 +566,6 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		s.logger.Error("fuse mount failed, running without FUSE", "repo", cfg.Name, "error", err)
 		mfs = nil
 	}
-	runtimeCtx, cancel := context.WithCancel(ctx)
-
 	rt := &repoRuntime{
 		cfg:      cfg,
 		ctx:      runtimeCtx,
@@ -570,6 +573,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		snapshot: snap,
 		overlay:  ov,
 		hydrator: h,
+		sizes:    sizes,
 		resolver: resolver,
 		mfs:      mfs,
 		state:    newRuntimeState(cfg.ID, headOID, headRef, gen),
@@ -601,8 +605,11 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	if headOID != "" {
 		s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
 	}
+	runtimeCtx, cancel := context.WithCancel(ctx)
+	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
+	sizes.Start(runtimeCtx)
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
-		snap.UpdateSize(resolver.Generation(), objectOID, size)
+		sizes.Add(resolver.Generation(), objectOID, size)
 	})
 	h.Start(s.hydrationWorkers(), cfg)
 
@@ -622,7 +629,6 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		s.logger.Error("fuse mount failed, running without FUSE", "repo", cfg.Name, "error", err)
 		mfs = nil
 	}
-	runtimeCtx, cancel := context.WithCancel(ctx)
 	state := cfg.PrepareState
 	if strings.TrimSpace(state) == "" {
 		state = model.PrepareStatePreparing
@@ -634,6 +640,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		snapshot: snap,
 		overlay:  ov,
 		hydrator: h,
+		sizes:    sizes,
 		resolver: resolver,
 		mfs:      mfs,
 		gate:     gate,
@@ -751,11 +758,16 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 				return fail(err)
 			}
 		} else {
+			if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+				return fail(err)
+			}
 			if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
 				return fail(err)
 			}
-			if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
-				return fail(err)
+			if !sameBranchRef(cfg.FetchRef, cfg.Branch) {
+				if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+					return fail(err)
+				}
 			}
 		}
 	}
@@ -793,6 +805,23 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 		return fail(err)
 	}
 	return nil
+}
+
+func sameBranchRef(fetchRef string, branch string) bool {
+	return branchRefName(fetchRef) == branchRefName(branch)
+}
+
+func branchRefName(ref string) string {
+	ref = strings.TrimSpace(ref)
+	for _, prefix := range []string{"refs/heads/", "refs/remotes/origin/", "origin/"} {
+		if strings.HasPrefix(ref, prefix) {
+			return strings.TrimPrefix(ref, prefix)
+		}
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		return ""
+	}
+	return ref
 }
 
 func (s *Service) snapshotForPrepare(ctx context.Context, cfg model.RepoConfig) (*snapshot.Store, bool, error) {
@@ -1036,6 +1065,90 @@ func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, sna
 	return gen, "", nil
 }
 
+type sizeUpdateBatcher struct {
+	snapshot *snapshot.Store
+	logger   *slog.Logger
+	repoName string
+	interval time.Duration
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	done     chan struct{}
+	mu       sync.Mutex
+	pending  map[int64]map[string]int64
+	stopped  bool
+}
+
+func newSizeUpdateBatcher(snap *snapshot.Store, logger *slog.Logger, repoName string) *sizeUpdateBatcher {
+	return &sizeUpdateBatcher{
+		snapshot: snap,
+		logger:   logger,
+		repoName: repoName,
+		interval: sizeUpdateFlushInterval,
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
+		pending:  map[int64]map[string]int64{},
+	}
+}
+
+func (b *sizeUpdateBatcher) Start(ctx context.Context) {
+	go b.run(ctx)
+}
+
+func (b *sizeUpdateBatcher) Add(generation int64, objectOID string, size int64) {
+	if generation <= 0 || strings.TrimSpace(objectOID) == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped {
+		return
+	}
+	if b.pending[generation] == nil {
+		b.pending[generation] = map[string]int64{}
+	}
+	b.pending[generation][objectOID] = size
+}
+
+func (b *sizeUpdateBatcher) Stop() {
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		b.stopped = true
+		b.mu.Unlock()
+		close(b.stopCh)
+		<-b.done
+		b.Flush()
+	})
+}
+
+func (b *sizeUpdateBatcher) run(ctx context.Context) {
+	ticker := time.NewTicker(b.interval)
+	defer ticker.Stop()
+	defer close(b.done)
+	defer b.Flush()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-b.stopCh:
+			return
+		case <-ticker.C:
+			b.Flush()
+		}
+	}
+}
+
+func (b *sizeUpdateBatcher) Flush() {
+	b.mu.Lock()
+	pending := b.pending
+	b.pending = map[int64]map[string]int64{}
+	b.mu.Unlock()
+	for gen, sizes := range pending {
+		if err := b.snapshot.UpdateSizes(context.Background(), gen, sizes); err != nil && b.logger != nil {
+			b.logger.Warn("snapshot size backfill failed", "repo", b.repoName, "generation", gen, "error", err)
+		}
+	}
+}
+
 func (s *Service) refreshCommitTime(ctx context.Context, cfg model.RepoConfig, oid string, resolver *fusefs.Resolver, warnMsg string) {
 	if ts, err := s.git.CommitTimestamp(ctx, cfg, oid); err == nil {
 		resolver.SetCommitTime(ts)
@@ -1178,6 +1291,9 @@ func (s *Service) stopRuntime(rt *repoRuntime) {
 	}
 	if rt.hydrator != nil {
 		rt.hydrator.Stop()
+	}
+	if rt.sizes != nil {
+		rt.sizes.Stop()
 	}
 	if rt.snapshot != nil {
 		_ = rt.snapshot.Close()
