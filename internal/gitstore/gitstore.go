@@ -1221,14 +1221,14 @@ func fetchRefTarget(repo model.RepoConfig, ref string) (fetchRefInfo, error) {
 
 func branchName(ref string) string {
 	ref = strings.TrimSpace(ref)
-	if strings.HasPrefix(ref, "refs/heads/") {
-		return strings.TrimPrefix(ref, "refs/heads/")
+	if after, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
+		return after
 	}
-	if strings.HasPrefix(ref, "refs/remotes/origin/") {
-		return strings.TrimPrefix(ref, "refs/remotes/origin/")
+	if after, ok := strings.CutPrefix(ref, "refs/remotes/origin/"); ok {
+		return after
 	}
-	if strings.HasPrefix(ref, "origin/") {
-		return strings.TrimPrefix(ref, "origin/")
+	if after, ok := strings.CutPrefix(ref, "origin/"); ok {
+		return after
 	}
 	if strings.HasPrefix(ref, "refs/") {
 		return ""

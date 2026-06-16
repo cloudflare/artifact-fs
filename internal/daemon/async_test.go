@@ -541,7 +541,7 @@ func TestRunPrepareFreshCloneSkipsSecondFetchForBranchFetchRef(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, line := range strings.Split(string(logData), "\n") {
+			for line := range strings.SplitSeq(string(logData), "\n") {
 				if strings.HasPrefix(line, "fetch ") {
 					t.Fatalf("fresh branch clone ran redundant fetch; git log:\n%s", logData)
 				}

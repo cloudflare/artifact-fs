@@ -814,8 +814,8 @@ func sameBranchRef(fetchRef string, branch string) bool {
 func branchRefName(ref string) string {
 	ref = strings.TrimSpace(ref)
 	for _, prefix := range []string{"refs/heads/", "refs/remotes/origin/", "origin/"} {
-		if strings.HasPrefix(ref, prefix) {
-			return strings.TrimPrefix(ref, prefix)
+		if after, ok := strings.CutPrefix(ref, prefix); ok {
+			return after
 		}
 	}
 	if strings.HasPrefix(ref, "refs/") {

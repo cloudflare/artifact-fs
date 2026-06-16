@@ -229,7 +229,7 @@ func pathBeforeAtSegmentCount(path string) int {
 		path = path[:at]
 	}
 	count := 0
-	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+	for segment := range strings.SplitSeq(strings.Trim(path, "/"), "/") {
 		if segment != "" {
 			count++
 		}
@@ -258,8 +258,8 @@ func userinfoLikeBeforePath(candidate string) bool {
 	if candidate == "" {
 		return false
 	}
-	if slash := strings.Index(candidate, "/"); slash >= 0 {
-		prefix := candidate[:slash]
+	if before, _, ok := strings.Cut(candidate, "/"); ok {
+		prefix := before
 		return strings.Contains(prefix, ":") || !isRealHost(prefix)
 	}
 	return true

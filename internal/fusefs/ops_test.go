@@ -117,7 +117,7 @@ func TestPrefetchDirCapsAndPrioritizesTasks(t *testing.T) {
 	h := &fakeBatchHydrator{}
 	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Hydrator: h}
 	entries := make([]ReaddirEntry, 0, maxPrefetchTasksPerDir+2)
-	for i := 0; i < maxPrefetchTasksPerDir+1; i++ {
+	for i := range maxPrefetchTasksPerDir + 1 {
 		entries = append(entries, ReaddirEntry{Name: fmt.Sprintf("image-%03d.png", i), Type: "file", ObjectOID: fmt.Sprintf("png-%03d", i)})
 	}
 	entries = append(entries, ReaddirEntry{Name: "README.md", Type: "file", ObjectOID: "readme"})

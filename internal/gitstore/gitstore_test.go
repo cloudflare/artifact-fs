@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1025,10 +1026,8 @@ func TestNonInteractiveGitEnvForcesSSHBatchMode(t *testing.T) {
 func TestNonInteractiveGitEnvDefaultSSHBatchMode(t *testing.T) {
 	t.Setenv("GIT_SSH_COMMAND", "")
 	env := nonInteractiveGitEnv()
-	for _, e := range env {
-		if e == "GIT_SSH_COMMAND=ssh -o BatchMode=yes" {
-			return
-		}
+	if slices.Contains(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes") {
+		return
 	}
 	t.Fatalf("expected forced GIT_SSH_COMMAND, got %v", env)
 }

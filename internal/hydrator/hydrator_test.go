@@ -232,7 +232,7 @@ func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
 	}
 	runtime.Gosched()
 	close(releaseFetch)
-	for i := 0; i < readers+1; i++ {
+	for range readers + 1 {
 		if err := <-errCh; err != nil {
 			t.Fatalf("EnsureHydrated: %v", err)
 		}
