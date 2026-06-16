@@ -287,8 +287,8 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	// pack metadata and doesn't trigger network fetches on blobless clones.
 	if err := s.batchResolveSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
 		// Non-fatal: sizes remain "unknown" and reads will still work via
-		// hydration. Log so operators can diagnose size=0 issues.
-		s.logger.Warn("batch size resolution failed, files will show size 0 until hydrated", "repo", repo.Name, "error", err)
+		// hydration. Log so operators can diagnose unexpected attr hydration.
+		s.logger.Warn("batch size resolution failed, some file sizes will resolve on demand", "repo", repo.Name, "error", err)
 	}
 	return addImplicitDirs(repo.ID, nodes), nil
 }
