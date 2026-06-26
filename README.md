@@ -26,7 +26,7 @@ ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any 
 
 ## Build and Install
 
-Requires Go 1.24+ and a FUSE implementation:
+Requires Go 1.25+ and a FUSE implementation:
 
 - **macOS** -- [macFUSE](https://osxfuse.github.io/)
 - **Linux** -- `fuse3` (`apt install fuse3` on Debian/Ubuntu, `dnf install fuse3` on Fedora)
