@@ -177,12 +177,10 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	errCh := make(chan error, readers)
 	var wg sync.WaitGroup
 	for range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, _, err := h.EnsureHydrated(ctx, cfg, node)
 			errCh <- err
-		}()
+		})
 	}
 	<-verifyStarted
 	runtime.Gosched()

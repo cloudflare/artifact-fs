@@ -44,16 +44,14 @@ func BenchmarkAsyncHydration(b *testing.B) {
 		jobs := make(chan model.BaseNode)
 		var wg sync.WaitGroup
 		for range callerWorkers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for n := range jobs {
 					if _, _, err := h.EnsureHydrated(context.Background(), cfg, n); err != nil {
 						b.Errorf("EnsureHydrated: %v", err)
 						return
 					}
 				}
-			}()
+			})
 		}
 		for _, n := range nodes {
 			jobs <- n
@@ -266,16 +264,14 @@ func hydrateBenchmarkNodes(b *testing.B, h *Service, cfg model.RepoConfig, nodes
 	jobs := make(chan model.BaseNode)
 	var wg sync.WaitGroup
 	for range callerWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for n := range jobs {
 				if _, _, err := h.EnsureHydrated(context.Background(), cfg, n); err != nil {
 					b.Errorf("EnsureHydrated: %v", err)
 					return
 				}
 			}
-		}()
+		})
 	}
 	for _, n := range nodes {
 		jobs <- n
