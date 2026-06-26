@@ -28,6 +28,10 @@ type RepoConfig struct {
 	MetaDBPath        string
 	OverlayDBPath     string
 	Enabled           bool
+	PreparedGitDir    bool
+	FetchRef          string
+	PrepareState      string
+	PrepareError      string
 }
 
 type RepoRuntimeState struct {
@@ -44,7 +48,14 @@ type RepoRuntimeState struct {
 	HydratedBlobBytes  int64
 	DirtyOverlay       bool
 	State              string
+	PrepareError       string
 }
+
+const (
+	PrepareStatePreparing = "preparing"
+	PrepareStateReady     = "ready"
+	PrepareStateFailed    = "failed"
+)
 
 // BaseNode represents a tracked entry from the git tree. Inode IDs are assigned
 // at runtime by the FUSE layer (monotonic allocation, like tigrisfs).
@@ -101,6 +112,8 @@ type HydrationTask struct {
 	RepoID     RepoID
 	Path       string
 	ObjectOID  string
+	SizeState  string
+	SizeBytes  int64
 	Priority   int
 	Reason     string
 	EnqueuedAt time.Time
@@ -143,7 +156,9 @@ type Registry interface {
 
 type GitStore interface {
 	CloneBlobless(ctx context.Context, cfg RepoConfig) error
+	CloneBloblessNonInteractive(ctx context.Context, cfg RepoConfig) error
 	Fetch(ctx context.Context, repo RepoConfig) error
+	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
 	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)
 	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
 	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
@@ -151,6 +166,8 @@ type GitStore interface {
 	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
 	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
 	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
+	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
+	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
 }
 
 type SnapshotStore interface {
@@ -177,6 +194,7 @@ type OverlayStore interface {
 
 type Hydrator interface {
 	Enqueue(task HydrationTask)
+	EnqueueBatch(tasks []HydrationTask)
 	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
 	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
 	QueueDepth(repoID RepoID) int

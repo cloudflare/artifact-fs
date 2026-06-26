@@ -202,6 +202,143 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	}
 }
 
+func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: int64(len(payload))}
+	releaseFetch := make(chan struct{})
+	fetchStarted := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: payload, fetchStarted: fetchStarted, fetchWait: releaseFetch}
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const readers = 8
+	errCh := make(chan error, readers+1)
+	go func() {
+		_, _, err := h.EnsureHydrated(ctx, cfg, node)
+		errCh <- err
+	}()
+	<-fetchStarted
+	for range readers {
+		go func() {
+			_, _, err := h.EnsureHydrated(ctx, cfg, node)
+			errCh <- err
+		}()
+	}
+	runtime.Gosched()
+	close(releaseFetch)
+	for range readers + 1 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("EnsureHydrated: %v", err)
+		}
+	}
+	if fetcher.Calls() != 1 {
+		t.Fatalf("fetch calls = %d, want 1", fetcher.Calls())
+	}
+}
+
+func TestEnqueueDedupesAndUpgradesPriority(t *testing.T) {
+	t.Parallel()
+	h := New(&fakeBlobFetcher{})
+	low := model.HydrationTask{RepoID: "repo", Path: "image.png", ObjectOID: "blob", Priority: PriorityBinary, Reason: "prefetch", EnqueuedAt: time.Now()}
+	high := model.HydrationTask{RepoID: "repo", Path: "README.md", ObjectOID: "blob", Priority: PriorityBootstrap, Reason: "prefetch", EnqueuedAt: time.Now().Add(time.Second)}
+
+	h.Enqueue(low)
+	h.Enqueue(low)
+	if got := h.QueueDepth("repo"); got != 1 {
+		t.Fatalf("QueueDepth after duplicate enqueue = %d, want 1", got)
+	}
+	h.EnqueueBatch([]model.HydrationTask{low, high})
+	if got := h.QueueDepth("repo"); got != 1 {
+		t.Fatalf("QueueDepth after priority upgrade = %d, want 1", got)
+	}
+	h.mu.Lock()
+	got := h.pq[0].task
+	h.mu.Unlock()
+	if got.Priority != PriorityBootstrap || got.Path != "README.md" {
+		t.Fatalf("queued task = %+v, want upgraded README priority", got)
+	}
+}
+
+func TestQueuedHydrationUsesValidCacheHit(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	cachePath := filepath.Join(tmp, "blob")
+	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &fakeBlobFetcher{payload: []byte("new-data"), verifyOK: true}
+	h := New(fetcher)
+	hydrated := make(chan struct{})
+	var hydratedOnce sync.Once
+	h.SetOnHydrated(func(model.RepoID, string, int64) {
+		hydratedOnce.Do(func() { close(hydrated) })
+	})
+	h.Enqueue(model.HydrationTask{
+		RepoID:     cfg.ID,
+		Path:       "file.txt",
+		ObjectOID:  "blob",
+		SizeState:  "known",
+		SizeBytes:  int64(len(payload)),
+		Priority:   PriorityBootstrap,
+		Reason:     "prefetch",
+		EnqueuedAt: time.Now(),
+	})
+	h.Start(1, cfg)
+	defer h.Stop()
+
+	select {
+	case <-hydrated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued hydration did not complete")
+	}
+	if fetcher.Calls() != 0 {
+		t.Fatalf("fetch calls = %d, want 0", fetcher.Calls())
+	}
+	if fetcher.VerifyCalls() != 1 {
+		t.Fatalf("verify calls = %d, want 1", fetcher.VerifyCalls())
+	}
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("cache contents = %q, want %q", data, payload)
+	}
+}
+
+func TestQueuedHydrationWakesWorkersForBacklog(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	releaseFetch := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchWait: releaseFetch}
+	h := New(fetcher)
+	for i := range 4 {
+		h.Enqueue(model.HydrationTask{
+			RepoID:     cfg.ID,
+			Path:       filepath.Join("dir", "file.txt"),
+			ObjectOID:  string(rune('a' + i)),
+			Priority:   PriorityBootstrap,
+			Reason:     "prefetch",
+			EnqueuedAt: time.Now(),
+		})
+	}
+	h.Start(4, cfg)
+	defer h.Stop()
+
+	waitForFetchCalls(t, fetcher, 4)
+	close(releaseFetch)
+	waitForHydratorIdle(t, h, cfg.ID)
+}
+
 func TestEnsureHydratedVerificationIgnoresLeaderTimeout(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -362,6 +499,39 @@ func TestReadBlobSkipsVerificationForOversizedCache(t *testing.T) {
 	}
 }
 
+func waitForFetchCalls(t *testing.T, fetcher *fakeBlobFetcher, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fetcher.Calls() >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fetch calls = %d, want at least %d", fetcher.Calls(), want)
+}
+
+func waitForHydratorIdle(t *testing.T, h *Service, repoID model.RepoID) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		queued := 0
+		for _, item := range h.pq {
+			if item.task.RepoID == repoID {
+				queued++
+			}
+		}
+		idle := queued == 0 && len(h.active) == 0
+		h.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("hydrator did not become idle")
+}
+
 type fakeBlobFetcher struct {
 	mu            sync.Mutex
 	calls         int
@@ -371,8 +541,12 @@ type fakeBlobFetcher struct {
 	readBlobErr   error
 	verifyOK      bool
 	verifyErr     error
+	fetchStarted  chan struct{}
+	fetchWait     <-chan struct{}
+	fetchDelay    time.Duration
 	verifyStarted chan struct{}
 	verifyWait    <-chan struct{}
+	fetchOnce     sync.Once
 	verifyOnce    sync.Once
 }
 
@@ -380,6 +554,15 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ s
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
+	if f.fetchStarted != nil {
+		f.fetchOnce.Do(func() { close(f.fetchStarted) })
+	}
+	if f.fetchWait != nil {
+		<-f.fetchWait
+	}
+	if f.fetchDelay > 0 {
+		time.Sleep(f.fetchDelay)
+	}
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return 0, err
 	}

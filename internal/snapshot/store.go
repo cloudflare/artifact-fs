@@ -28,6 +28,7 @@ var migrations = []string{
 	  PRIMARY KEY (generation, path)
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_parent ON base_nodes(generation, parent_path);`,
+	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_oid ON base_nodes(generation, object_oid);`,
 	`DROP TABLE IF EXISTS learned_path_stats;`,
 	`DROP TABLE IF EXISTS blob_cache_index;`,
 }
@@ -164,7 +165,29 @@ func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseN
 // the given OID in the current generation so stat() returns the correct size
 // without waiting for a full re-index.
 func (s *Store) UpdateSize(generation int64, objectOID string, size int64) {
-	s.db.Exec(`UPDATE base_nodes SET size_bytes=?, size_state='known' WHERE generation=? AND object_oid=?`, size, generation, objectOID)
+	_ = s.UpdateSizes(context.Background(), generation, map[string]int64{objectOID: size})
+}
+
+func (s *Store) UpdateSizes(ctx context.Context, generation int64, sizes map[string]int64) error {
+	if len(sizes) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `UPDATE base_nodes SET size_bytes=?, size_state='known' WHERE generation=? AND object_oid=?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for oid, size := range sizes {
+		if _, err := stmt.ExecContext(ctx, size, generation, oid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) nextGenerationTx(ctx context.Context, tx *sql.Tx) (int64, error) {

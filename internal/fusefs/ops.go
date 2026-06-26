@@ -7,11 +7,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
+
+const maxPrefetchTasksPerDir = 256
 
 type Engine struct {
 	Resolver *Resolver
@@ -55,6 +58,26 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 		return nil, err
 	}
 	return readFileChunk(cachePath, off, size)
+}
+
+func (e *Engine) BaseCachePath(ctx context.Context, path string) (string, int64, bool, error) {
+	path = model.CleanPath(path)
+	if ov, ok := e.Overlay.Get(path); ok {
+		if ov.IsDeleted() {
+			return "", 0, false, os.ErrNotExist
+		}
+		return "", 0, false, nil
+	}
+	gen := e.Resolver.Generation()
+	n, ok := e.Resolver.Snapshot.GetNode(gen, path)
+	if !ok {
+		return "", 0, false, fs.ErrNotExist
+	}
+	cachePath, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, n)
+	if err != nil {
+		return "", 0, false, err
+	}
+	return cachePath, gen, true, nil
 }
 
 func (e *Engine) Write(ctx context.Context, path string, off int64, data []byte) (int, error) {
@@ -178,26 +201,34 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 // PrefetchDir enqueues file children of a directory for speculative hydration.
 // Called from OpenDir in a goroutine so it doesn't block the FUSE operation.
 func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
-	gen := e.Resolver.Generation()
+	tasks := make([]model.HydrationTask, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Type != "file" {
+		if entry.Type != "file" || entry.ObjectOID == "" {
 			continue
 		}
 		childPath := model.CleanPath(filepath.Join(dirPath, entry.Name))
-		n, ok := e.Resolver.Snapshot.GetNode(gen, childPath)
-		if !ok || n.ObjectOID == "" {
-			continue
-		}
 		pri := hydrator.ClassifyPriority(childPath)
-		e.Hydrator.Enqueue(model.HydrationTask{
+		tasks = append(tasks, model.HydrationTask{
 			RepoID:     e.Repo.ID,
 			Path:       childPath,
-			ObjectOID:  n.ObjectOID,
+			ObjectOID:  entry.ObjectOID,
+			SizeState:  entry.SizeState,
+			SizeBytes:  entry.SizeBytes,
 			Priority:   pri,
 			Reason:     "prefetch",
 			EnqueuedAt: time.Now(),
 		})
 	}
+	if len(tasks) > maxPrefetchTasksPerDir {
+		sort.SliceStable(tasks, func(i, j int) bool {
+			if tasks[i].Priority == tasks[j].Priority {
+				return tasks[i].Path < tasks[j].Path
+			}
+			return tasks[i].Priority > tasks[j].Priority
+		})
+		tasks = tasks[:maxPrefetchTasksPerDir]
+	}
+	e.Hydrator.EnqueueBatch(tasks)
 }
 
 func readFileChunk(path string, off int64, size int) ([]byte, error) {
@@ -206,6 +237,10 @@ func readFileChunk(path string, off int64, size int) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return readFileChunkFrom(f, off, size)
+}
+
+func readFileChunkFrom(f *os.File, off int64, size int) ([]byte, error) {
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return nil, err
 	}

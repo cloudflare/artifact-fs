@@ -483,7 +483,7 @@ func TestReaddirTypedReturnsTypes(t *testing.T) {
 			kids: map[string][]model.BaseNode{
 				".": {
 					{Path: "dir", Type: "dir"},
-					{Path: "file.txt", Type: "file"},
+					{Path: "file.txt", Type: "file", ObjectOID: "abc123", SizeState: "known", SizeBytes: 42},
 					{Path: "link", Type: "symlink"},
 				},
 			},
@@ -501,6 +501,15 @@ func TestReaddirTypedReturnsTypes(t *testing.T) {
 	if types["dir"] != "dir" || types["file.txt"] != "file" || types["link"] != "symlink" {
 		t.Fatalf("wrong types: %v", types)
 	}
+	for _, e := range entries {
+		if e.Name == "file.txt" {
+			if e.ObjectOID != "abc123" || e.SizeState != "known" || e.SizeBytes != 42 {
+				t.Fatalf("file metadata = %+v", e)
+			}
+			return
+		}
+	}
+	t.Fatal("file.txt entry not found")
 }
 
 func TestChildName(t *testing.T) {

@@ -131,12 +131,13 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	type entry struct {
 		name string
 		typ  string
+		base model.BaseNode
 	}
 	set := map[string]entry{}
 	for _, c := range children {
 		name := filepath.Base(c.Path)
 		if name != "." {
-			set[name] = entry{name: name, typ: c.Type}
+			set[name] = entry{name: name, typ: c.Type, base: c}
 		}
 	}
 	ovEntries, err := r.Overlay.ListByPrefix(ctx, path)
@@ -163,7 +164,7 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	}
 	out := make([]ReaddirEntry, 0, len(set))
 	for _, e := range set {
-		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ})
+		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil

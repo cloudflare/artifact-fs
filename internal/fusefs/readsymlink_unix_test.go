@@ -24,6 +24,8 @@ type fakeSymlinkHydrator struct {
 
 func (f *fakeSymlinkHydrator) Enqueue(model.HydrationTask) {}
 
+func (f *fakeSymlinkHydrator) EnqueueBatch([]model.HydrationTask) {}
+
 func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
 	f.calls++
 	return f.cachePath, f.size, f.err

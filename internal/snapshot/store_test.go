@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
@@ -144,6 +145,49 @@ func TestCurrentGeneration(t *testing.T) {
 	}
 	if gen != 1 {
 		t.Fatalf("expected 1, got %d", gen)
+	}
+}
+
+func TestUpdateSizeUsesGenerationObjectOIDIndex(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	nodes := []model.BaseNode{
+		{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"},
+		{RepoID: "r", Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "shared", SizeState: "unknown"},
+		{RepoID: "r", Path: "b.txt", Type: "file", Mode: 0o644, ObjectOID: "other", SizeState: "unknown"},
+	}
+	gen, err := s.PublishGeneration(ctx, "h1", "main", nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var id, parent, notUsed int
+	var detail string
+	err = s.db.QueryRowContext(ctx, `EXPLAIN QUERY PLAN UPDATE base_nodes SET size_bytes=?, size_state='known' WHERE generation=? AND object_oid=?`, 42, gen, "shared").Scan(&id, &parent, &notUsed, &detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "idx_base_nodes_gen_oid") {
+		t.Fatalf("UpdateSize plan = %q, want idx_base_nodes_gen_oid", detail)
+	}
+
+	if err := s.UpdateSizes(ctx, gen, map[string]int64{"shared": 42, "other": 7}); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := s.GetNode(gen, "a.txt")
+	if !ok {
+		t.Fatal("a.txt not found")
+	}
+	if n.SizeState != "known" || n.SizeBytes != 42 {
+		t.Fatalf("a.txt size = %s/%d, want known/42", n.SizeState, n.SizeBytes)
+	}
+	n, ok = s.GetNode(gen, "b.txt")
+	if !ok {
+		t.Fatal("b.txt not found")
+	}
+	if n.SizeState != "known" || n.SizeBytes != 7 {
+		t.Fatalf("b.txt size = %s/%d, want known/7", n.SizeState, n.SizeBytes)
 	}
 }
 
