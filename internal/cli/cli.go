@@ -171,6 +171,19 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			return nil
 		}),
 		{
+			Name:   "fsmonitor-hook",
+			Usage:  "internal fsmonitor hook",
+			Hidden: true,
+			Flags:  []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name (required)"}},
+			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
+				name := strings.TrimSpace(c.String("name"))
+				if name == "" {
+					return fmt.Errorf("--name required")
+				}
+				return svc.FSMonitorHook(ctx, name, stdout)
+			}),
+		},
+		{
 			Name:  "set-refresh",
 			Usage: "update refresh interval",
 			Flags: []ucli.Flag{

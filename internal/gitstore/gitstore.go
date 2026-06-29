@@ -825,6 +825,83 @@ func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 	return err
 }
 
+func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	hookDir := filepath.Join(repo.GitDir, "hooks")
+	if err := os.MkdirAll(hookDir, 0o755); err != nil {
+		return err
+	}
+	hookPath := filepath.Join(hookDir, "artifact-fs-fsmonitor")
+	script := fsmonitorHookScript(stateRoot, exe, repo.Name)
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "config", "core.fsmonitor", hookPath); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "config", "fsmonitor.allowRemote", "true"); err != nil {
+		return err
+	}
+	workTreeEnv := gitWorkTreeEnv(repo.MountPath)
+	if _, err := runGitWithEnv(ctx, repo.GitDir, workTreeEnv, "update-index", "--fsmonitor"); err != nil {
+		return err
+	}
+	return markIndexFSMonitorValid(ctx, repo.GitDir, repo.MountPath)
+}
+
+func gitWorkTreeEnv(workTree string) []string {
+	if strings.TrimSpace(workTree) == "" {
+		return nil
+	}
+	return []string{"GIT_WORK_TREE=" + workTree}
+}
+
+func markIndexFSMonitorValid(ctx context.Context, gitDir, workTree string) error {
+	env := append(os.Environ(), "GIT_DIR="+gitDir)
+	env = append(env, gitWorkTreeEnv(workTree)...)
+	ls := exec.CommandContext(ctx, "git", "ls-files", "-z")
+	ls.Env = env
+	stdout, err := ls.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	lsErr := &bytes.Buffer{}
+	ls.Stderr = lsErr
+	update := exec.CommandContext(ctx, "git", "update-index", "--fsmonitor-valid", "-z", "--stdin")
+	update.Env = env
+	update.Stdin = stdout
+	updateErr := &bytes.Buffer{}
+	update.Stderr = updateErr
+	if err := ls.Start(); err != nil {
+		return err
+	}
+	if err := update.Start(); err != nil {
+		_ = ls.Process.Kill()
+		_ = ls.Wait()
+		return err
+	}
+	upErr := update.Wait()
+	lsWaitErr := ls.Wait()
+	if lsWaitErr != nil {
+		msg := auth.RedactString(strings.TrimSpace(lsErr.String()))
+		if msg == "" {
+			msg = auth.RedactString(lsWaitErr.Error())
+		}
+		return errors.New(msg)
+	}
+	if upErr != nil {
+		msg := auth.RedactString(strings.TrimSpace(updateErr.String()))
+		if msg == "" {
+			msg = auth.RedactString(upErr.Error())
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
 	rangeSpec := fmt.Sprintf("HEAD...origin/%s", repo.Branch)
 	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", rangeSpec)
@@ -1166,6 +1243,20 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+func fsmonitorHookScript(stateRoot, exe, repoName string) string {
+	return fmt.Sprintf("#!/bin/sh\nARTIFACT_FS_ROOT=%s exec %s fsmonitor-hook --name %s \"$@\"\n", shellScriptQuote(stateRoot), shellScriptQuote(exe), shellScriptQuote(repoName))
+}
+
+func shellScriptQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if isShellSafeScriptValue(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 func doubleQuote(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -1191,6 +1282,19 @@ func isShellSafe(s string) bool {
 			continue
 		}
 		if strings.ContainsRune("@%_+=:,./-~$", r) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isShellSafeScriptValue(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		if strings.ContainsRune("@%_+=:,./-~", r) {
 			continue
 		}
 		return false

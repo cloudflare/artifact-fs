@@ -48,14 +48,17 @@ type InodeRef struct {
 	Path    string
 	Type    string // file, dir, symlink
 	Mode    uint32
+	Gen     int64
 	Refcnt  int64
 	IsRoot  bool
 	Overlay bool
 }
 
 type DirHandle struct {
-	inode   *InodeRef
-	entries []ReaddirEntry
+	inode      *InodeRef
+	gen        int64
+	commitTime int64
+	entries    []ReaddirEntry
 }
 
 type FileHandle struct {
@@ -69,11 +72,26 @@ type FileHandle struct {
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
 type ReaddirEntry struct {
-	Name      string
-	Type      string // file, dir, symlink
-	ObjectOID string
-	SizeState string
-	SizeBytes int64
+	Name        string
+	Type        string // file, dir, symlink
+	Mode        uint32
+	ObjectOID   string
+	SizeState   string
+	SizeBytes   int64
+	FromOverlay bool
+	MtimeUnixNs int64
+	CtimeUnixNs int64
+}
+
+func (e ReaddirEntry) direntType() fuseutil.DirentType {
+	switch e.Type {
+	case "dir":
+		return fuseutil.DT_Directory
+	case "symlink":
+		return fuseutil.DT_Link
+	default:
+		return fuseutil.DT_File
+	}
 }
 
 func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) *ArtifactFuse {
@@ -95,7 +113,7 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 	return fs
 }
 
-func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32) *InodeRef {
+func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32, gen int64) *InodeRef {
 	// Caller must hold fs.mu write lock.
 	if id, ok := fs.pathToInode[path]; ok {
 		if ref, ok := fs.inodes[id]; ok {
@@ -105,7 +123,7 @@ func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32) *InodeRef {
 	}
 	id := fs.nextInodeID
 	fs.nextInodeID++
-	ref := &InodeRef{ID: id, Path: path, Type: typ, Mode: mode, Refcnt: 1}
+	ref := &InodeRef{ID: id, Path: path, Type: typ, Mode: mode, Gen: gen, Refcnt: 1}
 	fs.inodes[id] = ref
 	fs.pathToInode[path] = id
 	return ref
@@ -124,6 +142,19 @@ func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeR
 		return nil, missing
 	}
 	return ref, nil
+}
+
+func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
+	fs.mu.Lock()
+	ref, ok := fs.inodes[id]
+	if ok {
+		ref.Refcnt--
+		if ref.Refcnt <= 0 && !ref.IsRoot {
+			delete(fs.inodes, id)
+			delete(fs.pathToInode, ref.Path)
+		}
+	}
+	fs.mu.Unlock()
 }
 
 func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*InodeRef, string, error) {
@@ -258,7 +289,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	// Synthesize .git gitfile in root
 	if parent.IsRoot && op.Name == ".git" {
 		fs.mu.Lock()
-		ref := fs.allocInode(".git", "file", 0o644)
+		ref := fs.allocInode(".git", "file", 0o644, fs.resolver.Generation())
 		fs.mu.Unlock()
 		op.Entry.Child = ref.ID
 		op.Entry.Attributes = fs.gitFileAttrs()
@@ -275,7 +306,7 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	}
 
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, typ, mode)
+	ref := fs.allocInode(childPath, typ, mode, fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
@@ -405,20 +436,18 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	if err != nil {
 		return err
 	}
+	gen := fs.resolver.Generation()
+	commitTime := fs.resolver.CommitTime()
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
-	entries, err := fs.resolver.ReaddirTyped(ctx, ref.Path)
+	entries, err := fs.resolver.ReaddirTypedAt(ctx, ref.Path, gen)
 	if err != nil {
 		return syscall.EIO
 	}
 	if ref.IsRoot {
-		entries = append([]ReaddirEntry{{Name: ".git", Type: "file"}}, entries...)
+		entries = append([]ReaddirEntry{{Name: ".git", Type: "file", Mode: 0o644, SizeBytes: int64(len(fs.gitfileContent)), SizeState: "known"}}, entries...)
 	}
 
-	// Speculative prefetch: enqueue file children for hydration at a lower
-	// priority so they're warmed in the cache before the user opens them.
-	go fs.engine.PrefetchDir(ref.Path, entries)
-
-	dh := &DirHandle{inode: ref, entries: entries}
+	dh := &DirHandle{inode: ref, gen: gen, commitTime: commitTime, entries: entries}
 	fs.mu.Lock()
 	handle := fs.nextHandleID
 	fs.nextHandleID++
@@ -437,18 +466,11 @@ func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error 
 	offset := int(op.Offset)
 	for i := offset; i < len(dh.entries); i++ {
 		e := dh.entries[i]
-		dt := fuseutil.DT_File
-		switch e.Type {
-		case "dir":
-			dt = fuseutil.DT_Directory
-		case "symlink":
-			dt = fuseutil.DT_Link
-		}
 		dirent := fuseutil.Dirent{
 			Offset: fuseops.DirOffset(i + 1),
 			Inode:  fuseops.RootInodeID + 1, // placeholder; kernel re-looks-up via LookUpInode
 			Name:   e.Name,
-			Type:   dt,
+			Type:   e.direntType(),
 		}
 		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], dirent)
 		if n == 0 {
@@ -457,6 +479,78 @@ func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error 
 		op.BytesRead += n
 	}
 	return nil
+}
+
+func (fs *ArtifactFuse) ReadDirPlus(_ context.Context, op *fuseops.ReadDirPlusOp) error {
+	dh, err := fs.dirHandle(op.Handle)
+	if err != nil {
+		return err
+	}
+
+	offset := int(op.Offset)
+	for i := offset; i < len(dh.entries); i++ {
+		e := dh.entries[i]
+		childPath := cleanChildPath(dh.inode.Path, e.Name)
+		entry, err := fs.childEntryFromReaddir(childPath, dh.gen, dh.commitTime, e)
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return syscall.ENOENT
+			}
+			return syscall.EIO
+		}
+		dirent := fuseutil.DirentPlus{
+			Dirent: fuseutil.Dirent{
+				Offset: fuseops.DirOffset(i + 1),
+				Inode:  entry.Child,
+				Name:   e.Name,
+				Type:   e.direntType(),
+			},
+			Entry: entry,
+		}
+		n := fuseutil.WriteDirentPlus(op.Dst[op.BytesRead:], dirent)
+		if n == 0 {
+			fs.dropInodeLookup(entry.Child)
+			break
+		}
+		op.BytesRead += n
+	}
+	return nil
+}
+
+func (fs *ArtifactFuse) childEntryFromReaddir(path string, gen, commitTime int64, e ReaddirEntry) (fuseops.ChildInodeEntry, error) {
+	if path == ".git" {
+		fs.mu.Lock()
+		ref := fs.allocInode(path, "file", 0o644, gen)
+		fs.mu.Unlock()
+		entry := fuseops.ChildInodeEntry{Child: ref.ID, Attributes: fs.gitFileAttrs()}
+		setChildEntryExpiry(&entry, time.Minute)
+		return entry, nil
+	}
+	mode, size, typ, mtime, ctime := readdirAttrs(e, gen, commitTime)
+	fs.mu.Lock()
+	ref := fs.allocInode(path, typ, mode, gen)
+	fs.mu.Unlock()
+	entry := fuseops.ChildInodeEntry{
+		Child:      ref.ID,
+		Attributes: inodeAttrs(mode, uint64(size), typ, mtime, ctime),
+	}
+	setChildEntryExpiry(&entry, time.Second)
+	return entry, nil
+}
+
+func readdirAttrs(e ReaddirEntry, gen, commitTime int64) (mode uint32, size int64, typ string, mtime time.Time, ctime time.Time) {
+	typ = e.Type
+	mode = normalizeMode(e.Mode, typ)
+	size = e.SizeBytes
+	if e.FromOverlay {
+		return mode, size, typ, time.Unix(0, e.MtimeUnixNs), time.Unix(0, e.CtimeUnixNs)
+	}
+	ct := commitTime
+	if ct == 0 {
+		ct = gen
+	}
+	mt := time.Unix(ct, 0)
+	return mode, size, typ, mt, mt
 }
 
 func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseDirHandleOp) error {
@@ -535,7 +629,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		return syscall.EIO
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "file", uint32(op.Mode))
+	ref := fs.allocInode(childPath, "file", uint32(op.Mode), fs.resolver.Generation())
 	fh := &FileHandle{inode: ref, path: childPath}
 	handle := fs.nextHandleID
 	fs.nextHandleID++
@@ -559,7 +653,7 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 		return syscall.EIO
 	}
 	fs.mu.Lock()
-	ref := fs.allocInode(childPath, "dir", uint32(op.Mode))
+	ref := fs.allocInode(childPath, "dir", uint32(op.Mode), fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op.Entry.Child = ref.ID
@@ -720,9 +814,8 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
-		// UseReadDirPlus intentionally not set -- the ReadDir implementation
-		// uses WriteDirent (plain format). Enable only after implementing
-		// WriteDirentPlus with full ChildInodeEntry.
+		EnableReaddirplus:       true,
+		EnableAutoReaddirplus:   true,
 	}
 	platformMountConfig(mountCfg)
 

@@ -245,6 +245,122 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 	}
 }
 
+func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{
+			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
+		}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	)
+	h := &fakeLookupHydrator{size: 12}
+	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	op := &fuseops.ReadDirPlusOp{}
+	op.Handle = open.Handle
+	op.Dst = make([]byte, 4096)
+	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
+		t.Fatalf("ReadDirPlus: %v", err)
+	}
+	if op.BytesRead == 0 {
+		t.Fatal("ReadDirPlus wrote no entries")
+	}
+	if h.calls != 0 {
+		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+	}
+	if fs.pathToInode["file.txt"] == 0 {
+		t.Fatal("ReadDirPlus did not allocate file inode")
+	}
+}
+
+func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{
+			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "unknown"}},
+		}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	)
+	h := &fakeLookupHydrator{size: 12}
+	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	op := &fuseops.ReadDirPlusOp{}
+	op.Handle = open.Handle
+	op.Dst = make([]byte, 4096)
+
+	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
+		t.Fatalf("ReadDirPlus: %v", err)
+	}
+	if op.BytesRead == 0 {
+		t.Fatal("ReadDirPlus wrote no entries")
+	}
+	if h.calls != 0 {
+		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+	}
+}
+
+func TestReadDirPlusUsesOpenDirGeneration(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	snap := &generationSnapshot{nodes: map[int64]map[string]model.BaseNode{}, kids: map[int64]map[string][]model.BaseNode{
+		1: {".": {{Path: "old.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 1}}},
+		2: {".": {{Path: "new.txt", Type: "file", Mode: 0o100644, SizeState: "known", SizeBytes: 2}}},
+	}}
+	r := &Resolver{Snapshot: snap, Overlay: &fakeOverlay{entries: map[string]model.OverlayEntry{}}}
+	r.SetGeneration(1)
+	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeLookupHydrator{}})
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	r.SetGeneration(2)
+	op := &fuseops.ReadDirPlusOp{}
+	op.Handle = open.Handle
+	op.Dst = make([]byte, 4096)
+
+	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
+		t.Fatalf("ReadDirPlus: %v", err)
+	}
+	if fs.pathToInode["old.txt"] == 0 {
+		t.Fatal("ReadDirPlus did not use OpenDir generation entry")
+	}
+	if fs.pathToInode["new.txt"] != 0 {
+		t.Fatal("ReadDirPlus used live resolver generation entry")
+	}
+}
+
+func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{
+			".": {{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 42}},
+		}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
+	)
+	fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: &fakeLookupHydrator{}})
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir: %v", err)
+	}
+	op := &fuseops.ReadDirPlusOp{}
+	op.Handle = open.Handle
+	op.Dst = make([]byte, 1)
+	if err := fs.ReadDirPlus(context.Background(), op); err != nil {
+		t.Fatalf("ReadDirPlus: %v", err)
+	}
+	if op.BytesRead != 0 {
+		t.Fatalf("BytesRead = %d, want 0", op.BytesRead)
+	}
+	if fs.pathToInode[".git"] != 0 {
+		t.Fatal("inode lookup leaked for entry that did not fit")
+	}
+}
+
 type fakeLookupHydrator struct {
 	size  int64
 	calls int

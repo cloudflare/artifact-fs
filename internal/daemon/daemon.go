@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -565,6 +567,8 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if err != nil {
 		s.logger.Error("fuse mount failed, running without FUSE", "repo", cfg.Name, "error", err)
 		mfs = nil
+	} else {
+		s.configureStatusOptimization(ctx, cfg)
 	}
 	rt := &repoRuntime{
 		cfg:      cfg,
@@ -804,6 +808,7 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	if err := s.completePreparedRuntime(ctx, cfg, headOID, headRef, gen); err != nil {
 		return fail(err)
 	}
+	s.configureStatusOptimization(ctx, cfg)
 	return nil
 }
 
@@ -972,6 +977,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := s.git.ReadTreeHEAD(ctx, rt.cfg); err != nil {
 		s.logger.Warn("read-tree HEAD failed", "repo", rt.cfg.Name, "error", err)
 	}
+	s.configureStatusOptimization(ctx, rt.cfg)
 	s.refreshCommitTime(ctx, rt.cfg, oid, rt.resolver, "commit timestamp unavailable")
 
 	// Atomically update the resolver's generation so FUSE ops see the new snapshot
@@ -979,6 +985,69 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	s.mu.Lock()
 	setHeadState(&rt.state, oid, ref, gen)
 	s.mu.Unlock()
+}
+
+func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
+	if err := s.git.ConfigureStatusOptimization(ctx, cfg, s.root); err != nil {
+		s.logger.Warn("git status optimization setup failed", "repo", cfg.Name, "error", err)
+	}
+}
+
+func (s *Service) FSMonitorHook(ctx context.Context, name string, w io.Writer) error {
+	cfg, err := s.registry.GetRepo(ctx, name)
+	if err != nil {
+		return err
+	}
+	s.fillPaths(&cfg)
+	ov, err := overlay.New(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer ov.Close()
+	entries, err := ov.ListAll(ctx)
+	if err != nil {
+		return err
+	}
+	paths := fsMonitorDirtyPaths(entries)
+	token := fmt.Sprintf("artifact-fs:%s:%d", cfg.ID, time.Now().UnixNano())
+	if _, err := io.WriteString(w, token); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte{0}); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if _, err := io.WriteString(w, p); err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte{0}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fsMonitorDirtyPaths(entries []model.OverlayEntry) []string {
+	set := map[string]struct{}{}
+	add := func(path string) {
+		path = model.CleanPath(path)
+		if path == "." {
+			return
+		}
+		set[path] = struct{}{}
+	}
+	for _, e := range entries {
+		add(e.Path)
+		if e.TargetPath != "" {
+			add(e.TargetPath)
+		}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *Service) refreshLoop(rt *repoRuntime) {

@@ -58,7 +58,7 @@ func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000)
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -97,7 +97,7 @@ func TestReadSymlinkRejectsNegativeKnownBlobBeforeHydration(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000)
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -135,7 +135,7 @@ func TestReadSymlinkRejectsUnknownOversizedBlobWithoutHydration(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000)
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}
@@ -173,7 +173,7 @@ func TestReadSymlinkReadsUnknownBlobThroughBoundedRead(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{ID: repoID}, resolver, &Engine{Hydrator: hydrator})
 
 	fs.mu.Lock()
-	ref := fs.allocInode("link", "symlink", 0o120000)
+	ref := fs.allocInode("link", "symlink", 0o120000, fs.resolver.Generation())
 	fs.mu.Unlock()
 
 	op := &fuseops.ReadSymlinkOp{Inode: ref.ID}

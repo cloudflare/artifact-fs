@@ -123,15 +123,21 @@ func (r *Resolver) Readdir(ctx context.Context, path string) ([]string, error) {
 // ReaddirTyped returns directory entries with name and type, so the FUSE
 // adapter doesn't need to call Getattr per child.
 func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntry, error) {
+	return r.ReaddirTypedAt(ctx, path, r.Generation())
+}
+
+func (r *Resolver) ReaddirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {
 	path = model.CleanPath(path)
-	children, err := r.Snapshot.ListChildren(r.Generation(), path)
+	children, err := r.Snapshot.ListChildren(generation, path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	type entry struct {
-		name string
-		typ  string
-		base model.BaseNode
+		name        string
+		typ         string
+		base        model.BaseNode
+		overlay     model.OverlayEntry
+		fromOverlay bool
 	}
 	set := map[string]entry{}
 	for _, c := range children {
@@ -158,13 +164,30 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 			if ov, ok := r.Overlay.Get(childPath); ok && ov.IsDeleted() {
 				continue
 			}
-			typ := e.NodeType()
-			set[name] = entry{name: name, typ: typ}
+			if ov, ok := r.Overlay.Get(childPath); ok {
+				set[name] = entry{name: name, typ: ov.NodeType(), overlay: ov, fromOverlay: true}
+				continue
+			}
+			if _, ok := set[name]; !ok {
+				set[name] = entry{name: name, typ: "dir", base: model.BaseNode{Type: "dir", Mode: 0o755, SizeState: "known"}}
+			}
 		}
 	}
 	out := make([]ReaddirEntry, 0, len(set))
 	for _, e := range set {
-		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes})
+		if e.fromOverlay {
+			out = append(out, ReaddirEntry{
+				Name:        e.name,
+				Type:        e.typ,
+				Mode:        e.overlay.Mode,
+				SizeBytes:   e.overlay.SizeBytes,
+				FromOverlay: true,
+				MtimeUnixNs: e.overlay.MtimeUnixNs,
+				CtimeUnixNs: e.overlay.CtimeUnixNs,
+			})
+			continue
+		}
+		out = append(out, ReaddirEntry{Name: e.name, Type: e.typ, Mode: e.base.Mode, ObjectOID: e.base.ObjectOID, SizeState: e.base.SizeState, SizeBytes: e.base.SizeBytes})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil

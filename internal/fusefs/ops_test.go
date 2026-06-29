@@ -21,6 +21,7 @@ type fakeBatchHydrator struct {
 
 type generationSnapshot struct {
 	nodes map[int64]map[string]model.BaseNode
+	kids  map[int64]map[string][]model.BaseNode
 }
 
 type blockingCopyOverlay struct {
@@ -61,8 +62,8 @@ func (g *generationSnapshot) GetNode(gen int64, path string) (model.BaseNode, bo
 	return n, ok
 }
 
-func (g *generationSnapshot) ListChildren(int64, string) ([]model.BaseNode, error) {
-	return nil, nil
+func (g *generationSnapshot) ListChildren(gen int64, path string) ([]model.BaseNode, error) {
+	return g.kids[gen][path], nil
 }
 
 func (o *blockingCopyOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {

@@ -52,6 +52,51 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	}
 }
 
+func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	pwned := filepath.Join(tmp, "pwned")
+	hookPath := filepath.Join(tmp, "artifact-fs-fsmonitor")
+	script := fsmonitorHookScript(tmp, "/bin/false", "repo$(touch "+pwned+")")
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	_ = exec.Command("sh", hookPath).Run()
+	if _, err := os.Stat(pwned); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generated hook allowed shell command substitution; stat err = %v", err)
+	}
+}
+
+func TestMarkIndexFSMonitorValidUsesWorkTree(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644)
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	gitDir := filepath.Join(repo, ".git")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "config", "core.fsmonitor", "true"); err != nil {
+		t.Fatalf("config core.fsmonitor: %v", err)
+	}
+	if _, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "update-index", "--fsmonitor"); err != nil {
+		t.Fatalf("update-index --fsmonitor: %v", err)
+	}
+
+	if err := markIndexFSMonitorValid(ctx, gitDir, repo); err != nil {
+		t.Fatalf("markIndexFSMonitorValid: %v", err)
+	}
+	out, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "ls-files", "-f", "README.md")
+	if err != nil {
+		t.Fatalf("ls-files -f: %v", err)
+	}
+	if !strings.HasPrefix(out, "h ") {
+		t.Fatalf("ls-files -f = %q, want fsmonitor-clean lowercase h", out)
+	}
+}
+
 func TestBlobToCacheBinarySafe(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

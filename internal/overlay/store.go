@@ -542,6 +542,10 @@ func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
 	return c, err
 }
 
+func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {
+	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
+}
+
 // ListByPrefix returns overlay entries that are direct children of the given
 // directory path. Uses path + "/" prefix to avoid matching sibling directories.
 func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.OverlayEntry, error) {
