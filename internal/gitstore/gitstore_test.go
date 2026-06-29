@@ -68,32 +68,64 @@ func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 }
 
 func TestMarkIndexFSMonitorValidUsesWorkTree(t *testing.T) {
-	t.Parallel()
 	tmp := t.TempDir()
-	repo := filepath.Join(tmp, "repo")
-	run(t, "git", "init", repo)
-	os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644)
-	run(t, "git", "-C", repo, "add", "README.md")
-	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
-	gitDir := filepath.Join(repo, ".git")
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(tmp, "env.log")
+	stdinPath := filepath.Join(tmp, "stdin.bin")
+	expectedStdinPath := filepath.Join(tmp, "expected-stdin.bin")
+	if err := os.WriteFile(expectedStdinPath, []byte("README.md\x00"), 0o644); err != nil {
+		t.Fatalf("write expected stdin: %v", err)
+	}
+	fakeGit := filepath.Join(binDir, "git")
+	fakeGitScript := "#!/bin/sh\n" +
+		"if [ \"$GIT_DIR\" != \"$AFS_TEST_GIT_DIR\" ]; then printf 'bad GIT_DIR: %s\\n' \"$GIT_DIR\" >&2; exit 2; fi\n" +
+		"if [ \"$GIT_WORK_TREE\" != \"$AFS_TEST_WORK_TREE\" ]; then printf 'bad GIT_WORK_TREE: %s\\n' \"$GIT_WORK_TREE\" >&2; exit 2; fi\n" +
+		"case \"$1\" in\n" +
+		"  ls-files)\n" +
+		"    if [ \"$#\" -ne 2 ] || [ \"$2\" != \"-z\" ]; then printf 'bad ls-files args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
+		"    printf 'README.md\\0'\n" +
+		"    printf 'ls-files\\n' >>\"$AFS_TEST_RECORD\"\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"  update-index)\n" +
+		"    if [ \"$#\" -ne 4 ] || [ \"$2\" != \"--fsmonitor-valid\" ] || [ \"$3\" != \"-z\" ] || [ \"$4\" != \"--stdin\" ]; then printf 'bad update-index args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
+		"    cat >\"$AFS_TEST_STDIN\"\n" +
+		"    if ! cmp -s \"$AFS_TEST_STDIN\" \"$AFS_TEST_EXPECTED_STDIN\"; then printf 'bad update-index stdin\\n' >&2; exit 2; fi\n" +
+		"    printf 'update-index\\n' >>\"$AFS_TEST_RECORD\"\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"printf 'unexpected git command: %s\\n' \"$*\" >&2\n" +
+		"exit 2\n"
+	if err := os.WriteFile(fakeGit, []byte(fakeGitScript), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_TEST_RECORD", recordPath)
+	t.Setenv("AFS_TEST_STDIN", stdinPath)
+	t.Setenv("AFS_TEST_EXPECTED_STDIN", expectedStdinPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "config", "core.fsmonitor", "true"); err != nil {
-		t.Fatalf("config core.fsmonitor: %v", err)
-	}
-	if _, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "update-index", "--fsmonitor"); err != nil {
-		t.Fatalf("update-index --fsmonitor: %v", err)
-	}
 
-	if err := markIndexFSMonitorValid(ctx, gitDir, repo); err != nil {
+	gitDir := filepath.Join(tmp, "git")
+	workTree := filepath.Join(tmp, "worktree")
+	t.Setenv("AFS_TEST_GIT_DIR", gitDir)
+	t.Setenv("AFS_TEST_WORK_TREE", workTree)
+	if err := markIndexFSMonitorValid(ctx, gitDir, workTree); err != nil {
 		t.Fatalf("markIndexFSMonitorValid: %v", err)
 	}
-	out, err := runGitWithEnv(ctx, gitDir, gitWorkTreeEnv(repo), "ls-files", "-f", "README.md")
+	recorded, err := os.ReadFile(recordPath)
 	if err != nil {
-		t.Fatalf("ls-files -f: %v", err)
+		t.Fatalf("read env log: %v", err)
 	}
-	if !strings.HasPrefix(out, "h ") {
-		t.Fatalf("ls-files -f = %q, want fsmonitor-clean lowercase h", out)
+	got := strings.Fields(string(recorded))
+	slices.Sort(got)
+	want := []string{"ls-files", "update-index"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("recorded commands = %#v, want %#v", got, want)
 	}
 }
 
