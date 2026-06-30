@@ -977,7 +977,6 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := s.git.ReadTreeHEAD(ctx, rt.cfg); err != nil {
 		s.logger.Warn("read-tree HEAD failed", "repo", rt.cfg.Name, "error", err)
 	}
-	s.configureStatusOptimization(ctx, rt.cfg)
 	s.refreshCommitTime(ctx, rt.cfg, oid, rt.resolver, "commit timestamp unavailable")
 
 	// Atomically update the resolver's generation so FUSE ops see the new snapshot
@@ -985,6 +984,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	s.mu.Lock()
 	setHeadState(&rt.state, oid, ref, gen)
 	s.mu.Unlock()
+	s.configureStatusOptimization(ctx, rt.cfg)
 }
 
 func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
