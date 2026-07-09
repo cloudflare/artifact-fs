@@ -1003,8 +1003,8 @@ func (s *Store) lockPaths(paths ...string) func() {
 		s.pathLocks[index].Lock()
 	}
 	return func() {
-		for i := len(indices) - 1; i >= 0; i-- {
-			s.pathLocks[indices[i]].Unlock()
+		for _, indice := range slices.Backward(indices) {
+			s.pathLocks[indice].Unlock()
 		}
 	}
 }

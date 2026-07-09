@@ -206,15 +206,13 @@ func TestConcurrentBlobToCacheUsesIndependentTempFiles(t *testing.T) {
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			store := New(nil)
 			defer store.Close()
 			<-start
 			_, err := store.BlobToCache(context.Background(), cfg, blobOID, dst)
 			errCh <- err
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

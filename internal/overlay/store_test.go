@@ -92,13 +92,11 @@ func TestConcurrentCopyOnWriteUsesOneCompleteBacking(t *testing.T) {
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			_, err := s.EnsureCopyOnWrite(ctx, cfg, "tracked.txt", base)
 			errCh <- err
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

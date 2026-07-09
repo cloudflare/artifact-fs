@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -217,22 +218,20 @@ func (fs *ArtifactFuse) lockFileHandlesForPaths(paths ...string) func() {
 	fs.mu.RLock()
 	byID := make(map[fuseops.HandleID]*FileHandle)
 	for _, path := range paths {
-		for id, fh := range fs.filesByPath[path] {
-			byID[id] = fh
-		}
+		maps.Copy(byID, fs.filesByPath[path])
 	}
 	fs.mu.RUnlock()
 	ids := make([]fuseops.HandleID, 0, len(byID))
 	for id := range byID {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	for _, id := range ids {
 		byID[id].mu.Lock()
 	}
 	return func() {
-		for i := len(ids) - 1; i >= 0; i-- {
-			byID[ids[i]].mu.Unlock()
+		for _, id := range slices.Backward(ids) {
+			byID[id].mu.Unlock()
 		}
 	}
 }
@@ -241,9 +240,7 @@ func (fs *ArtifactFuse) fileHandlesForPath(path string) map[fuseops.HandleID]*Fi
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	handles := make(map[fuseops.HandleID]*FileHandle, len(fs.filesByPath[path]))
-	for id, fh := range fs.filesByPath[path] {
-		handles[id] = fh
-	}
+	maps.Copy(handles, fs.filesByPath[path])
 	return handles
 }
 
