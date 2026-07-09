@@ -91,11 +91,15 @@ func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref strin
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	// Clean up old generations to prevent unbounded growth
-	if gen > 2 {
-		s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation < ?`, gen-1)
-	}
 	return gen, nil
+}
+
+func (s *Store) CleanupGenerations(ctx context.Context, current int64) error {
+	if current <= 2 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation < ?`, current-1)
+	return err
 }
 
 func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
@@ -112,13 +116,27 @@ func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
 // ReadState returns persisted HEAD OID, ref, and generation from the snapshot
 // database. Used by status commands that run outside the daemon process.
 func (s *Store) ReadState(ctx context.Context) (headOID, headRef string, generation int64, err error) {
-	gen, err := s.CurrentGeneration(ctx)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return "", "", 0, err
 	}
-	headOID, _, _ = stateValue(ctx, s.db, "head_oid")
-	headRef, _, _ = stateValue(ctx, s.db, "head_ref")
-	return headOID, headRef, gen, nil
+	defer tx.Rollback()
+	generation, _, err = stateInt64(ctx, tx, "current_generation")
+	if err != nil {
+		return "", "", 0, err
+	}
+	headOID, _, err = stateValue(ctx, tx, "head_oid")
+	if err != nil {
+		return "", "", 0, err
+	}
+	headRef, _, err = stateValue(ctx, tx, "head_ref")
+	if err != nil {
+		return "", "", 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", 0, err
+	}
+	return headOID, headRef, generation, nil
 }
 
 func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {

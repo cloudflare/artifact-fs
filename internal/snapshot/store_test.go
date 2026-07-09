@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,6 +108,9 @@ func TestGenerationCleanup(t *testing.T) {
 	g1, _ := s.PublishGeneration(ctx, "h1", "main", nodes)
 	g2, _ := s.PublishGeneration(ctx, "h2", "main", nodes)
 	g3, _ := s.PublishGeneration(ctx, "h3", "main", nodes)
+	if err := s.CleanupGenerations(ctx, g3); err != nil {
+		t.Fatal(err)
+	}
 
 	if g1 != 1 || g2 != 2 || g3 != 3 {
 		t.Fatalf("unexpected generations: %d %d %d", g1, g2, g3)
@@ -145,6 +149,47 @@ func TestCurrentGeneration(t *testing.T) {
 	}
 	if gen != 1 {
 		t.Fatalf("expected 1, got %d", gen)
+	}
+}
+
+func TestReadStateReturnsOnePublishedGeneration(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	nodes := []model.BaseNode{{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}}
+	if _, err := s.PublishGeneration(ctx, "head-1", "ref-1", nodes); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		for i := 2; i <= 50; i++ {
+			if _, err := s.PublishGeneration(ctx, fmt.Sprintf("head-%d", i), fmt.Sprintf("ref-%d", i), nodes); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	for {
+		head, ref, gen, err := s.ReadState(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head != fmt.Sprintf("head-%d", gen) || ref != fmt.Sprintf("ref-%d", gen) {
+			t.Fatalf("mixed state: head=%q ref=%q generation=%d", head, ref, gen)
+		}
+		select {
+		case <-done:
+			select {
+			case err := <-errCh:
+				t.Fatal(err)
+			default:
+			}
+			return
+		default:
+		}
 	}
 }
 

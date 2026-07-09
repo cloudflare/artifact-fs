@@ -5,18 +5,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/jacobsa/fuse/fuseops"
 )
 
 type fakeBatchHydrator struct {
-	tasks      []model.HydrationTask
-	calls      int
-	path       string
-	pathsByOID map[string]string
+	tasks         []model.HydrationTask
+	calls         int
+	path          string
+	pathsByOID    map[string]string
+	ensureStarted chan struct{}
+	ensureWait    <-chan struct{}
+	ensureOnce    sync.Once
 }
 
 type generationSnapshot struct {
@@ -41,6 +46,12 @@ func (f *fakeBatchHydrator) EnqueueBatch(tasks []model.HydrationTask) {
 
 func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, node model.BaseNode) (string, int64, error) {
 	f.calls++
+	if f.ensureStarted != nil {
+		f.ensureOnce.Do(func() { close(f.ensureStarted) })
+	}
+	if f.ensureWait != nil {
+		<-f.ensureWait
+	}
 	if f.pathsByOID != nil {
 		return f.pathsByOID[node.ObjectOID], 0, nil
 	}
@@ -235,6 +246,7 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, engine)
 	fh := &FileHandle{path: "file.txt"}
 	fs.fileHandles[1] = fh
+	fs.filesByPath["file.txt"] = map[fuseops.HandleID]*FileHandle{1: fh}
 	defer fh.closeCachedFile()
 
 	first, err := fh.read(context.Background(), engine, 0, 3)
@@ -274,5 +286,57 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}
 	if string(after) != "new" {
 		t.Fatalf("read after write = %q, want new", after)
+	}
+}
+
+func TestTruncateZeroDoesNotHydrateBaseFile(t *testing.T) {
+	h := &fakeBatchHydrator{}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{
+		"large.bin": {Path: "large.bin", Type: "file", Mode: 0o644, ObjectOID: "large", SizeState: "known", SizeBytes: 10 << 30},
+	}}, overlay)
+	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+
+	if err := engine.Truncate(context.Background(), "large.bin", 0); err != nil {
+		t.Fatal(err)
+	}
+	if h.calls != 0 {
+		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+	}
+	e, ok := overlay.Get("large.bin")
+	if !ok || e.Kind != model.OverlayKindModify || e.SourceOID != "large" || e.SizeBytes != 0 {
+		t.Fatalf("truncated entry = %+v, ok=%v", e, ok)
+	}
+}
+
+func TestBlockedHydrationDoesNotBlockGenerationUpdate(t *testing.T) {
+	releaseHydration := make(chan struct{})
+	hydrationStarted := make(chan struct{})
+	h := &fakeBatchHydrator{ensureStarted: hydrationStarted, ensureWait: releaseHydration}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{
+		"file.txt": {Path: "file.txt", Type: "file", Mode: 0o644, ObjectOID: "blob"},
+	}}, overlay)
+	engine := &Engine{Repo: model.RepoConfig{ID: "repo"}, Resolver: resolver, Overlay: overlay, Hydrator: h}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := engine.Write(context.Background(), "file.txt", 0, []byte("x"))
+		writeDone <- err
+	}()
+	<-hydrationStarted
+	viewUpdated := make(chan struct{})
+	go func() {
+		unlock := resolver.BeginViewUpdate()
+		unlock()
+		close(viewUpdated)
+	}()
+	select {
+	case <-viewUpdated:
+	case <-time.After(time.Second):
+		t.Fatal("generation update blocked behind hydration")
+	}
+	close(releaseHydration)
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
 	}
 }

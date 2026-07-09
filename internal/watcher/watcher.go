@@ -23,6 +23,10 @@ func New(interval time.Duration) *Poller {
 
 func (p *Poller) Watch(ctx context.Context, gitDir string, fn func()) {
 	headPath := filepath.Join(gitDir, "HEAD")
+	// Establish the baseline before re-resolving HEAD. A change on either side
+	// of the callback is then observed by the callback or the next poll.
+	_ = p.headChanged(headPath)
+	fn()
 	t := time.NewTicker(p.interval)
 	defer t.Stop()
 	for {

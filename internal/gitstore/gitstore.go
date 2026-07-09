@@ -25,6 +25,7 @@ type Store struct {
 	mu          sync.Mutex
 	poolMaxSize int
 	pools       map[string]*batchPool // gitDir -> pool
+	closed      bool
 }
 
 type readBlobResult struct {
@@ -60,6 +61,7 @@ func New(logger *slog.Logger) *Store {
 func (s *Store) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	for dir, p := range s.pools {
 		p.closeAll()
 		delete(s.pools, dir)
@@ -455,30 +457,37 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return 0, err
 	}
-	pool := s.getPool(repo.GitDir)
-	batch, err := pool.acquire()
+	pool, err := s.getPool(repo.GitDir)
+	if err != nil {
+		return 0, err
+	}
+	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return 0, err
 	}
 	size, err = fetchBatchToFile(ctx, batch, objectOID, dstPath)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			pool.forget()
 			return 0, err
 		}
 		// Process may have died or be desynchronized; discard and retry.
-		batch.close()
-		batch, err = pool.acquire()
+		batch.kill()
+		pool.forget()
+		batch, err = pool.acquire(ctx)
 		if err != nil {
 			return 0, err
 		}
 		size, err = fetchBatchToFile(ctx, batch, objectOID, dstPath)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				pool.forget()
 				return 0, err
 			}
 			// Retry also failed; close instead of returning a potentially
 			// corrupted process to the pool.
-			batch.close()
+			batch.kill()
+			pool.forget()
 			return 0, err
 		}
 	}
@@ -506,8 +515,14 @@ func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID s
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
 	}
-	pool := s.getPool(repo.GitDir)
-	batch, err := pool.acquire()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	pool, err := s.getPool(repo.GitDir)
+	if err != nil {
+		return nil, err
+	}
+	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -518,11 +533,16 @@ func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID s
 	}
 	if errors.Is(err, model.ErrBlobTooLarge) {
 		batch.kill()
+		pool.forget()
 		return nil, err
 	}
-	batch.close()
+	batch.kill()
+	pool.forget()
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
 
-	batch, err = pool.acquire()
+	batch, err = pool.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -530,9 +550,11 @@ func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID s
 	if err != nil {
 		if errors.Is(err, model.ErrBlobTooLarge) {
 			batch.kill()
+			pool.forget()
 			return nil, err
 		}
-		batch.close()
+		batch.kill()
+		pool.forget()
 		return nil, err
 	}
 	pool.release(batch)
@@ -562,15 +584,18 @@ func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID
 	return strings.TrimSpace(out) == objectOID, nil
 }
 
-func (s *Store) getPool(gitDir string) *batchPool {
+func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p, ok := s.pools[gitDir]; ok {
-		return p
+	if s.closed {
+		return nil, errors.New("git store closed")
 	}
-	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize}
+	if p, ok := s.pools[gitDir]; ok {
+		return p, nil
+	}
+	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize, ready: make(chan struct{})}
 	s.pools[gitDir] = p
-	return p
+	return p, nil
 }
 
 // batchPool maintains a pool of reusable cat-file --batch processes so
@@ -581,32 +606,72 @@ type batchPool struct {
 	gitDir  string
 	logger  *slog.Logger
 	maxSize int
+	closed  bool
+	total   int
+	ready   chan struct{}
 }
 
-func (p *batchPool) acquire() (*batchCatFile, error) {
-	p.mu.Lock()
-	if n := len(p.free); n > 0 {
-		b := p.free[n-1]
-		p.free = p.free[:n-1]
-		p.mu.Unlock()
-		if b.alive() {
+func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errors.New("git batch pool closed")
+		}
+		if n := len(p.free); n > 0 {
+			b := p.free[n-1]
+			p.free = p.free[:n-1]
+			p.mu.Unlock()
+			if b.alive() {
+				return b, nil
+			}
+			b.close()
+			p.mu.Lock()
+			p.total--
+			p.signalLocked()
+			p.mu.Unlock()
+			continue
+		}
+		if p.total < p.maxSize {
+			p.total++
+			p.mu.Unlock()
+			b, err := newBatchCatFile(p.gitDir, p.logger)
+			if err != nil {
+				p.mu.Lock()
+				p.total--
+				p.signalLocked()
+				p.mu.Unlock()
+				return nil, err
+			}
 			return b, nil
 		}
-		b.close()
-	} else {
+		ready := p.ready
 		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ready:
+		}
 	}
-	return newBatchCatFile(p.gitDir, p.logger)
 }
 
 func (p *batchPool) release(b *batchCatFile) {
 	if !b.alive() {
 		b.close()
+		p.forget()
 		return
 	}
 	p.mu.Lock()
+	if p.closed || p.total > p.maxSize {
+		p.total--
+		p.signalLocked()
+		p.mu.Unlock()
+		b.close()
+		return
+	}
 	if len(p.free) < p.maxSize {
 		p.free = append(p.free, b)
+		p.signalLocked()
 		p.mu.Unlock()
 		return
 	}
@@ -614,13 +679,23 @@ func (p *batchPool) release(b *batchCatFile) {
 	b.close()
 }
 
+func (p *batchPool) forget() {
+	p.mu.Lock()
+	p.total--
+	p.signalLocked()
+	p.mu.Unlock()
+}
+
 func (p *batchPool) closeAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.closed = true
 	for _, b := range p.free {
 		b.close()
 	}
+	p.total -= len(p.free)
 	p.free = nil
+	p.signalLocked()
 }
 
 func (p *batchPool) setMaxSize(n int) {
@@ -630,11 +705,18 @@ func (p *batchPool) setMaxSize(n int) {
 	if len(p.free) > n {
 		extras = append(extras, p.free[n:]...)
 		p.free = p.free[:n]
+		p.total -= len(extras)
 	}
+	p.signalLocked()
 	p.mu.Unlock()
 	for _, b := range extras {
 		b.close()
 	}
+}
+
+func (p *batchPool) signalLocked() {
+	close(p.ready)
+	p.ready = make(chan struct{})
 }
 
 // batchCatFile manages a persistent `git cat-file --batch` process. The
@@ -716,13 +798,13 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 
 	// Stream blob content to a temp file, then atomic rename. The blob cache is
 	// reconstructible from git, so we prefer throughput over per-object fsync.
-	tmp := dstPath + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(dstPath), ".artifact-fs-blob-*")
 	if err != nil {
 		// Drain the blob content so the protocol stays in sync.
 		io.CopyN(io.Discard, b.stdout, size+1) // +1 for trailing LF
 		return 0, err
 	}
+	tmp := f.Name()
 	written, copyErr := io.CopyN(f, b.stdout, size)
 	// Read the trailing LF that git appends after the content. If this fails
 	// the batch protocol is desynchronized and the caller must discard the

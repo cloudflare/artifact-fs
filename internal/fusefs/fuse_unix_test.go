@@ -5,6 +5,8 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -276,7 +278,7 @@ func TestReadDirPlusUsesReaddirMetadataWithoutHydration(t *testing.T) {
 	}
 }
 
-func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
+func TestReadDirPlusDefersUnknownSizeBaseFileLookup(t *testing.T) {
 	repo := model.RepoConfig{ID: "repo", GitDir: "/tmp/repo.git"}
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{
@@ -302,6 +304,9 @@ func TestReadDirPlusDoesNotHydrateUnknownSizeBaseFile(t *testing.T) {
 	}
 	if h.calls != 0 {
 		t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+	}
+	if fs.pathToInode["file.txt"] != 0 {
+		t.Fatal("unknown-size entry should require a separate lookup")
 	}
 }
 
@@ -359,6 +364,180 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 	if fs.pathToInode[".git"] != 0 {
 		t.Fatal("inode lookup leaked for entry that did not fit")
 	}
+}
+
+func TestRenameRetargetsOpenSourceHandle(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo"}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"old.txt": {Path: "old.txt", Kind: model.OverlayKindCreate, Mode: 0o644},
+	}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}, kids: map[string][]model.BaseNode{}}, overlay)
+	fs := NewArtifactFuse(repo, resolver, &Engine{Resolver: resolver, Overlay: overlay})
+	fs.mu.Lock()
+	ref := fs.allocInode("old.txt", "file", 0o644, 1)
+	fh := &FileHandle{inode: ref, path: "old.txt"}
+	fs.fileHandles[1] = fh
+	fs.filesByPath["old.txt"] = map[fuseops.HandleID]*FileHandle{1: fh}
+	fs.mu.Unlock()
+
+	op := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "old.txt", NewParent: fuseops.RootInodeID, NewName: "new.txt"}
+	if err := fs.Rename(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if path := fh.pathSnapshot(); path != "new.txt" {
+		t.Fatalf("handle path = %q, want new.txt", path)
+	}
+	if fs.pathToInode["new.txt"] != ref.ID || fs.pathToInode["old.txt"] != 0 {
+		t.Fatalf("inode paths not retargeted: %+v", fs.pathToInode)
+	}
+}
+
+func TestRenameReplacementPreservesOpenOverlayDestination(t *testing.T) {
+	tmp := t.TempDir()
+	sourceBacking := filepath.Join(tmp, "source")
+	destinationBacking := filepath.Join(tmp, "destination")
+	if err := os.WriteFile(sourceBacking, []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destinationBacking, []byte("destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"source.txt":      {Path: "source.txt", Kind: model.OverlayKindCreate, Mode: 0o644, BackingPath: sourceBacking},
+		"destination.txt": {Path: "destination.txt", Kind: model.OverlayKindCreate, Mode: 0o644, BackingPath: destinationBacking},
+	}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}, kids: map[string][]model.BaseNode{}}, overlay)
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, &Engine{Resolver: resolver, Overlay: overlay})
+	fs.mu.Lock()
+	sourceRef := fs.allocInode("source.txt", "file", 0o644, 1)
+	destinationRef := fs.allocInode("destination.txt", "file", 0o644, 1)
+	fs.mu.Unlock()
+	sourceOpen := &fuseops.OpenFileOp{Inode: sourceRef.ID}
+	if err := fs.OpenFile(context.Background(), sourceOpen); err != nil {
+		t.Fatal(err)
+	}
+	destinationOpen := &fuseops.OpenFileOp{Inode: destinationRef.ID, OpenFlags: 2}
+	if err := fs.OpenFile(context.Background(), destinationOpen); err != nil {
+		t.Fatal(err)
+	}
+
+	rename := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "source.txt", NewParent: fuseops.RootInodeID, NewName: "destination.txt"}
+	if err := fs.Rename(context.Background(), rename); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: destinationRef.ID, N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if fs.pathToInode["destination.txt"] != sourceRef.ID {
+		t.Fatalf("destination mapping = %d, want source inode %d", fs.pathToInode["destination.txt"], sourceRef.ID)
+	}
+	read := &fuseops.ReadFileOp{Handle: destinationOpen.Handle, Size: 32}
+	if err := fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read.Data[0]); got != "destination" {
+		t.Fatalf("replaced destination handle read = %q, want destination", got)
+	}
+	write := &fuseops.WriteFileOp{Handle: destinationOpen.Handle, Offset: 0, Data: []byte("D")}
+	if err := fs.WriteFile(context.Background(), write); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(destinationBacking)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "Destination" {
+		t.Fatalf("detached destination content = %q, want Destination", data)
+	}
+}
+
+func TestUnlinkPreservesOpenOverlayHandle(t *testing.T) {
+	tmp := t.TempDir()
+	backing := filepath.Join(tmp, "open")
+	if err := os.WriteFile(backing, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"open.txt": {Path: "open.txt", Kind: model.OverlayKindCreate, Mode: 0o644, BackingPath: backing},
+	}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}, kids: map[string][]model.BaseNode{}}, overlay)
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, &Engine{Resolver: resolver, Overlay: overlay})
+	fs.mu.Lock()
+	ref := fs.allocInode("open.txt", "file", 0o644, 1)
+	fs.mu.Unlock()
+	open := &fuseops.OpenFileOp{Inode: ref.ID, OpenFlags: 2}
+	if err := fs.OpenFile(context.Background(), open); err != nil {
+		t.Fatal(err)
+	}
+	unlink := &fuseops.UnlinkOp{Parent: fuseops.RootInodeID, Name: "open.txt"}
+	if err := fs.Unlink(context.Background(), unlink); err != nil {
+		t.Fatal(err)
+	}
+	write := &fuseops.WriteFileOp{Handle: open.Handle, Offset: 0, Data: []byte("C")}
+	if err := fs.WriteFile(context.Background(), write); err != nil {
+		t.Fatal(err)
+	}
+	read := &fuseops.ReadFileOp{Handle: open.Handle, Size: 16}
+	if err := fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read.Data[0]); got != "Content" {
+		t.Fatalf("unlinked handle content = %q, want Content", got)
+	}
+	if entry, ok := overlay.Get("open.txt"); !ok || !entry.IsDeleted() {
+		t.Fatalf("unlinked path was recreated: %+v, ok=%v", entry, ok)
+	}
+}
+
+func TestRenameReplacementPreservesWritableBaseDestination(t *testing.T) {
+	tmp := t.TempDir()
+	baseCache := filepath.Join(tmp, "base-cache")
+	sourceBacking := filepath.Join(tmp, "source")
+	if err := os.WriteFile(baseCache, []byte("destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourceBacking, []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"source.txt": {Path: "source.txt", Kind: model.OverlayKindCreate, Mode: 0o644, BackingPath: sourceBacking},
+	}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{
+		"destination.txt": {Path: "destination.txt", Type: "file", Mode: 0o644, ObjectOID: "base"},
+	}}, overlay)
+	repo := model.RepoConfig{ID: "repo", OverlayDir: filepath.Join(tmp, "overlay")}
+	fs := NewArtifactFuse(repo, resolver, &Engine{Resolver: resolver, Repo: repo, Overlay: overlay, Hydrator: &fakeBatchHydrator{path: baseCache}})
+	fs.mu.Lock()
+	sourceRef := fs.allocInode("source.txt", "file", 0o644, 1)
+	destinationRef := fs.allocInode("destination.txt", "file", 0o644, 1)
+	fs.mu.Unlock()
+	destinationOpen := &fuseops.OpenFileOp{Inode: destinationRef.ID, OpenFlags: 2}
+	if err := fs.OpenFile(context.Background(), destinationOpen); err != nil {
+		t.Fatal(err)
+	}
+	rename := &fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "source.txt", NewParent: fuseops.RootInodeID, NewName: "destination.txt"}
+	if err := fs.Rename(context.Background(), rename); err != nil {
+		t.Fatal(err)
+	}
+	write := &fuseops.WriteFileOp{Handle: destinationOpen.Handle, Offset: 0, Data: []byte("D")}
+	if err := fs.WriteFile(context.Background(), write); err != nil {
+		t.Fatal(err)
+	}
+	read := &fuseops.ReadFileOp{Handle: destinationOpen.Handle, Size: 32}
+	if err := fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read.Data[0]); got != "Destination" {
+		t.Fatalf("detached base handle content = %q, want Destination", got)
+	}
+	cacheData, err := os.ReadFile(baseCache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(cacheData) != "destination" {
+		t.Fatalf("base cache was modified: %q", cacheData)
+	}
+	_ = sourceRef
 }
 
 type fakeLookupHydrator struct {

@@ -31,14 +31,19 @@ type Service struct {
 	queued     map[string]*taskItem
 	wait       inflight[result]
 	verifying  inflight[verifyResult]
+	verifyJobs map[string]struct{}
 	started    bool
+	stopped    bool
 	stopOnce   sync.Once
+	workers    sync.WaitGroup
 	stopCh     chan struct{}
 	workReady  chan struct{} // signaled when new work is enqueued
 	onHydrated OnHydratedFunc
 	verified   map[string]struct{}
 	active     map[string]struct{}
 }
+
+var errStopped = errors.New("hydrator stopped")
 
 type result struct {
 	cachePath string
@@ -53,14 +58,15 @@ type verifyResult struct {
 
 func New(fetcher BlobFetcher) *Service {
 	return &Service{
-		fetcher:   fetcher,
-		queued:    map[string]*taskItem{},
-		wait:      newInflight[result](),
-		verifying: newInflight[verifyResult](),
-		stopCh:    make(chan struct{}),
-		workReady: make(chan struct{}, 1),
-		verified:  map[string]struct{}{},
-		active:    map[string]struct{}{},
+		fetcher:    fetcher,
+		queued:     map[string]*taskItem{},
+		wait:       newInflight[result](),
+		verifying:  newInflight[verifyResult](),
+		verifyJobs: map[string]struct{}{},
+		stopCh:     make(chan struct{}),
+		workReady:  make(chan struct{}, 1),
+		verified:   map[string]struct{}{},
+		active:     map[string]struct{}{},
 	}
 }
 
@@ -81,14 +87,18 @@ func (s *Service) signalWork() {
 
 func (s *Service) Start(workers int, repo model.RepoConfig) {
 	s.mu.Lock()
-	if s.started {
+	if s.started || s.stopped {
 		s.mu.Unlock()
 		return
 	}
 	s.started = true
+	s.workers.Add(workers)
 	s.mu.Unlock()
 	for range workers {
-		go s.worker(repo)
+		go func() {
+			defer s.workers.Done()
+			s.worker(repo)
+		}()
 	}
 }
 
@@ -96,9 +106,13 @@ func (s *Service) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.wait.closeAll(result{err: errors.New("hydrator stopped")})
-		s.verifying.closeAll(verifyResult{err: errors.New("hydrator stopped")})
+		s.stopped = true
+		s.pq = nil
+		clear(s.queued)
+		s.wait.closeAll(result{err: errStopped})
+		s.verifying.closeAll(verifyResult{err: errStopped})
+		s.mu.Unlock()
+		s.workers.Wait()
 	})
 }
 
@@ -129,6 +143,9 @@ func (s *Service) EnqueueBatch(tasks []model.HydrationTask) {
 }
 
 func (s *Service) enqueueLocked(task model.HydrationTask) bool {
+	if s.stopped {
+		return false
+	}
 	key := taskKey(task.RepoID, task.ObjectOID)
 	if _, ok := s.active[key]; ok {
 		return false
@@ -148,6 +165,12 @@ func (s *Service) enqueueLocked(task model.HydrationTask) bool {
 }
 
 func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (cachePath string, size int64, err error) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return "", 0, errStopped
+	}
+	s.mu.Unlock()
 	cachePath = cachePathFor(repo, node.ObjectOID)
 	key := taskKey(repo.ID, node.ObjectOID)
 	if ch, ok := s.joinInflight(key); ok {
@@ -156,10 +179,17 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
 		return "", 0, err
 	} else if ok {
+		if node.SizeState != "known" {
+			s.notifyHydrated(repo.ID, node.ObjectOID, size)
+		}
 		return cachePath, size, nil
 	}
 	ch := make(chan result, 1)
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return "", 0, errStopped
+	}
 	if _, ok := s.active[key]; ok || len(s.wait[key]) > 0 {
 		s.wait.add(key, ch)
 		s.mu.Unlock()
@@ -202,6 +232,27 @@ func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result
 }
 
 func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node model.BaseNode, maxBytes int64) ([]byte, error) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil, errStopped
+	}
+	s.workers.Add(1)
+	s.mu.Unlock()
+	readCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+	defer func() {
+		close(done)
+		cancel()
+		s.workers.Done()
+	}()
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
 	}
@@ -214,14 +265,14 @@ func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node mode
 			return nil, err
 		}
 	} else if st.Size() > maxBytes {
-		return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
+		return s.fetcher.ReadBlob(readCtx, repo, node.ObjectOID, maxBytes)
 	}
-	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
+	if size, ok, err := s.validateCachedBlob(readCtx, repo, cachePath, node); err != nil {
 		return nil, err
 	} else if ok {
 		return readCachedBlob(cachePath, size, maxBytes)
 	}
-	return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
+	return s.fetcher.ReadBlob(readCtx, repo, node.ObjectOID, maxBytes)
 }
 
 func readCachedBlob(cachePath string, size int64, maxBytes int64) ([]byte, error) {
@@ -265,7 +316,7 @@ func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig,
 		return s.fetcher.VerifyBlob(verifyCtx, repo, node.ObjectOID, cachePath)
 	})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errStopped) {
 			return 0, false, err
 		}
 		return 0, false, nil
@@ -302,12 +353,22 @@ func (s *Service) removeInvalidCacheFile(cachePath string, repoID model.RepoID, 
 
 func (s *Service) verifyBlobOnce(ctx context.Context, key string, verify func(context.Context) (bool, error)) (bool, error) {
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return false, errStopped
+	}
 	if _, ok := s.verified[key]; ok {
 		s.mu.Unlock()
 		return true, nil
 	}
 	ch := make(chan verifyResult, 1)
-	first := s.verifying.add(key, ch)
+	s.verifying.add(key, ch)
+	_, active := s.verifyJobs[key]
+	first := !active
+	if first {
+		s.verifyJobs[key] = struct{}{}
+		s.workers.Add(1)
+	}
 	s.mu.Unlock()
 
 	if first {
@@ -329,6 +390,7 @@ func (s *Service) awaitVerification(ctx context.Context, key string, ch chan ver
 }
 
 func (s *Service) runVerification(key string, verify func(context.Context) (bool, error)) {
+	defer s.workers.Done()
 	verifyCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -347,6 +409,7 @@ func (s *Service) runVerification(key string, verify func(context.Context) (bool
 		s.verified[key] = struct{}{}
 	}
 	waiters := s.verifying.take(key)
+	delete(s.verifyJobs, key)
 	s.mu.Unlock()
 
 	notifyWaiters(waiters, r)

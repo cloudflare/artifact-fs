@@ -35,6 +35,7 @@ func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, err
 type fakeOverlay struct {
 	entries map[string]model.OverlayEntry
 	list    []model.OverlayEntry
+	listErr error
 }
 
 func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
@@ -42,7 +43,18 @@ func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
 	return v, ok
 }
 func (f *fakeOverlay) ListByPrefix(_ context.Context, _ string) ([]model.OverlayEntry, error) {
-	return f.list, nil
+	return f.list, f.listErr
+}
+func (f *fakeOverlay) HasDescendant(_ context.Context, prefix string) (bool, error) {
+	if f.listErr != nil {
+		return false, f.listErr
+	}
+	for _, entry := range f.list {
+		if _, ok := childName(prefix, entry.Path); ok && !entry.IsDeleted() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	if f.entries == nil {
@@ -56,11 +68,23 @@ func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, p
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil
 }
+func (f *fakeOverlay) CreateTruncated(_ context.Context, path string, base model.BaseNode) (model.OverlayEntry, error) {
+	if f.entries == nil {
+		f.entries = map[string]model.OverlayEntry{}
+	}
+	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, Mode: base.Mode, SourceOID: base.ObjectOID}
+	f.entries[e.Path] = e
+	return e, nil
+}
 func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, _ []byte) (int, error) {
 	return 0, nil
 }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
-func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
+func (f *fakeOverlay) Remove(_ context.Context, path string) error {
+	path = model.CleanPath(path)
+	f.entries[path] = model.OverlayEntry{Path: path, Kind: model.OverlayKindDelete}
+	return nil
+}
 func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
@@ -95,6 +119,7 @@ func (f *fakeOverlay) SetMtime(_ context.Context, path string, t time.Time) erro
 	f.entries[model.CleanPath(path)] = e
 	return nil
 }
+func (f *fakeOverlay) SyncFile(_ context.Context, _ string) error { return nil }
 func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
 	return nil
 }
@@ -425,6 +450,41 @@ func TestReaddirMergesSnapshotAndOverlay(t *testing.T) {
 	}
 }
 
+func TestReaddirPreservesImplicitDirectoryForDirtyDescendant(t *testing.T) {
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {}}},
+		&fakeOverlay{
+			entries: map[string]model.OverlayEntry{"dir/local.txt": {Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+			list:    []model.OverlayEntry{{Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+		},
+	)
+
+	entries, err := r.ReaddirTyped(context.Background(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "dir" || entries[0].Type != "dir" {
+		t.Fatalf("entries = %+v, want implicit dir", entries)
+	}
+}
+
+func TestResolveSynthesizesImplicitDirectoryForDirtyDescendant(t *testing.T) {
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{}},
+		&fakeOverlay{
+			entries: map[string]model.OverlayEntry{},
+			list:    []model.OverlayEntry{{Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+		},
+	)
+	node, err := r.ResolvePath("dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !node.FromOverlay || node.Overlay.Kind != model.OverlayKindMkdir {
+		t.Fatalf("resolved node = %+v, want implicit overlay directory", node)
+	}
+}
+
 func TestReaddirSkipsOverlayEntryForListedDirectory(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {}}},
@@ -442,6 +502,18 @@ func TestReaddirSkipsOverlayEntryForListedDirectory(t *testing.T) {
 		if name == "." {
 			t.Fatal("root overlay entry should not appear as a child")
 		}
+	}
+}
+
+func TestReaddirReturnsOverlayQueryError(t *testing.T) {
+	want := errors.New("overlay unavailable")
+	r := newResolver(
+		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {{Path: "base.txt", Type: "file"}}}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}, listErr: want},
+	)
+
+	if _, err := r.Readdir(context.Background(), "."); !errors.Is(err, want) {
+		t.Fatalf("Readdir error = %v, want %v", err, want)
 	}
 }
 

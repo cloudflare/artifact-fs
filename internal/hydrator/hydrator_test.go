@@ -95,6 +95,115 @@ func TestEnsureHydratedUsesValidKnownBlobCacheHit(t *testing.T) {
 	}
 }
 
+func TestEnsureHydratedRejectsWorkAfterStop(t *testing.T) {
+	t.Parallel()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	h := New(&fakeBlobFetcher{payload: []byte("content"), verifyOK: true})
+	h.Start(1, cfg)
+	h.Stop()
+
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); !errors.Is(err, errStopped) {
+		t.Fatalf("EnsureHydrated error = %v, want %v", err, errStopped)
+	}
+	h.Enqueue(explicitReadTask(cfg.ID, node))
+	if depth := h.QueueDepth(cfg.ID); depth != 0 {
+		t.Fatalf("queue depth after stop = %d, want 0", depth)
+	}
+}
+
+func TestStopWaitsForActiveVerification(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	if err := os.WriteFile(filepath.Join(tmp, node.ObjectOID), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	verifyStarted := make(chan struct{})
+	releaseVerify := make(chan struct{})
+	h := New(&fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify})
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, _, err := h.EnsureHydrated(context.Background(), cfg, node)
+		ensureDone <- err
+	}()
+	<-verifyStarted
+	stopDone := make(chan struct{})
+	go func() {
+		h.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before verification exited")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseVerify)
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not wait for verification")
+	}
+	if err := <-ensureDone; !errors.Is(err, errStopped) {
+		t.Fatalf("EnsureHydrated error = %v, want %v", err, errStopped)
+	}
+}
+
+func TestCanceledVerificationWaitersDoNotStartDuplicateJobs(t *testing.T) {
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	if err := os.WriteFile(filepath.Join(tmp, node.ObjectOID), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	verifyStarted := make(chan struct{})
+	releaseVerify := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify}
+	h := New(fetcher)
+	defer h.Stop()
+
+	for range 5 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		_, _, err := h.EnsureHydrated(ctx, cfg, node)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("EnsureHydrated error = %v, want deadline exceeded", err)
+		}
+	}
+	if calls := fetcher.VerifyCalls(); calls != 1 {
+		t.Fatalf("VerifyBlob calls = %d, want 1", calls)
+	}
+	close(releaseVerify)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, _, err := h.EnsureHydrated(ctx, cfg, node); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadBlobStopsWithService(t *testing.T) {
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: t.TempDir()}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "link", ObjectOID: "blob", SizeState: "unknown"}
+	readStarted := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: []byte("target"), readBlobStarted: readStarted, readBlobWait: make(chan struct{})}
+	h := New(fetcher)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := h.ReadBlob(context.Background(), cfg, node, 32)
+		readDone <- err
+	}()
+	<-readStarted
+	h.Stop()
+	if err := <-readDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("active ReadBlob error = %v, want context.Canceled", err)
+	}
+	if _, err := h.ReadBlob(context.Background(), cfg, node, 32); !errors.Is(err, errStopped) {
+		t.Fatalf("post-stop ReadBlob error = %v, want %v", err, errStopped)
+	}
+}
+
 func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -108,6 +217,8 @@ func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 
 	fetcher := &fakeBlobFetcher{payload: []byte("new-data"), verifyOK: true}
 	h := New(fetcher)
+	hydrated := make(chan int64, 1)
+	h.SetOnHydrated(func(_ model.RepoID, _ string, size int64) { hydrated <- size })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -123,6 +234,14 @@ func TestEnsureHydratedUsesValidUnknownSizeCacheHit(t *testing.T) {
 	}
 	if fetcher.Calls() != 0 {
 		t.Fatalf("fetch calls = %d, want 0", fetcher.Calls())
+	}
+	select {
+	case size := <-hydrated:
+		if size != int64(len(payload)) {
+			t.Fatalf("hydrated size = %d, want %d", size, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected unknown-size cache hit notification")
 	}
 }
 
@@ -531,21 +650,24 @@ func waitForHydratorIdle(t *testing.T, h *Service, repoID model.RepoID) {
 }
 
 type fakeBlobFetcher struct {
-	mu            sync.Mutex
-	calls         int
-	readBlobCalls int
-	verifyCalls   int
-	payload       []byte
-	readBlobErr   error
-	verifyOK      bool
-	verifyErr     error
-	fetchStarted  chan struct{}
-	fetchWait     <-chan struct{}
-	fetchDelay    time.Duration
-	verifyStarted chan struct{}
-	verifyWait    <-chan struct{}
-	fetchOnce     sync.Once
-	verifyOnce    sync.Once
+	mu              sync.Mutex
+	calls           int
+	readBlobCalls   int
+	verifyCalls     int
+	payload         []byte
+	readBlobErr     error
+	verifyOK        bool
+	verifyErr       error
+	fetchStarted    chan struct{}
+	fetchWait       <-chan struct{}
+	fetchDelay      time.Duration
+	verifyStarted   chan struct{}
+	verifyWait      <-chan struct{}
+	readBlobStarted chan struct{}
+	readBlobWait    <-chan struct{}
+	fetchOnce       sync.Once
+	verifyOnce      sync.Once
+	readBlobOnce    sync.Once
 }
 
 func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ string, dstPath string) (int64, error) {
@@ -570,10 +692,20 @@ func (f *fakeBlobFetcher) BlobToCache(_ context.Context, _ model.RepoConfig, _ s
 	return int64(len(f.payload)), nil
 }
 
-func (f *fakeBlobFetcher) ReadBlob(_ context.Context, _ model.RepoConfig, _ string, maxBytes int64) ([]byte, error) {
+func (f *fakeBlobFetcher) ReadBlob(ctx context.Context, _ model.RepoConfig, _ string, maxBytes int64) ([]byte, error) {
 	f.mu.Lock()
 	f.readBlobCalls++
 	f.mu.Unlock()
+	if f.readBlobStarted != nil {
+		f.readBlobOnce.Do(func() { close(f.readBlobStarted) })
+	}
+	if f.readBlobWait != nil {
+		select {
+		case <-f.readBlobWait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if f.readBlobErr != nil {
 		return nil, f.readBlobErr
 	}

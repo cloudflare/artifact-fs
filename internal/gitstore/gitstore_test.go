@@ -1,6 +1,7 @@
 package gitstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +166,70 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "line\n" {
 		t.Fatalf("expected 'line\\n', got %q", data)
+	}
+}
+
+func TestConcurrentBlobToCacheUsesIndependentTempFiles(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	payload := bytes.Repeat([]byte{0x00, 0xff, 0x7f, '\n'}, 1<<20)
+	if err := os.WriteFile(filepath.Join(repo, "blob.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "blob.bin")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}
+	probe := New(nil)
+	oid, _, err := probe.ResolveHEAD(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := probe.BuildTreeIndex(context.Background(), cfg, oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blobOID string
+	for _, node := range nodes {
+		if node.Path == "blob.bin" {
+			blobOID = node.ObjectOID
+		}
+	}
+	if blobOID == "" {
+		t.Fatal("no blob OID found")
+	}
+
+	dst := filepath.Join(cfg.BlobCacheDir, blobOID)
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store := New(nil)
+			defer store.Close()
+			<-start
+			_, err := store.BlobToCache(context.Background(), cfg, blobOID, dst)
+			errCh <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("cache payload length/content mismatch: got %d bytes, want %d", len(got), len(payload))
 	}
 }
 
@@ -1208,7 +1274,10 @@ func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
 func TestSetBatchPoolSizeUpdatesExistingAndNewPools(t *testing.T) {
 	t.Parallel()
 	store := New(nil)
-	first := store.getPool("/tmp/repo-a.git")
+	first, err := store.getPool("/tmp/repo-a.git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if first.maxSize != 4 {
 		t.Fatalf("initial pool maxSize = %d, want 4", first.maxSize)
 	}
@@ -1217,9 +1286,50 @@ func TestSetBatchPoolSizeUpdatesExistingAndNewPools(t *testing.T) {
 	if first.maxSize != 12 {
 		t.Fatalf("updated existing pool maxSize = %d, want 12", first.maxSize)
 	}
-	second := store.getPool("/tmp/repo-b.git")
+	second, err := store.getPool("/tmp/repo-b.git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if second.maxSize != 12 {
 		t.Fatalf("new pool maxSize = %d, want 12", second.maxSize)
+	}
+}
+
+func TestBatchPoolBoundsLeasedProcessesAndClosesLateRelease(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	store := New(nil)
+	store.SetBatchPoolSize(1)
+	pool, err := store.getPool(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pool.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := pool.acquire(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want deadline exceeded", err)
+	}
+	pool.release(first)
+
+	second, err := pool.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	pool.release(second)
+	if second.alive() {
+		t.Fatal("late release left git process alive")
+	}
+	pool.mu.Lock()
+	total := pool.total
+	pool.mu.Unlock()
+	if total != 0 {
+		t.Fatalf("pool total after close = %d, want 0", total)
 	}
 }
 

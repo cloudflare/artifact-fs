@@ -2,10 +2,14 @@ package overlay
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +56,190 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestCreateExistingFileDoesNotTruncate(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "existing.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "existing.txt", 0, []byte("keep")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "existing.txt", 0o644); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("CreateFile error = %v, want os.ErrExist", err)
+	}
+	e, _ := s.Get("existing.txt")
+	data, err := os.ReadFile(e.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep" {
+		t.Fatalf("content = %q, want keep", data)
+	}
+}
+
+func TestConcurrentCopyOnWriteUsesOneCompleteBacking(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	payload := []byte("base content")
+	oid := "object"
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "tracked.txt", Type: "file", Mode: 0o644, ObjectOID: oid}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.EnsureCopyOnWrite(ctx, cfg, "tracked.txt", base)
+			errCh <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	e, ok := s.Get("tracked.txt")
+	if !ok {
+		t.Fatal("expected promoted entry")
+	}
+	data, err := os.ReadFile(e.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("content = %q, want %q", data, payload)
+	}
+}
+
+func TestCreateTruncatedSkipsBaseContent(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{Path: "large.bin", Type: "file", Mode: 0o644, ObjectOID: "large", SizeState: "known", SizeBytes: 10 << 30}
+	e, err := s.CreateTruncated(ctx, "large.bin", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Kind != model.OverlayKindModify || e.SourceOID != base.ObjectOID || e.SizeBytes != 0 {
+		t.Fatalf("entry = %+v", e)
+	}
+	info, err := os.Stat(e.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("backing size = %d, want 0", info.Size())
+	}
+}
+
+func TestSyncFileSyncsOverlayBacking(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "sync.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "sync.txt", 0, []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncFile(ctx, "sync.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncFile(ctx, "missing.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing SyncFile error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestConcurrentRemoveCannotBeUndoneByWrite(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "race.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := s.WriteFile(ctx, "race.txt", 0, []byte("write"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			errCh <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		errCh <- s.Remove(ctx, "race.txt")
+	}()
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	e, ok := s.Get("race.txt")
+	if !ok || !e.IsDeleted() {
+		t.Fatalf("entry = %+v, ok=%v, want whiteout", e, ok)
+	}
+}
+
+func TestRenameReplacesOverlayDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	for path, content := range map[string]string{"source.txt": "source", "destination.txt": "destination"} {
+		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.WriteFile(ctx, path, 0, []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Rename(ctx, "source.txt", "destination.txt"); err != nil {
+		t.Fatal(err)
+	}
+	destination, ok := s.Get("destination.txt")
+	if !ok {
+		t.Fatal("expected destination entry")
+	}
+	data, err := os.ReadFile(destination.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "source" {
+		t.Fatalf("destination content = %q, want source", data)
+	}
+}
+
+func TestListByPrefixReturnsBoundedDescendants(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	for _, path := range []string{"dir/direct.txt", "dir/nested/deep.txt", "other.txt"} {
+		if _, err := s.CreateFile(ctx, path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := s.ListByPrefix(ctx, "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Path != "dir/direct.txt" || entries[1].Path != "dir/nested/deep.txt" {
+		t.Fatalf("entries = %+v, want dir descendants only", entries)
+	}
+}
+
 func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
@@ -74,6 +262,33 @@ func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
 	}
 	if got.CtimeUnixNs == 0 {
 		t.Fatal("expected zero ctime to be repaired")
+	}
+}
+
+func TestOpenReadOnlyDoesNotRunSchemaRepairs(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "old.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=0 WHERE path=?`, "old.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := OpenReadOnly(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	entries, err := readOnly.ListAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].CtimeUnixNs != 0 {
+		t.Fatalf("read-only open unexpectedly repaired entries: %+v", entries)
+	}
+	if _, err := readOnly.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=1`); err == nil {
+		t.Fatal("read-only overlay accepted a write")
 	}
 }
 
@@ -713,9 +928,9 @@ func TestReconcileAfterCommit(t *testing.T) {
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		switch path {
 		case "foo.txt":
-			return model.BaseNode{Path: "foo.txt", ObjectOID: "bbb"}, true
+			return model.BaseNode{Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: testBlobOID([]byte("modified"))}, true
 		case "new.txt":
-			return model.BaseNode{Path: "new.txt", ObjectOID: "ccc"}, true
+			return model.BaseNode{Path: "new.txt", Type: "file", Mode: 0o644, ObjectOID: testBlobOID(nil)}, true
 		default:
 			return model.BaseNode{}, false
 		}
@@ -733,6 +948,58 @@ func TestReconcileAfterCommit(t *testing.T) {
 	}
 	if _, ok := s.Get("gone.txt"); ok {
 		t.Fatal("gone.txt whiteout should be removed (not in base)")
+	}
+}
+
+func TestReconcilePreservesEditMadeAfterCommit(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "old-base"}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "foo.txt", 0, []byte("second edit")); err != nil {
+		t.Fatal(err)
+	}
+	committedOID := testBlobOID([]byte("first edit"))
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		return model.BaseNode{Path: path, Type: "file", ObjectOID: committedOID}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get("foo.txt")
+	if !ok {
+		t.Fatal("second edit was removed during reconcile")
+	}
+	if e.SourceOID != committedOID {
+		t.Fatalf("source OID = %q, want %q", e.SourceOID, committedOID)
+	}
+	data, err := os.ReadFile(e.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "second edit" {
+		t.Fatalf("content = %q, want second edit", data)
+	}
+}
+
+func TestReconcilePreservesFileWhenBaseChangesType(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "node", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "node", 0, []byte("target")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		return model.BaseNode{Path: path, Type: "symlink", Mode: 0o120000, ObjectOID: testBlobOID([]byte("target"))}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := s.Get("node")
+	if !ok || e.NodeType() != "file" {
+		t.Fatalf("regular file lost after base type change: %+v, ok=%v", e, ok)
 	}
 }
 
@@ -815,4 +1082,11 @@ func TestSetMtime(t *testing.T) {
 	if e.CtimeUnixNs == 0 {
 		t.Fatal("ctime should be non-zero")
 	}
+}
+
+func testBlobOID(data []byte) string {
+	digest := sha1.New()
+	_, _ = digest.Write([]byte("blob " + strconv.Itoa(len(data)) + "\x00"))
+	_, _ = digest.Write(data)
+	return hex.EncodeToString(digest.Sum(nil))
 }

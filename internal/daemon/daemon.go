@@ -61,18 +61,21 @@ type mountFailure struct {
 }
 
 type repoRuntime struct {
-	cfg      model.RepoConfig
-	ctx      context.Context
-	cancel   context.CancelFunc
-	snapshot *snapshot.Store
-	overlay  *overlay.Store
-	hydrator *hydrator.Service
-	sizes    *sizeUpdateBatcher
-	resolver *fusefs.Resolver
-	mfs      fusefs.MountedFS
-	gate     *fusefs.ReadyGate
-	state    model.RepoRuntimeState
-	active   bool
+	cfg            model.RepoConfig
+	ctx            context.Context
+	cancel         context.CancelFunc
+	snapshot       *snapshot.Store
+	overlay        *overlay.Store
+	hydrator       *hydrator.Service
+	sizes          *sizeUpdateBatcher
+	resolver       *fusefs.Resolver
+	mfs            fusefs.MountedFS
+	gate           *fusefs.ReadyGate
+	state          model.RepoRuntimeState
+	active         bool
+	stopping       bool
+	headMu         sync.Mutex
+	refreshUpdates chan time.Duration
 }
 
 type aheadBehind struct {
@@ -126,10 +129,19 @@ func (s *Service) hydrationWorkers() int {
 
 func (s *Service) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, rt := range s.running {
-		s.stopRuntime(rt)
-		delete(s.running, id)
+	ids := make([]model.RepoID, 0, len(s.running))
+	for id := range s.running {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	var unmountErrs []error
+	for _, id := range ids {
+		if err := s.unmount(id); err != nil {
+			unmountErrs = append(unmountErrs, err)
+		}
+	}
+	if len(unmountErrs) > 0 {
+		return errors.Join(unmountErrs...)
 	}
 	s.git.Close()
 	return s.registry.Close()
@@ -168,12 +180,18 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	for _, repo := range repos {
 		registered[repo.ID] = true
 		if !repo.Enabled {
-			s.unmount(repo.ID)
+			if err := s.unmount(repo.ID); err != nil {
+				s.logger.Error("repo unmount failed", "repo", repo.Name, "error", err)
+			}
 			continue
 		}
 		s.mu.Lock()
 		rt, running := s.running[repo.ID]
 		_, alreadyPreparing := s.preparing[repo.ID]
+		if running && rt.cfg.RefreshInterval != repo.RefreshInterval {
+			rt.cfg.RefreshInterval = repo.RefreshInterval
+			signalRefreshUpdate(rt, repo.RefreshInterval)
+		}
 		s.mu.Unlock()
 		if running {
 			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
@@ -222,7 +240,10 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	s.mu.Unlock()
 	for _, id := range stale {
 		s.logger.Info("unmounting removed repo", "repo", id)
-		s.unmount(id)
+		if err := s.unmount(id); err != nil {
+			s.logger.Error("removed repo unmount failed", "repo", id, "error", err)
+			continue
+		}
 		delete(s.mountFailures, id)
 	}
 	for id := range s.mountFailures {
@@ -251,7 +272,10 @@ func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model
 		return
 	}
 	if rt.active || !configMatches {
-		s.unmount(latest.ID)
+		if err := s.unmount(latest.ID); err != nil {
+			s.logger.Error("repo async unmount failed", "repo", latest.Name, "error", err)
+			return
+		}
 		if err := s.mountAsyncRepo(ctx, latest); err != nil {
 			s.logger.Error("repo async remount failed", "repo", latest.Name, "error", err)
 			return
@@ -350,7 +374,9 @@ func (s *Service) RemoveRepo(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	s.unmount(cfg.ID)
+	if err := s.unmount(cfg.ID); err != nil {
+		return err
+	}
 	return s.registry.RemoveRepo(ctx, name)
 }
 
@@ -370,6 +396,7 @@ func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Dur
 	s.mu.Lock()
 	if rt, ok := s.running[cfg.ID]; ok {
 		rt.cfg.RefreshInterval = interval
+		signalRefreshUpdate(rt, interval)
 	}
 	s.mu.Unlock()
 	return nil
@@ -385,11 +412,11 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 	s.mu.Lock()
 	rt, ok := s.running[cfg.ID]
 	if ok {
-		dirty, _ := rt.overlay.DirtyCount(ctx)
-		rt.state.DirtyOverlay = dirty > 0
 		st := rt.state // copy under lock
 		cfg = rt.cfg
 		s.mu.Unlock()
+		dirty, _ := rt.overlay.DirtyCount(ctx)
+		st.DirtyOverlay = dirty > 0
 		applyHydrationStats(&st, cfg.BlobCacheDir)
 		return st, nil
 	}
@@ -455,7 +482,9 @@ func (s *Service) Remount(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	s.unmount(cfg.ID)
+	if err := s.unmount(cfg.ID); err != nil {
+		return err
+	}
 	if shouldMountAsync(cfg) {
 		if err := s.mountAsyncRepo(ctx, cfg); err != nil {
 			return err
@@ -473,8 +502,7 @@ func (s *Service) Unmount(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	s.unmount(cfg.ID)
-	return nil
+	return s.unmount(cfg.ID)
 }
 
 // prepareRepo clones the git repo and builds the initial snapshot. It does NOT
@@ -547,7 +575,10 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
-	s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
+	if err := snap.CleanupGenerations(ctx, gen); err != nil {
+		s.logger.Warn("snapshot cleanup failed", "repo", cfg.Name, "error", err)
+	}
+	resolver.SetCommitTime(s.commitTimestamp(ctx, cfg, headOID, "commit timestamp unavailable, mtime will use generation fallback"))
 	runtimeCtx, cancel := context.WithCancel(ctx)
 	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
 	sizes.Start(runtimeCtx)
@@ -571,16 +602,17 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		s.configureStatusOptimization(ctx, cfg)
 	}
 	rt := &repoRuntime{
-		cfg:      cfg,
-		ctx:      runtimeCtx,
-		cancel:   cancel,
-		snapshot: snap,
-		overlay:  ov,
-		hydrator: h,
-		sizes:    sizes,
-		resolver: resolver,
-		mfs:      mfs,
-		state:    newRuntimeState(cfg.ID, headOID, headRef, gen),
+		cfg:            cfg,
+		ctx:            runtimeCtx,
+		cancel:         cancel,
+		snapshot:       snap,
+		overlay:        ov,
+		hydrator:       h,
+		sizes:          sizes,
+		resolver:       resolver,
+		mfs:            mfs,
+		state:          newRuntimeState(cfg.ID, headOID, headRef, gen),
+		refreshUpdates: make(chan time.Duration, 1),
 	}
 	s.startRuntime(rt)
 	s.startRepoBackground(rt)
@@ -606,8 +638,11 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	h := hydrator.New(s.git)
 	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
+	if err := snap.CleanupGenerations(ctx, gen); err != nil {
+		s.logger.Warn("snapshot cleanup failed", "repo", cfg.Name, "error", err)
+	}
 	if headOID != "" {
-		s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
+		resolver.SetCommitTime(s.commitTimestamp(ctx, cfg, headOID, "commit timestamp unavailable, mtime will use generation fallback"))
 	}
 	runtimeCtx, cancel := context.WithCancel(ctx)
 	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
@@ -638,16 +673,17 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		state = model.PrepareStatePreparing
 	}
 	rt := &repoRuntime{
-		cfg:      cfg,
-		ctx:      runtimeCtx,
-		cancel:   cancel,
-		snapshot: snap,
-		overlay:  ov,
-		hydrator: h,
-		sizes:    sizes,
-		resolver: resolver,
-		mfs:      mfs,
-		gate:     gate,
+		cfg:            cfg,
+		ctx:            runtimeCtx,
+		cancel:         cancel,
+		snapshot:       snap,
+		overlay:        ov,
+		hydrator:       h,
+		sizes:          sizes,
+		resolver:       resolver,
+		mfs:            mfs,
+		gate:           gate,
+		refreshUpdates: make(chan time.Duration, 1),
 		state: model.RepoRuntimeState{
 			RepoID:             cfg.ID,
 			CurrentHEADOID:     headOID,
@@ -857,20 +893,22 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
 		return registry.ErrRepoChanged
 	}
-	if !s.prepareConfigStillCurrent(ctx, cfg) {
-		return registry.ErrRepoChanged
-	}
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		return rt.snapshot.GetNode(gen, path)
 	}
-	if err := rt.overlay.Reconcile(ctx, baseLookup); err != nil {
+	commitTime := s.commitTimestamp(ctx, cfg, headOID, "commit timestamp unavailable")
+	if err := rt.overlay.ReconcileAndPublish(ctx, baseLookup, rt.resolver.BeginViewUpdate, func() {
+		rt.resolver.SetCommitTime(commitTime)
+		rt.resolver.SetGeneration(gen)
+	}); err != nil {
 		return err
 	}
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
 		return registry.ErrRepoChanged
 	}
-	s.refreshCommitTime(ctx, cfg, headOID, rt.resolver, "commit timestamp unavailable")
-	rt.resolver.SetGeneration(gen)
+	if err := rt.snapshot.CleanupGenerations(ctx, gen); err != nil {
+		s.logger.Warn("snapshot cleanup failed", "repo", cfg.Name, "error", err)
+	}
 	s.mu.Lock()
 	if s.running[cfg.ID] != rt || !samePrepareConfig(rt.cfg, cfg) {
 		s.mu.Unlock()
@@ -934,57 +972,99 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 }
 
 func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
-	oid, ref, err := s.git.ResolveHEAD(ctx, rt.cfg)
-	if err != nil {
-		s.logger.Error("HEAD resolve failed", "repo", rt.cfg.Name, "error", err)
-		return
-	}
+	rt.headMu.Lock()
+	defer rt.headMu.Unlock()
 	s.mu.Lock()
+	cfg := rt.cfg
 	prevOID := rt.state.CurrentHEADOID
 	prevRef := rt.state.CurrentHEADRef
 	s.mu.Unlock()
+	oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		s.logger.Error("HEAD resolve failed", "repo", cfg.Name, "error", err)
+		return
+	}
 	if oid == prevOID {
 		if ref == prevRef {
 			return
 		}
 		if err := rt.snapshot.UpdateHEADRef(ctx, ref); err != nil {
-			s.logger.Warn("snapshot head_ref update failed", "repo", rt.cfg.Name, "error", err)
+			s.logger.Warn("snapshot head_ref update failed", "repo", cfg.Name, "error", err)
 		}
 		s.mu.Lock()
 		rt.state.CurrentHEADRef = ref
 		s.mu.Unlock()
 		return
 	}
-	gen, phase, err := s.publishSnapshot(ctx, rt.cfg, rt.snapshot, oid, ref)
+	gen, phase, err := s.publishSnapshot(ctx, cfg, rt.snapshot, oid, ref)
 	if err != nil {
 		msg := "tree rebuild failed"
 		if phase == "publish" {
 			msg = "snapshot publish failed"
 		}
-		s.logger.Error(msg, "repo", rt.cfg.Name, "error", err)
+		s.logger.Error(msg, "repo", cfg.Name, "error", err)
 		return
 	}
+	commitTime := s.commitTimestamp(ctx, cfg, oid, "commit timestamp unavailable")
+	s.applyPublishedViewLocked(rt, oid, ref, gen, commitTime)
+}
+
+func (s *Service) applyPublishedViewLocked(rt *repoRuntime, oid, ref string, gen, commitTime int64) {
+	s.mu.Lock()
+	cfg := rt.cfg
+	s.mu.Unlock()
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		return rt.snapshot.GetNode(gen, path)
 	}
-	if err := rt.overlay.Reconcile(ctx, baseLookup); err != nil {
-		s.logger.Warn("overlay reconcile failed", "repo", rt.cfg.Name, "error", err)
+	if err := rt.overlay.ReconcileAndPublish(rt.ctx, baseLookup, rt.resolver.BeginViewUpdate, func() {
+		rt.resolver.SetCommitTime(commitTime)
+		rt.resolver.SetGeneration(gen)
+	}); err != nil {
+		s.logger.Warn("overlay reconcile failed", "repo", cfg.Name, "error", err)
+		s.retryPublishedView(rt, oid, ref, gen, commitTime)
+		return
 	}
-
-	// Refresh the git index so `git status` inside the mount reflects the
-	// new HEAD. Without this, the index still describes the old tree and
-	// status shows phantom diffs after a branch switch or commit.
-	if err := s.git.ReadTreeHEAD(ctx, rt.cfg); err != nil {
-		s.logger.Warn("read-tree HEAD failed", "repo", rt.cfg.Name, "error", err)
+	if err := rt.snapshot.CleanupGenerations(rt.ctx, gen); err != nil {
+		s.logger.Warn("snapshot cleanup failed", "repo", cfg.Name, "error", err)
 	}
-	s.refreshCommitTime(ctx, rt.cfg, oid, rt.resolver, "commit timestamp unavailable")
-
-	// Atomically update the resolver's generation so FUSE ops see the new snapshot
-	rt.resolver.SetGeneration(gen)
 	s.mu.Lock()
 	setHeadState(&rt.state, oid, ref, gen)
 	s.mu.Unlock()
-	s.configureStatusOptimization(ctx, rt.cfg)
+	s.configureStatusOptimization(rt.ctx, cfg)
+}
+
+func (s *Service) retryPublishedView(rt *repoRuntime, oid, ref string, gen, commitTime int64) {
+	go func() {
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-rt.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		rt.headMu.Lock()
+		defer rt.headMu.Unlock()
+		s.mu.Lock()
+		if s.running[rt.cfg.ID] != rt || rt.state.SnapshotGeneration >= gen {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		s.mu.Lock()
+		cfg := rt.cfg
+		s.mu.Unlock()
+		currentOID, _, err := s.git.ResolveHEAD(rt.ctx, cfg)
+		if err != nil {
+			s.logger.Warn("HEAD resolve retry failed", "repo", cfg.Name, "error", err)
+			s.retryPublishedView(rt, oid, ref, gen, commitTime)
+			return
+		}
+		if currentOID != oid {
+			go s.onHEADChanged(rt.ctx, rt)
+			return
+		}
+		s.applyPublishedViewLocked(rt, oid, ref, gen, commitTime)
+	}()
 }
 
 func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
@@ -999,7 +1079,7 @@ func (s *Service) FSMonitorHook(ctx context.Context, name string, w io.Writer) e
 		return err
 	}
 	s.fillPaths(&cfg)
-	ov, err := overlay.New(ctx, cfg)
+	ov, err := overlay.OpenReadOnly(cfg)
 	if err != nil {
 		return err
 	}
@@ -1059,9 +1139,15 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 		select {
 		case <-rt.ctx.Done():
 			return
+		case interval := <-rt.refreshUpdates:
+			backoff = interval
+			ticker.Reset(backoff)
 		case <-ticker.C:
+			s.mu.Lock()
+			cfg := rt.cfg
+			s.mu.Unlock()
 			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
-			err := s.git.Fetch(ctx, rt.cfg)
+			err := s.git.Fetch(ctx, cfg)
 			if err != nil {
 				s.mu.Lock()
 				markFetchFailure(&rt.state, auth.RedactString(err.Error()))
@@ -1072,10 +1158,10 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				ticker.Reset(backoff)
 				continue
 			}
-			state, abErr := s.fetchState(ctx, rt.cfg)
+			state, abErr := s.fetchState(ctx, cfg)
 			cancel()
 			// Reset backoff on success
-			backoff = rt.cfg.RefreshInterval
+			backoff = cfg.RefreshInterval
 			ticker.Reset(backoff)
 			s.mu.Lock()
 			markFetchResult(&rt.state, time.Now(), "ok")
@@ -1084,6 +1170,25 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			}
 			s.mu.Unlock()
 		}
+	}
+}
+
+func signalRefreshUpdate(rt *repoRuntime, interval time.Duration) {
+	if rt.refreshUpdates == nil || interval <= 0 {
+		return
+	}
+	select {
+	case rt.refreshUpdates <- interval:
+		return
+	default:
+	}
+	select {
+	case <-rt.refreshUpdates:
+	default:
+	}
+	select {
+	case rt.refreshUpdates <- interval:
+	default:
 	}
 }
 
@@ -1218,11 +1323,12 @@ func (b *sizeUpdateBatcher) Flush() {
 	}
 }
 
-func (s *Service) refreshCommitTime(ctx context.Context, cfg model.RepoConfig, oid string, resolver *fusefs.Resolver, warnMsg string) {
+func (s *Service) commitTimestamp(ctx context.Context, cfg model.RepoConfig, oid string, warnMsg string) int64 {
 	if ts, err := s.git.CommitTimestamp(ctx, cfg, oid); err == nil {
-		resolver.SetCommitTime(ts)
+		return ts
 	} else {
 		s.logger.Warn(warnMsg, "repo", cfg.Name, "error", err)
+		return 0
 	}
 }
 
@@ -1337,26 +1443,48 @@ func blobCacheStats(cacheDir string) (int64, int64) {
 	return count, bytes
 }
 
-func (s *Service) unmount(id model.RepoID) {
+func (s *Service) unmount(id model.RepoID) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rt, ok := s.running[id]
 	if !ok {
-		return
+		s.mu.Unlock()
+		return nil
 	}
-	s.stopRuntime(rt)
-	delete(s.running, id)
+	if rt.stopping {
+		s.mu.Unlock()
+		return errors.New("unmount already in progress")
+	}
+	rt.stopping = true
+	s.mu.Unlock()
+	if err := s.stopRuntime(rt); err != nil {
+		s.mu.Lock()
+		if s.running[id] == rt {
+			rt.stopping = false
+		}
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Lock()
+	if s.running[id] == rt {
+		delete(s.running, id)
+	}
+	s.mu.Unlock()
+	return nil
 }
 
-func (s *Service) stopRuntime(rt *repoRuntime) {
+func (s *Service) stopRuntime(rt *repoRuntime) error {
+	if rt.mfs != nil {
+		if err := rt.mfs.Unmount(); err != nil {
+			return err
+		}
+	}
 	if rt.cancel != nil {
 		rt.cancel()
 	}
+	rt.headMu.Lock()
+	defer rt.headMu.Unlock()
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)
-	}
-	if rt.mfs != nil {
-		_ = rt.mfs.Unmount()
 	}
 	if rt.hydrator != nil {
 		rt.hydrator.Stop()
@@ -1370,6 +1498,7 @@ func (s *Service) stopRuntime(rt *repoRuntime) {
 	if rt.overlay != nil {
 		_ = rt.overlay.Close()
 	}
+	return nil
 }
 
 func (s *Service) fillPaths(cfg *model.RepoConfig) {

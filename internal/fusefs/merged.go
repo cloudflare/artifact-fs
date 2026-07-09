@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,7 @@ func childName(parent, entryPath string) (string, bool) {
 type Resolver struct {
 	generation atomic.Int64
 	commitTime atomic.Int64 // unix seconds of HEAD commit
+	viewMu     sync.RWMutex
 	Snapshot   model.SnapshotStore
 	Overlay    model.OverlayStore
 }
@@ -45,6 +47,13 @@ func (r *Resolver) Generation() int64       { return r.generation.Load() }
 func (r *Resolver) SetCommitTime(ts int64)  { r.commitTime.Store(ts) }
 func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 
+// BeginViewUpdate prevents FUSE namespace mutations from resolving an old
+// generation while the overlay is reconciled and the new view is published.
+func (r *Resolver) BeginViewUpdate() func() {
+	r.viewMu.Lock()
+	return r.viewMu.Unlock
+}
+
 type ResolvedNode struct {
 	FromOverlay bool
 	Base        model.BaseNode
@@ -52,6 +61,12 @@ type ResolvedNode struct {
 }
 
 func (r *Resolver) ResolvePath(path string) (ResolvedNode, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	return r.resolvePath(path)
+}
+
+func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 	path = model.CleanPath(path)
 	if ov, ok := r.Overlay.Get(path); ok {
 		if ov.IsDeleted() {
@@ -62,19 +77,34 @@ func (r *Resolver) ResolvePath(path string) (ResolvedNode, error) {
 	if n, ok := r.Snapshot.GetNode(r.Generation(), path); ok {
 		return ResolvedNode{Base: n}, nil
 	}
+	hasDescendant, err := r.Overlay.HasDescendant(context.Background(), path)
+	if err != nil {
+		return ResolvedNode{}, err
+	}
+	if hasDescendant {
+		return ResolvedNode{FromOverlay: true, Overlay: model.OverlayEntry{
+			Path: path,
+			Kind: model.OverlayKindMkdir,
+			Mode: 0o755,
+		}}, nil
+	}
 	return ResolvedNode{}, fs.ErrNotExist
 }
 
 func (r *Resolver) Lookup(parent, name string) (ResolvedNode, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	if parent == "" {
 		parent = "."
 	}
 	p := model.CleanPath(filepath.Join(parent, name))
-	return r.ResolvePath(p)
+	return r.resolvePath(p)
 }
 
 func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
-	n, err := r.ResolvePath(path)
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	n, err := r.resolvePath(path)
 	if err != nil {
 		return 0, 0, "", time.Time{}, time.Time{}, err
 	}
@@ -123,10 +153,18 @@ func (r *Resolver) Readdir(ctx context.Context, path string) ([]string, error) {
 // ReaddirTyped returns directory entries with name and type, so the FUSE
 // adapter doesn't need to call Getattr per child.
 func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntry, error) {
-	return r.ReaddirTypedAt(ctx, path, r.Generation())
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	return r.readdirTypedAt(ctx, path, r.Generation())
 }
 
 func (r *Resolver) ReaddirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
+	return r.readdirTypedAt(ctx, path, generation)
+}
+
+func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {
 	path = model.CleanPath(path)
 	children, err := r.Snapshot.ListChildren(generation, path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -147,30 +185,41 @@ func (r *Resolver) ReaddirTypedAt(ctx context.Context, path string, generation i
 		}
 	}
 	ovEntries, err := r.Overlay.ListByPrefix(ctx, path)
-	if err == nil {
-		for _, e := range ovEntries {
-			if e.Path == path {
-				continue
-			}
-			name, ok := childName(path, e.Path)
-			if !ok {
-				continue
-			}
-			childPath := model.CleanPath(filepath.Join(path, name))
-			if e.IsDeleted() && e.Path == childPath {
-				delete(set, name)
-				continue
-			}
-			if ov, ok := r.Overlay.Get(childPath); ok && ov.IsDeleted() {
-				continue
-			}
-			if ov, ok := r.Overlay.Get(childPath); ok {
-				set[name] = entry{name: name, typ: ov.NodeType(), overlay: ov, fromOverlay: true}
-				continue
-			}
-			if _, ok := set[name]; !ok {
-				set[name] = entry{name: name, typ: "dir", base: model.BaseNode{Type: "dir", Mode: 0o755, SizeState: "known"}}
-			}
+	if err != nil {
+		return nil, err
+	}
+	direct := make(map[string]model.OverlayEntry)
+	for _, e := range ovEntries {
+		if e.Path == path {
+			continue
+		}
+		name, ok := childName(path, e.Path)
+		if !ok {
+			continue
+		}
+		childPath := model.CleanPath(filepath.Join(path, name))
+		if e.Path == childPath {
+			direct[name] = e
+		}
+	}
+	for name, e := range direct {
+		if e.IsDeleted() {
+			delete(set, name)
+			continue
+		}
+		set[name] = entry{name: name, typ: e.NodeType(), overlay: e, fromOverlay: true}
+	}
+	for _, e := range ovEntries {
+		name, ok := childName(path, e.Path)
+		if !ok {
+			continue
+		}
+		childPath := model.CleanPath(filepath.Join(path, name))
+		if e.Path == childPath || direct[name].Path != "" {
+			continue
+		}
+		if _, exists := set[name]; !exists && !e.IsDeleted() {
+			set[name] = entry{name: name, typ: "dir", base: model.BaseNode{Type: "dir", Mode: 0o755, SizeState: "known"}}
 		}
 	}
 	out := make([]ReaddirEntry, 0, len(set))

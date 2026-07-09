@@ -35,7 +35,11 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 		}
 	})
 
-	// Prime the previous mtime snapshot before changing HEAD.
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial HEAD reconciliation")
+	}
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
 		t.Fatalf("update HEAD: %v", err)
@@ -45,6 +49,35 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 	case <-changed:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected HEAD change notification")
+	}
+}
+
+func TestWatchDetectsChangeMadeDuringInitialCallback(t *testing.T) {
+	gitDir := t.TempDir()
+	headPath := filepath.Join(gitDir, "HEAD")
+	if err := os.WriteFile(headPath, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := New(5 * time.Millisecond)
+	callbacks := make(chan struct{}, 2)
+	calls := 0
+	go p.Watch(t.Context(), gitDir, func() {
+		calls++
+		callbacks <- struct{}{}
+		if calls == 1 {
+			time.Sleep(15 * time.Millisecond)
+			if err := os.WriteFile(headPath, []byte("second"), 0o644); err != nil {
+				t.Errorf("update HEAD: %v", err)
+			}
+		}
+	})
+
+	for range 2 {
+		select {
+		case <-callbacks:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected initial and changed HEAD callbacks")
+		}
 	}
 }
 
@@ -72,7 +105,11 @@ func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
 		}
 	})
 
-	// Prime the previous mtime snapshots before advancing the current branch ref.
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial HEAD reconciliation")
+	}
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(refPath, []byte("commit-2"), 0o644); err != nil {
 		t.Fatalf("update ref: %v", err)
@@ -208,7 +245,11 @@ func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 		}
 	})
 
-	// Prime the previous mtime snapshot before changing only the index.
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial HEAD reconciliation")
+	}
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(indexPath, []byte("index updated"), 0o644); err != nil {
 		t.Fatalf("update index: %v", err)

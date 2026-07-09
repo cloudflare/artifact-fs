@@ -179,6 +179,7 @@ type SnapshotStore interface {
 type OverlayStore interface {
 	Get(path string) (OverlayEntry, bool)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
+	CreateTruncated(ctx context.Context, path string, base BaseNode) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
 	Truncate(ctx context.Context, path string, size int64) error
@@ -187,9 +188,11 @@ type OverlayStore interface {
 	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
+	SyncFile(ctx context.Context, path string) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
 	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
+	HasDescendant(ctx context.Context, prefix string) (bool, error)
 }
 
 type Hydrator interface {
