@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"os/exec"
@@ -15,17 +16,120 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
 type Store struct {
-	logger      *slog.Logger
-	mu          sync.Mutex
-	poolMaxSize int
-	pools       map[string]*batchPool // gitDir -> pool
+	logger         *slog.Logger
+	mu             sync.Mutex
+	poolMaxSize    int
+	pools          map[string]*batchPool // gitDir -> pool
+	gitRetryDelays []time.Duration
 }
+
+// GitOperation identifies an explicitly retried Git operation.
+type GitOperation string
+
+const (
+	GitOperationClone GitOperation = "clone"
+	GitOperationFetch GitOperation = "fetch"
+)
+
+// GitOperationError describes a failed Git operation without exposing
+// credentials. Retryable reports whether its command failure matched a known
+// transient smart-Git transport symptom.
+type GitOperationError struct {
+	Operation GitOperation
+	Attempts  int
+	Retryable bool
+
+	cause      error
+	contextErr error
+}
+
+func (e *GitOperationError) Error() string {
+	if e == nil {
+		return "git operation failed"
+	}
+	operation := string(e.Operation)
+	if operation == "" {
+		operation = "operation"
+	}
+	var msg string
+	if e.Attempts == 0 {
+		msg = fmt.Sprintf("git %s failed before first attempt", operation)
+	} else {
+		noun := "attempts"
+		if e.Attempts == 1 {
+			noun = "attempt"
+		}
+		msg = fmt.Sprintf("git %s failed after %d %s", operation, e.Attempts, noun)
+	}
+	if e.cause != nil {
+		msg += ": " + auth.RedactString(e.cause.Error())
+	}
+	if e.contextErr != nil {
+		msg += "; caller context: " + e.contextErr.Error()
+	}
+	return msg
+}
+
+func (e *GitOperationError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	errs := make([]error, 0, 2)
+	if e.cause != nil {
+		errs = append(errs, e.cause)
+	}
+	if e.contextErr != nil {
+		errs = append(errs, e.contextErr)
+	}
+	return errs
+}
+
+// gitCommandError preserves the command failure and caller cancellation as
+// distinct process-boundary errors. cause has already been redacted.
+type gitCommandError struct {
+	cause      error
+	contextErr error
+}
+
+func (e *gitCommandError) Error() string {
+	if e == nil {
+		return "git command failed"
+	}
+	if e.cause == nil {
+		if e.contextErr != nil {
+			return "caller context: " + e.contextErr.Error()
+		}
+		return "git command failed"
+	}
+	msg := e.cause.Error()
+	if e.contextErr != nil {
+		msg += "; caller context: " + e.contextErr.Error()
+	}
+	return msg
+}
+
+func (e *gitCommandError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	errs := make([]error, 0, 2)
+	if e.cause != nil {
+		errs = append(errs, e.cause)
+	}
+	if e.contextErr != nil {
+		errs = append(errs, e.contextErr)
+	}
+	return errs
+}
+
+var defaultGitRetryDelays = []time.Duration{250 * time.Millisecond, time.Second}
 
 type readBlobResult struct {
 	data []byte
@@ -53,7 +157,12 @@ func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Store{logger: logger, poolMaxSize: 4, pools: map[string]*batchPool{}}
+	return &Store{
+		logger:         logger,
+		poolMaxSize:    4,
+		pools:          map[string]*batchPool{},
+		gitRetryDelays: append([]time.Duration(nil), defaultGitRetryDelays...),
+	}
 }
 
 // Close shuts down all persistent batch processes.
@@ -94,12 +203,6 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
 	}
-	// Use a unique temp dir to avoid races between concurrent clones.
-	target, err := os.MkdirTemp(parent, ".clone-*")
-	if err != nil {
-		return fmt.Errorf("mktemp clone dir: %w", err)
-	}
-	defer os.RemoveAll(target)
 
 	// Strip credentials from the CLI-visible URL; pass them via a credential helper
 	// so they don't appear in ps output.
@@ -110,10 +213,28 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	env := append([]string{}, extraEnv...)
 	env = append(env, credHelper...)
 
-	args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target}
-	if _, err := runGitWithEnv(ctx, "", env, args...); err != nil {
+	var target string
+	attempt := func() error {
+		var err error
+		// A failed git clone can leave files in its destination, so every retry
+		// gets a fresh directory rather than risking a false "already exists".
+		target, err = os.MkdirTemp(parent, ".clone-*")
+		if err != nil {
+			return fmt.Errorf("mktemp clone dir: %w", err)
+		}
+		args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target}
+		_, err = runGitWithEnv(ctx, "", env, args...)
+		if err != nil {
+			_ = os.RemoveAll(target)
+			target = ""
+		}
 		return err
 	}
+	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
+		return err
+	}
+	defer os.RemoveAll(target)
+
 	// Populate the index so git status works inside the mount.
 	if _, err := runGit(ctx, filepath.Join(target, ".git"), "read-tree", "HEAD"); err != nil {
 		return err
@@ -122,6 +243,105 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		return err
 	}
 	return nil
+}
+
+func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, repoName string, attempt func() error) error {
+	delays := s.gitRetryDelays
+	for n := 0; ; n++ {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return &GitOperationError{Operation: operation, Attempts: n, contextErr: contextErr}
+		}
+
+		err := attempt()
+		if err == nil {
+			return nil
+		}
+		cause, contextErr := gitOperationCauses(err)
+		if contextErr == nil {
+			contextErr = ctx.Err()
+		}
+		retryable := isTransientGitError(cause)
+		operationErr := &GitOperationError{
+			Operation:  operation,
+			Attempts:   n + 1,
+			Retryable:  retryable,
+			cause:      cause,
+			contextErr: contextErr,
+		}
+		if contextErr != nil {
+			return operationErr
+		}
+
+		safeRepoName := auth.RedactString(repoName)
+		s.logger.Warn("git operation attempt failed", "operation", operation, "repo", safeRepoName, "attempt", n+1, "max_attempts", len(delays)+1, "retryable", retryable, "error", auth.RedactString(err.Error()))
+		if !retryable || n == len(delays) {
+			return operationErr
+		}
+		delay := equalJitter(delays[n])
+		s.logger.Info("retrying transient git operation failure", "operation", operation, "repo", safeRepoName, "attempt", n+1, "backoff", delay.String())
+		if waitErr := waitForGitRetry(ctx, delay); waitErr != nil {
+			operationErr.contextErr = waitErr
+			return operationErr
+		}
+	}
+}
+
+func gitOperationCauses(err error) (cause error, contextErr error) {
+	var commandErr *gitCommandError
+	if errors.As(err, &commandErr) {
+		return commandErr.cause, commandErr.contextErr
+	}
+	return err, nil
+}
+
+func equalJitter(maximum time.Duration) time.Duration {
+	if maximum <= 1 {
+		return maximum
+	}
+	half := maximum / 2
+	return half + time.Duration(rand.Int64N(int64(maximum-half)))
+}
+
+func waitForGitRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isTransientGitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, symptom := range []string{
+		"http 500", "http/1.0 500", "http/1.1 500", "http/2 500", "returned error: 500",
+		"http 502", "http/1.0 502", "http/1.1 502", "http/2 502", "returned error: 502",
+		"http 503", "http/1.0 503", "http/1.1 503", "http/2 503", "returned error: 503",
+		"http 504", "http/1.0 504", "http/1.1 504", "http/2 504", "returned error: 504",
+		"unexpected disconnect",
+		"remote end hung up unexpectedly",
+		"remote hung up",
+		"connection reset",
+		"early eof",
+		"index-pack failed",
+		"invalid index-pack output",
+		"pack has bad object at offset",
+		"pack is corrupted",
+		"premature end of pack file",
+		"inflate: data stream error",
+		"inflate returned",
+		"serious inflate inconsistency",
+	} {
+		if strings.Contains(message, symptom) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
@@ -138,8 +358,10 @@ func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfi
 	if target.branch != "" {
 		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
 	}
-	_, err = runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
-	return err
+	return s.retryGitOperation(ctx, GitOperationFetch, repo.Name, func() error {
+		_, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
+		return err
+	})
 }
 
 func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
@@ -937,16 +1159,21 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 	errBuf := &bytes.Buffer{}
 	cmd.Stdout = buf
 	cmd.Stderr = errBuf
-	err := cmd.Run()
+	runErr := cmd.Run()
 	out := strings.TrimSpace(buf.String())
-	if err == nil {
+	contextErr := ctx.Err()
+	if runErr == nil && contextErr == nil {
 		return out, nil
 	}
+
 	msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
-	if msg == "" {
-		msg = auth.RedactString(err.Error())
+	var cause error
+	if msg != "" && !(contextErr != nil && strings.EqualFold(msg, "signal: killed")) {
+		cause = errors.New(msg)
+	} else if runErr != nil && !(contextErr != nil && strings.EqualFold(strings.TrimSpace(runErr.Error()), "signal: killed")) {
+		cause = errors.New(auth.RedactString(runErr.Error()))
 	}
-	return out, errors.New(msg)
+	return out, &gitCommandError{cause: cause, contextErr: contextErr}
 }
 
 // credentialEnv returns a sanitized URL (safe for ps) and env vars that
@@ -1006,6 +1233,7 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 	helper := "!f() { printf '%s\\n' \"username=$ARTIFACT_FS_GIT_USERNAME\" \"password=$ARTIFACT_FS_GIT_PASSWORD\"; }; f"
 
 	u.User = nil
+	credentialScope := strings.ToLower(u.Scheme) + "://" + u.Host
 	return u.String(), []string{
 		"GIT_TERMINAL_PROMPT=0",
 		"ARTIFACT_FS_GIT_USERNAME=" + credentialUsername,
@@ -1013,7 +1241,7 @@ func credentialEnv(rawURL string) (safeURL string, env []string, err error) {
 		"GIT_CONFIG_COUNT=2",
 		"GIT_CONFIG_KEY_0=credential.helper",
 		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=credential.helper",
+		"GIT_CONFIG_KEY_1=credential." + credentialScope + ".helper",
 		"GIT_CONFIG_VALUE_1=" + helper,
 	}, nil
 }
