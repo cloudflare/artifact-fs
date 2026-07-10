@@ -75,7 +75,21 @@ func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 		return ResolvedNode{FromOverlay: true, Overlay: ov}, nil
 	}
 	if n, ok := r.Snapshot.GetNode(r.Generation(), path); ok {
-		return ResolvedNode{Base: n}, nil
+		if n.Type == "dir" {
+			return ResolvedNode{Base: n}, nil
+		}
+		hasDescendant, err := r.Overlay.HasDescendant(context.Background(), path)
+		if err != nil {
+			return ResolvedNode{}, err
+		}
+		if !hasDescendant {
+			return ResolvedNode{Base: n}, nil
+		}
+		return ResolvedNode{FromOverlay: true, Overlay: model.OverlayEntry{
+			Path: path,
+			Kind: model.OverlayKindMkdir,
+			Mode: 0o755,
+		}}, nil
 	}
 	hasDescendant, err := r.Overlay.HasDescendant(context.Background(), path)
 	if err != nil {
@@ -218,7 +232,7 @@ func (r *Resolver) readdirTypedAt(ctx context.Context, path string, generation i
 		if e.Path == childPath || direct[name].Path != "" {
 			continue
 		}
-		if _, exists := set[name]; !exists && !e.IsDeleted() {
+		if existing, exists := set[name]; (!exists || existing.typ != "dir") && !e.IsDeleted() {
 			set[name] = entry{name: name, typ: "dir", base: model.BaseNode{Type: "dir", Mode: 0o755, SizeState: "known"}}
 		}
 	}

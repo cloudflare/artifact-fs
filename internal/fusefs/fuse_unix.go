@@ -77,6 +77,7 @@ type FileHandle struct {
 	upperWritable   bool
 	detached        bool
 	writable        bool
+	writeOnly       bool
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -320,18 +321,20 @@ func (fh *FileHandle) pinUpper(path string) error {
 		return nil
 	}
 	fh.mu.RUnlock()
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	writable := err == nil
+	flag := os.O_RDONLY
+	if fh.writeOnly {
+		flag = os.O_WRONLY
+	} else if fh.writable {
+		flag = os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flag, 0)
 	if err != nil {
-		f, err = os.Open(path)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	fh.mu.Lock()
 	if fh.upperFile == nil {
 		fh.upperFile = f
-		fh.upperWritable = writable
+		fh.upperWritable = fh.writable
 		f = nil
 	}
 	fh.mu.Unlock()
@@ -365,18 +368,20 @@ func (fh *FileHandle) pinReadOnly(path string) error {
 }
 
 func (fh *FileHandle) repinUpper(path string) error {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	writable := err == nil
+	flag := os.O_RDONLY
+	if fh.writeOnly {
+		flag = os.O_WRONLY
+	} else if fh.writable {
+		flag = os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flag, 0)
 	if err != nil {
-		f, err = os.Open(path)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	fh.mu.Lock()
 	previous := fh.upperFile
 	fh.upperFile = f
-	fh.upperWritable = writable
+	fh.upperWritable = fh.writable
 	fh.mu.Unlock()
 	if previous != nil {
 		return previous.Close()
@@ -425,6 +430,14 @@ func (fh *FileHandle) prepareDetach(repo model.RepoConfig) error {
 		return err
 	}
 	name := private.Name()
+	if fh.inode != nil {
+		if err := private.Chmod(os.FileMode(fh.inode.Mode)); err != nil {
+			fh.mu.RUnlock()
+			_ = private.Close()
+			_ = os.Remove(name)
+			return err
+		}
+	}
 	_ = os.Remove(name)
 	_, copyErr := io.Copy(private, io.NewSectionReader(source, 0, info.Size()))
 	fh.mu.RUnlock()
@@ -456,6 +469,24 @@ func (fh *FileHandle) writeDetached(off int64, data []byte) (bool, error) {
 	}
 	_, err := fh.upperFile.WriteAt(data, off)
 	return true, err
+}
+
+func (fh *FileHandle) isDetached() bool {
+	fh.mu.RLock()
+	defer fh.mu.RUnlock()
+	return fh.detached
+}
+
+func (fh *FileHandle) truncateDetached(size int64) (os.FileInfo, error) {
+	fh.mu.RLock()
+	defer fh.mu.RUnlock()
+	if !fh.writable || fh.upperFile == nil || !fh.upperWritable {
+		return nil, os.ErrPermission
+	}
+	if err := fh.upperFile.Truncate(size); err != nil {
+		return nil, err
+	}
+	return fh.upperFile.Stat()
 }
 
 func (fh *FileHandle) syncPinned() (bool, error) {
@@ -620,9 +651,38 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
-	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
-	if err != nil {
-		return err
+	if op.Handle != nil {
+		fs.handleMu.Lock()
+		defer fs.handleMu.Unlock()
+	}
+	var fh *FileHandle
+	if op.Handle != nil {
+		var err error
+		fh, err = fs.fileHandle(*op.Handle)
+		if err != nil {
+			return err
+		}
+	}
+	ref := fs.getInode(op.Inode)
+	if ref == nil && fh != nil {
+		ref = fh.inode
+	}
+	if ref == nil {
+		return syscall.ESTALE
+	}
+	if fh != nil {
+		if fh.isDetached() {
+			if op.Size == nil || op.Mtime != nil {
+				return syscall.ENOTSUP
+			}
+			info, err := fh.truncateDetached(int64(*op.Size))
+			if err != nil {
+				return syscall.EIO
+			}
+			op.Attributes = inodeAttrs(ref.Mode, uint64(info.Size()), "file", info.ModTime(), info.ModTime())
+			op.AttributesExpiration = attrExpiry(time.Second)
+			return nil
+		}
 	}
 	if op.Size != nil {
 		fs.closeCachedFilesForPath(ref.Path)
@@ -815,7 +875,7 @@ func (fs *ArtifactFuse) OpenFile(_ context.Context, op *fuseops.OpenFileOp) erro
 	if err != nil {
 		return err
 	}
-	fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly()}
+	fh := &FileHandle{inode: ref, path: ref.Path, writable: !op.OpenFlags.IsReadOnly(), writeOnly: op.OpenFlags.IsWriteOnly()}
 	if ov, ok := fs.engine.Overlay.Get(ref.Path); ok && !ov.IsDeleted() && ov.BackingPath != "" {
 		if err := fh.pinUpper(ov.BackingPath); err != nil {
 			return syscall.EIO
@@ -907,7 +967,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 		}
 		return syscall.EIO
 	}
-	fh := &FileHandle{path: childPath, writable: !op.OpenFlags.IsReadOnly()}
+	fh := &FileHandle{path: childPath, writable: !op.OpenFlags.IsReadOnly(), writeOnly: op.OpenFlags.IsWriteOnly()}
 	if ov, ok := fs.engine.Overlay.Get(childPath); ok && ov.BackingPath != "" {
 		if err := fh.pinUpper(ov.BackingPath); err != nil {
 			return syscall.EIO
@@ -1007,6 +1067,15 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
+	if oldPath == newPath {
+		if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
+			if errors.Is(err, iofs.ErrInvalid) {
+				return syscall.ENOTSUP
+			}
+			return syscall.EIO
+		}
+		return nil
+	}
 	destinationHandles := fs.fileHandlesForPath(newPath)
 	for _, fh := range destinationHandles {
 		if err := fh.pinCurrent(ctx, fs.engine); err != nil {

@@ -39,12 +39,13 @@ var migrations = []string{
 }
 
 type Store struct {
-	db         *sql.DB
-	repo       model.RepoConfig
-	upperDir   string
-	mutationMu sync.RWMutex
-	pathLocks  [256]sync.Mutex
-	mu         sync.RWMutex
+	db          *sql.DB
+	repo        model.RepoConfig
+	upperDir    string
+	legacyCtime bool
+	mutationMu  sync.RWMutex
+	pathLocks   [256]sync.Mutex
+	mu          sync.RWMutex
 }
 
 func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
@@ -70,30 +71,17 @@ func OpenReadOnly(cfg model.RepoConfig) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, repo: cfg, upperDir: filepath.Join(cfg.OverlayDir, "upper")}, nil
+	hasCtime, err := overlayHasCtime(context.Background(), db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db, repo: cfg, upperDir: filepath.Join(cfg.OverlayDir, "upper"), legacyCtime: !hasCtime}, nil
 }
 
 func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(overlay_entries)`)
+	hasCtime, err := overlayHasCtime(ctx, db)
 	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	hasCtime := false
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return err
-		}
-		if name == "ctime_unix_ns" {
-			hasCtime = true
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	if !hasCtime {
@@ -103,6 +91,31 @@ func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
 	}
 	_, err = db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=? WHERE ctime_unix_ns=0`, time.Now().UnixNano())
 	return err
+}
+
+func overlayHasCtime(ctx context.Context, db *sql.DB) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(overlay_entries)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == "ctime_unix_ns" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Store) Close() error {
@@ -117,6 +130,13 @@ func (s *Store) Close() error {
 // the Scan call in queryEntries and the single-row scan in Get.
 const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path`
 
+func (s *Store) columns() string {
+	if s.legacyCtime {
+		return `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, 0 AS ctime_unix_ns, source_oid, target_path`
+	}
+	return overlayCols
+}
+
 func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -124,7 +144,7 @@ func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 }
 
 func (s *Store) get(path string) (model.OverlayEntry, bool) {
-	row := s.db.QueryRow(`SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
+	row := s.db.QueryRow(`SELECT `+s.columns()+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
 	var e model.OverlayEntry
 	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
 		return model.OverlayEntry{}, false
@@ -471,7 +491,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 
 func (s *Store) deletedDescendants(ctx context.Context, path string) ([]model.OverlayEntry, error) {
 	prefix := model.CleanPath(path) + "/"
-	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE kind=? AND substr(path, 1, length(?))=? ORDER BY path`, model.OverlayKindDelete, prefix, prefix)
+	return s.queryEntries(ctx, `SELECT `+s.columns()+` FROM overlay_entries WHERE kind=? AND substr(path, 1, length(?))=? ORDER BY path`, model.OverlayKindDelete, prefix, prefix)
 }
 
 func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error {
@@ -667,7 +687,7 @@ func (s *Store) reconcile(ctx context.Context, baseLookup func(path string) (mod
 		return nil
 	}
 	s.mu.RLock()
-	entries, err := s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
+	entries, err := s.queryEntries(ctx, `SELECT `+s.columns()+` FROM overlay_entries ORDER BY path`)
 	s.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("reconcile list: %w", err)
@@ -874,7 +894,7 @@ func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
 func (s *Store) ListAll(ctx context.Context) ([]model.OverlayEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
+	return s.queryEntries(ctx, `SELECT `+s.columns()+` FROM overlay_entries ORDER BY path`)
 }
 
 // ListByPrefix returns descendants of prefix. Readdir uses them to preserve
@@ -884,11 +904,11 @@ func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.Overla
 	defer s.mu.RUnlock()
 	prefix = model.CleanPath(prefix)
 	if prefix == "." {
-		return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
+		return s.queryEntries(ctx, `SELECT `+s.columns()+` FROM overlay_entries ORDER BY path`)
 	}
 	lower := prefix + "/"
 	upper := prefix + "0"
-	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path>=? AND path<? ORDER BY path`, lower, upper)
+	return s.queryEntries(ctx, `SELECT `+s.columns()+` FROM overlay_entries WHERE path>=? AND path<? ORDER BY path`, lower, upper)
 }
 
 func (s *Store) HasDescendant(ctx context.Context, prefix string) (bool, error) {

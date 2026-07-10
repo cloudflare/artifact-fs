@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -113,41 +114,41 @@ func TestEnsureHydratedRejectsWorkAfterStop(t *testing.T) {
 }
 
 func TestStopWaitsForActiveVerification(t *testing.T) {
-	tmp := t.TempDir()
-	payload := []byte("content")
-	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
-	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
-	if err := os.WriteFile(filepath.Join(tmp, node.ObjectOID), payload, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	verifyStarted := make(chan struct{})
-	releaseVerify := make(chan struct{})
-	h := New(&fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify})
-	ensureDone := make(chan error, 1)
-	go func() {
-		_, _, err := h.EnsureHydrated(context.Background(), cfg, node)
-		ensureDone <- err
-	}()
-	<-verifyStarted
-	stopDone := make(chan struct{})
-	go func() {
-		h.Stop()
-		close(stopDone)
-	}()
-	select {
-	case <-stopDone:
-		t.Fatal("Stop returned before verification exited")
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(releaseVerify)
-	select {
-	case <-stopDone:
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not wait for verification")
-	}
-	if err := <-ensureDone; !errors.Is(err, errStopped) {
-		t.Fatalf("EnsureHydrated error = %v, want %v", err, errStopped)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		tmp := t.TempDir()
+		payload := []byte("content")
+		cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+		node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+		if err := os.WriteFile(filepath.Join(tmp, node.ObjectOID), payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		verifyStarted := make(chan struct{})
+		releaseVerify := make(chan struct{})
+		h := New(&fakeBlobFetcher{payload: payload, verifyOK: true, verifyStarted: verifyStarted, verifyWait: releaseVerify})
+		ensureDone := make(chan error, 1)
+		go func() {
+			_, _, err := h.EnsureHydrated(context.Background(), cfg, node)
+			ensureDone <- err
+		}()
+		<-verifyStarted
+		stopDone := make(chan struct{})
+		go func() {
+			h.Stop()
+			close(stopDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-stopDone:
+			t.Fatal("Stop returned before verification exited")
+		default:
+		}
+		close(releaseVerify)
+		synctest.Wait()
+		<-stopDone
+		if err := <-ensureDone; !errors.Is(err, errStopped) {
+			t.Fatalf("EnsureHydrated error = %v, want %v", err, errStopped)
+		}
+	})
 }
 
 func TestCanceledVerificationWaitersDoNotStartDuplicateJobs(t *testing.T) {

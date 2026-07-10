@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -287,6 +288,49 @@ func TestOpenReadOnlyDoesNotRunSchemaRepairs(t *testing.T) {
 	}
 	if _, err := readOnly.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=1`); err == nil {
 		t.Fatal("read-only overlay accepted a write")
+	}
+}
+
+func TestOpenReadOnlySupportsLegacySchemaWithoutCtime(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "test",
+		OverlayDir:    filepath.Join(dir, "overlay"),
+		OverlayDBPath: filepath.Join(dir, "overlay", "meta.sqlite"),
+	}
+	db, err := meta.OpenDB(cfg.OverlayDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE overlay_entries (
+			path TEXT PRIMARY KEY, kind TEXT NOT NULL, backing_path TEXT,
+			mode INTEGER NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0,
+			mtime_unix_ns INTEGER NOT NULL, source_oid TEXT, target_path TEXT
+		);
+		INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path)
+		VALUES('legacy.txt', 'create', '', 420, 3, 1234, '', '');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := OpenReadOnly(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	entries, err := readOnly.ListAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "legacy.txt" || entries[0].CtimeUnixNs != 0 ||
+		entries[0].Mode != 0o644 || entries[0].SizeBytes != 3 || entries[0].MtimeUnixNs != 1234 {
+		t.Fatalf("legacy entries = %+v", entries)
 	}
 }
 

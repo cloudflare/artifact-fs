@@ -269,6 +269,15 @@ func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) error {
 			e.Resolver.viewMu.RUnlock()
 			return err
 		}
+		if n.FromOverlay && n.Overlay.Kind == model.OverlayKindMkdir {
+			if err := e.Overlay.Mkdir(ctx, path, n.Overlay.Mode); err != nil {
+				e.Resolver.viewMu.RUnlock()
+				return err
+			}
+			err := e.Overlay.SetMtime(ctx, path, t)
+			e.Resolver.viewMu.RUnlock()
+			return err
+		}
 		switch n.Base.Type {
 		case "dir":
 			if err := e.Overlay.Mkdir(ctx, path, n.Base.Mode); err != nil {

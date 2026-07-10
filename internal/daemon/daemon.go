@@ -76,6 +76,7 @@ type repoRuntime struct {
 	stopping       bool
 	headMu         sync.Mutex
 	refreshUpdates chan time.Duration
+	joinDone       chan error
 }
 
 type aheadBehind struct {
@@ -415,7 +416,16 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		st := rt.state // copy under lock
 		cfg = rt.cfg
 		s.mu.Unlock()
-		dirty, _ := rt.overlay.DirtyCount(ctx)
+		dirty, dirtyErr := rt.overlay.DirtyCount(ctx)
+		s.mu.Lock()
+		stillRunning := s.running[cfg.ID] == rt && !rt.stopping
+		s.mu.Unlock()
+		if !stillRunning {
+			return s.readPersistedStatus(ctx, cfg), nil
+		}
+		if dirtyErr != nil {
+			return model.RepoRuntimeState{}, dirtyErr
+		}
 		st.DirtyOverlay = dirty > 0
 		applyHydrationStats(&st, cfg.BlobCacheDir)
 		return st, nil
@@ -1341,13 +1351,17 @@ func (s *Service) fetchState(ctx context.Context, cfg model.RepoConfig) (aheadBe
 }
 
 func (s *Service) startRuntime(rt *repoRuntime) {
+	if rt.mfs != nil {
+		rt.joinDone = make(chan error, 1)
+	}
 	s.mu.Lock()
 	s.running[rt.cfg.ID] = rt
 	s.mu.Unlock()
 
 	if rt.mfs != nil {
 		go func() {
-			_ = rt.mfs.Join(rt.ctx)
+			rt.joinDone <- rt.mfs.Join(context.WithoutCancel(rt.ctx))
+			close(rt.joinDone)
 		}()
 	}
 }
@@ -1481,8 +1495,6 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	if rt.cancel != nil {
 		rt.cancel()
 	}
-	rt.headMu.Lock()
-	defer rt.headMu.Unlock()
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)
 	}
@@ -1492,11 +1504,20 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	if rt.sizes != nil {
 		rt.sizes.Stop()
 	}
+	var joinErr error
+	if rt.joinDone != nil {
+		joinErr = <-rt.joinDone
+	}
+	rt.headMu.Lock()
+	defer rt.headMu.Unlock()
 	if rt.snapshot != nil {
 		_ = rt.snapshot.Close()
 	}
 	if rt.overlay != nil {
 		_ = rt.overlay.Close()
+	}
+	if joinErr != nil && s.logger != nil {
+		s.logger.Warn("FUSE mount join failed after unmount", "repo", rt.cfg.Name, "error", joinErr)
 	}
 	return nil
 }

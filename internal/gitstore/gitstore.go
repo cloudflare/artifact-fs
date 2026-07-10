@@ -601,14 +601,15 @@ func (s *Store) getPool(gitDir string) (*batchPool, error) {
 // batchPool maintains a pool of reusable cat-file --batch processes so
 // multiple hydrator workers can fetch blobs concurrently.
 type batchPool struct {
-	mu      sync.Mutex
-	free    []*batchCatFile
-	gitDir  string
-	logger  *slog.Logger
-	maxSize int
-	closed  bool
-	total   int
-	ready   chan struct{}
+	mu       sync.Mutex
+	free     []*batchCatFile
+	gitDir   string
+	logger   *slog.Logger
+	newBatch func() (*batchCatFile, error)
+	maxSize  int
+	closed   bool
+	total    int
+	ready    chan struct{}
 }
 
 func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
@@ -635,7 +636,11 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 		if p.total < p.maxSize {
 			p.total++
 			p.mu.Unlock()
-			b, err := newBatchCatFile(p.gitDir, p.logger)
+			newBatch := p.newBatch
+			if newBatch == nil {
+				newBatch = func() (*batchCatFile, error) { return newBatchCatFile(p.gitDir, p.logger) }
+			}
+			b, err := newBatch()
 			if err != nil {
 				p.mu.Lock()
 				p.total--
@@ -643,6 +648,15 @@ func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
 				p.mu.Unlock()
 				return nil, err
 			}
+			p.mu.Lock()
+			if p.closed {
+				p.total--
+				p.signalLocked()
+				p.mu.Unlock()
+				b.close()
+				return nil, errors.New("git batch pool closed")
+			}
+			p.mu.Unlock()
 			return b, nil
 		}
 		ready := p.ready

@@ -153,6 +153,30 @@ func TestPrefetchDirCapsAndPrioritizesTasks(t *testing.T) {
 	}
 }
 
+func TestSetMtimeMaterializesImplicitDirectory(t *testing.T) {
+	overlay := &fakeOverlay{
+		entries: map[string]model.OverlayEntry{"dir/local.txt": {Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+		list:    []model.OverlayEntry{{Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+	}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, overlay)
+	engine := &Engine{Resolver: resolver, Overlay: overlay}
+	want := time.Unix(1700000000, 123)
+
+	if err := engine.SetMtime(context.Background(), "dir", want); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := overlay.Get("dir")
+	if !ok || entry.Kind != model.OverlayKindMkdir {
+		t.Fatalf("implicit directory was not materialized: %+v, ok=%v", entry, ok)
+	}
+	if entry.MtimeUnixNs != want.UnixNano() {
+		t.Fatalf("mtime = %d, want %d", entry.MtimeUnixNs, want.UnixNano())
+	}
+	if entry.Mode != 0o755 {
+		t.Fatalf("mode = %o, want 755", entry.Mode)
+	}
+}
+
 func TestFileHandleCachesHydratedBaseFile(t *testing.T) {
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "blob")

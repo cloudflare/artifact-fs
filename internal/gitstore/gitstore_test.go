@@ -174,15 +174,20 @@ func TestConcurrentBlobToCacheUsesIndependentTempFiles(t *testing.T) {
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
-	payload := bytes.Repeat([]byte{0x00, 0xff, 0x7f, '\n'}, 1<<20)
-	if err := os.WriteFile(filepath.Join(repo, "blob.bin"), payload, 0o644); err != nil {
+	payloadA := bytes.Repeat([]byte{0x00, 0xff, 0x7f, '\n'}, 1<<20)
+	payloadB := bytes.Repeat([]byte{0x7f, 0x00, '\n', 0xff}, 1<<20)
+	if err := os.WriteFile(filepath.Join(repo, "blob-a.bin"), payloadA, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run(t, "git", "-C", repo, "add", "blob.bin")
+	if err := os.WriteFile(filepath.Join(repo, "blob-b.bin"), payloadB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "blob-a.bin", "blob-b.bin")
 	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
 
 	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git"), BlobCacheDir: filepath.Join(tmp, "cache")}
 	probe := New(nil)
+	defer probe.Close()
 	oid, _, err := probe.ResolveHEAD(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -191,21 +196,21 @@ func TestConcurrentBlobToCacheUsesIndependentTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var blobOID string
+	var blobOIDs []string
 	for _, node := range nodes {
-		if node.Path == "blob.bin" {
-			blobOID = node.ObjectOID
+		if node.Path == "blob-a.bin" || node.Path == "blob-b.bin" {
+			blobOIDs = append(blobOIDs, node.ObjectOID)
 		}
 	}
-	if blobOID == "" {
-		t.Fatal("no blob OID found")
+	if len(blobOIDs) != 2 {
+		t.Fatalf("blob OIDs = %v, want two", blobOIDs)
 	}
 
-	dst := filepath.Join(cfg.BlobCacheDir, blobOID)
+	dst := filepath.Join(cfg.BlobCacheDir, "shared-destination")
 	start := make(chan struct{})
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
-	for range 2 {
+	for _, blobOID := range blobOIDs {
 		wg.Go(func() {
 			store := New(nil)
 			defer store.Close()
@@ -226,8 +231,8 @@ func TestConcurrentBlobToCacheUsesIndependentTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("cache payload length/content mismatch: got %d bytes, want %d", len(got), len(payload))
+	if !bytes.Equal(got, payloadA) && !bytes.Equal(got, payloadB) {
+		t.Fatalf("cache payload was not one complete blob: got %d bytes", len(got))
 	}
 }
 
@@ -1329,6 +1334,51 @@ func TestBatchPoolBoundsLeasedProcessesAndClosesLateRelease(t *testing.T) {
 	if total != 0 {
 		t.Fatalf("pool total after close = %d, want 0", total)
 	}
+}
+
+func TestBatchPoolCloseWhileProcessStarts(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closer := &recordingWriteCloser{}
+	pool := &batchPool{
+		maxSize: 1,
+		ready:   make(chan struct{}),
+		newBatch: func() (*batchCatFile, error) {
+			close(started)
+			<-release
+			return &batchCatFile{stdin: closer}, nil
+		},
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := pool.acquire(context.Background())
+		errCh <- err
+	}()
+	<-started
+	pool.closeAll()
+	close(release)
+	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "pool closed") {
+		t.Fatalf("acquire error = %v, want pool closed", err)
+	}
+	pool.mu.Lock()
+	total := pool.total
+	pool.mu.Unlock()
+	if total != 0 {
+		t.Fatalf("pool total after concurrent close = %d, want 0", total)
+	}
+	if !closer.closed {
+		t.Fatal("process created during close was not closed")
+	}
+}
+
+type recordingWriteCloser struct {
+	closed bool
+}
+
+func (*recordingWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (c *recordingWriteCloser) Close() error {
+	c.closed = true
+	return nil
 }
 
 func run(t *testing.T, name string, args ...string) {

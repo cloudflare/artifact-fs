@@ -485,6 +485,35 @@ func TestResolveSynthesizesImplicitDirectoryForDirtyDescendant(t *testing.T) {
 	}
 }
 
+func TestDirtyDescendantShadowsNonDirectoryBaseAncestor(t *testing.T) {
+	overlay := &fakeOverlay{
+		entries: map[string]model.OverlayEntry{"dir/local.txt": {Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+		list:    []model.OverlayEntry{{Path: "dir/local.txt", Kind: model.OverlayKindCreate}},
+	}
+	r := newResolver(
+		&fakeSnapshot{
+			nodes: map[string]model.BaseNode{"dir": {Path: "dir", Type: "file", Mode: 0o644}},
+			kids:  map[string][]model.BaseNode{".": {{Path: "dir", Type: "file", Mode: 0o644}}},
+		},
+		overlay,
+	)
+
+	node, err := r.ResolvePath("dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !node.FromOverlay || node.Overlay.NodeType() != "dir" {
+		t.Fatalf("resolved node = %+v, want implicit overlay directory", node)
+	}
+	entries, err := r.ReaddirTyped(context.Background(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "dir" || entries[0].Type != "dir" {
+		t.Fatalf("entries = %+v, want dirty implicit directory", entries)
+	}
+}
+
 func TestReaddirSkipsOverlayEntryForListedDirectory(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{kids: map[string][]model.BaseNode{".": {}}},
