@@ -2,13 +2,16 @@
 
 package gitstore
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
 
-func configureBatchCommand(_ *exec.Cmd) {}
+func configureCommandProcessGroup(_ *exec.Cmd) {}
 
-func killBatchCommand(cmd *exec.Cmd) {
+func killCommandProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return os.ErrProcessDone
 	}
-	_ = cmd.Process.Kill()
+	return cmd.Process.Kill()
 }

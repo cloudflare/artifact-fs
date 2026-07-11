@@ -16,6 +16,20 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
+type stagedErrorContext struct {
+	context.Context
+	errAt int
+	calls int
+}
+
+func (c *stagedErrorContext) Err() error {
+	c.calls++
+	if c.calls >= c.errAt {
+		return context.Canceled
+	}
+	return nil
+}
+
 func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -634,7 +648,7 @@ func TestCloneBloblessDoesNotRetryPermanentError(t *testing.T) {
 	}
 	countPath := filepath.Join(tmp, "clone-count")
 	fakeGit := filepath.Join(bin, "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncount=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\ncount=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\nprintf '%s\\n' 'fatal: Authentication failed for https://user:super-secret@example.com/org/repo.git; HTTP 401' >&2\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\ncount=0; [ -f \"$AFS_CLONE_COUNT\" ] && count=$(cat \"$AFS_CLONE_COUNT\")\ncount=$((count + 1)); printf '%s' \"$count\" > \"$AFS_CLONE_COUNT\"\nprintf '%s\\n' 'remote: credential-user' 'remote: super-secret' 'fatal: Authentication failed for https://credential-user:super-secret@example.com/org/repo.git; HTTP 401' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -642,7 +656,7 @@ func TestCloneBloblessDoesNotRetryPermanentError(t *testing.T) {
 
 	store := New(nil)
 	store.gitRetryDelays = []time.Duration{0, 0}
-	err := store.CloneBlobless(context.Background(), model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
+	err := store.CloneBlobless(context.Background(), model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://credential-user:super-secret@example.com/org/repo.git", Branch: "main"})
 	var operationErr *GitOperationError
 	if !errors.As(err, &operationErr) {
 		t.Fatalf("error = %T %v, want GitOperationError", err, err)
@@ -650,7 +664,7 @@ func TestCloneBloblessDoesNotRetryPermanentError(t *testing.T) {
 	if operationErr.Operation != GitOperationClone || operationErr.Attempts != 1 || operationErr.Retryable {
 		t.Fatalf("GitOperationError = %+v, want one non-retryable clone attempt", operationErr)
 	}
-	if strings.Contains(err.Error(), "user") || strings.Contains(err.Error(), "super-secret") {
+	if strings.Contains(err.Error(), "credential-user") || strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("clone error leaked credentials: %v", err)
 	}
 	count, readErr := os.ReadFile(countPath)
@@ -727,10 +741,45 @@ func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
 	}
 }
 
+func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testing.T) {
+	ctx := &stagedErrorContext{Context: context.Background(), errAt: 3}
+	transportErr := errors.New("HTTP 500 transport failure")
+	store := New(nil)
+	store.gitRetryDelays = []time.Duration{0}
+	attempts := 0
+	err := store.retryGitOperation(ctx, GitOperationClone, "repo", func() error {
+		attempts++
+		return transportErr
+	})
+	if !errors.Is(err, transportErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want transport and cancellation causes", err)
+	}
+	var operationErr *GitOperationError
+	if !errors.As(err, &operationErr) || !operationErr.Retryable || operationErr.Attempts != 1 {
+		t.Fatalf("error = %#v, want the first retryable attempt", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
 func TestTransientGitErrorIndependentSignatures(t *testing.T) {
 	for _, message := range []string{
+		"error: RPC failed; HTTP 408 curl 22",
 		"error: RPC failed; HTTP 500 curl 22",
+		"fatal: unable to access remote: The requested URL returned error: 522",
+		"fatal: unable to access remote: The requested URL returned error: 524",
+		"error: RPC failed; curl 18 transfer closed with 66 bytes remaining to read",
+		"error: RPC failed; curl 55 Send failure: Broken pipe",
+		"error: RPC failed; curl 56 The TLS connection was non-properly terminated",
+		"error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL",
+		"fatal: unable to access remote: Operation timed out after 60000 milliseconds",
+		"fatal: unable to access remote: Empty reply from server",
+		"fatal: unable to access remote: Could not resolve host: github.com",
+		"fatal: unable to access remote: Failed to connect to github.com port 443: Couldn't connect to server",
 		"fetch-pack: unexpected disconnect while reading sideband packet",
+		"fetch-pack: 12 bytes of body are still expected",
+		"fetch-pack: 3 bytes of length header were received",
 		"fatal: early EOF",
 		"fatal: index-pack failed",
 	} {
@@ -739,6 +788,80 @@ func TestTransientGitErrorIndependentSignatures(t *testing.T) {
 				t.Fatalf("isTransientGitError(%q) = false, want true", message)
 			}
 		})
+	}
+}
+
+func TestRunGitClassifiesBeforeCredentialRedaction(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'HTTP 500 transport failure' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := runGitWithEnv(context.Background(), "", []string{"ARTIFACT_FS_GIT_PASSWORD=0"}, "version")
+	_, _, retryable := gitOperationCauses(err)
+	if !retryable {
+		t.Fatalf("redacted command error was not retryable: %v", err)
+	}
+	if strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("command error leaked credential value: %v", err)
+	}
+}
+
+func TestRunGitCancellationKillsDescendants(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(tmp, "started")
+	survived := filepath.Join(tmp, "survived")
+	script := "#!/bin/sh\n(sleep 0.2; : > \"$AFS_CHILD_SURVIVED\") &\n: > \"$AFS_GIT_STARTED\"\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_STARTED", started)
+	t.Setenv("AFS_CHILD_SURVIVED", survived)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runGit(ctx, "", "version")
+		errCh <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("git command did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runGit error = %v, want context canceled", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(survived); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("git descendant survived cancellation")
+	}
+}
+
+func TestKillCommandProcessGroupReportsExitedProcess(t *testing.T) {
+	cmd := exec.Command("git", "version")
+	configureCommandProcessGroup(cmd)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err := killCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("kill exited process error = %v, want os.ErrProcessDone", err)
 	}
 }
 
@@ -761,11 +884,16 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 
 func TestRetryGitOperationPermanentFailures(t *testing.T) {
 	for _, message := range []string{
+		"HTTP 429 Too Many Requests",
 		"HTTP 501 Not Implemented",
 		"HTTP 505 Version Not Supported",
 		"fatal: Authentication failed",
 		"fetch-pack failed",
 		"packfile could not be read",
+		"No space left on device; index-pack failed",
+		"Disk quota exceeded; pack is corrupted",
+		"Permission denied; early EOF",
+		"Read-only file system; invalid index-pack output",
 	} {
 		t.Run(message, func(t *testing.T) {
 			store := New(nil)
@@ -1046,6 +1174,13 @@ func TestCredentialEnvScopesCredentialsToOriginalAuthority(t *testing.T) {
 	different, _ := fill("other.example.com:8443")
 	if strings.Contains(different, "username=") || strings.Contains(different, "password=") {
 		t.Fatalf("different authority received credentials: %q", different)
+	}
+}
+
+func TestCredentialEnvRejectsCredentialedHTTPWithoutAuthority(t *testing.T) {
+	t.Parallel()
+	if _, _, err := credentialEnv("https://alice:secret@/attacker/repo.git"); err == nil {
+		t.Fatal("expected missing HTTP authority rejection")
 	}
 }
 
