@@ -3,21 +3,23 @@
 package gitstore
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
 
-func configureBatchCommand(cmd *exec.Cmd) {
+func configureCommandProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func killBatchCommand(cmd *exec.Cmd) {
+func killCommandProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return os.ErrProcessDone
 	}
 	pid := cmd.Process.Pid
+	err := cmd.Process.Kill()
 	if pid > 0 {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
-	_ = cmd.Process.Kill()
+	return err
 }
