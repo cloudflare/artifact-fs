@@ -62,6 +62,11 @@ func (g *generationSnapshot) GetNode(gen int64, path string) (model.BaseNode, bo
 	return n, ok
 }
 
+func (g *generationSnapshot) LookupNode(_ context.Context, gen int64, path string) (model.BaseNode, bool, error) {
+	n, ok := g.GetNode(gen, path)
+	return n, ok, nil
+}
+
 func (g *generationSnapshot) ListChildren(gen int64, path string) ([]model.BaseNode, error) {
 	return g.kids[gen][path], nil
 }

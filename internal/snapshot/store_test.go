@@ -112,7 +112,10 @@ func TestGenerationCleanup(t *testing.T) {
 		t.Fatalf("unexpected generations: %d %d %d", g1, g2, g3)
 	}
 
-	// Generation 1 should be cleaned up after gen 3 publish
+	if err := s.PruneGenerations(ctx, g2); err != nil {
+		t.Fatal(err)
+	}
+	// Generation 1 should be cleaned up once the caller publishes the view.
 	_, ok := s.GetNode(1, "f.txt")
 	if ok {
 		t.Fatal("gen 1 should be cleaned up")

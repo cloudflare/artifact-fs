@@ -47,6 +47,7 @@ func New(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	if err := meta.ExecMigrations(ctx, db, migrations); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -91,11 +92,15 @@ func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref strin
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	// Clean up old generations to prevent unbounded growth
-	if gen > 2 {
-		s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation < ?`, gen-1)
-	}
 	return gen, nil
+}
+
+func (s *Store) PruneGenerations(ctx context.Context, keepFrom int64) error {
+	if keepFrom <= 1 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation < ?`, keepFrom)
+	return err
 }
 
 func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
@@ -127,18 +132,20 @@ func (s *Store) UpdateHEADRef(ctx context.Context, ref string) error {
 }
 
 func (s *Store) GetNode(generation int64, path string) (model.BaseNode, bool) {
-	// Uses background context for backward compat; callers with a deadline
-	// should use GetNodeCtx.
-	return s.GetNodeCtx(context.Background(), generation, path)
+	n, ok, _ := s.LookupNode(context.Background(), generation, path)
+	return n, ok
 }
 
-func (s *Store) GetNodeCtx(ctx context.Context, generation int64, path string) (model.BaseNode, bool) {
+func (s *Store) LookupNode(ctx context.Context, generation int64, path string) (model.BaseNode, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND path=?`, generation, path)
 	var n model.BaseNode
 	if err := row.Scan(&n.Path, &n.Type, &n.Mode, &n.ObjectOID, &n.SizeState, &n.SizeBytes); err != nil {
-		return model.BaseNode{}, false
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.BaseNode{}, false, nil
+		}
+		return model.BaseNode{}, false, err
 	}
-	return n, true
+	return n, true, nil
 }
 
 // ListChildren returns direct children of parentPath using a path-based lookup

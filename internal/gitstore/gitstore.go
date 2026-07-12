@@ -28,6 +28,7 @@ type Store struct {
 	poolMaxSize    int
 	pools          map[string]*batchPool // gitDir -> pool
 	gitRetryDelays []time.Duration
+	closed         bool
 }
 
 // GitOperation identifies an explicitly retried Git operation.
@@ -169,10 +170,19 @@ func New(logger *slog.Logger) *Store {
 // Close shuts down all persistent batch processes.
 func (s *Store) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	pools := make([]*batchPool, 0, len(s.pools))
 	for dir, p := range s.pools {
-		p.closeAll()
+		pools = append(pools, p)
 		delete(s.pools, dir)
+	}
+	s.mu.Unlock()
+	for _, p := range pools {
+		p.closeAll()
 	}
 }
 
@@ -182,6 +192,9 @@ func (s *Store) SetBatchPoolSize(n int) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	s.poolMaxSize = n
 	for _, p := range s.pools {
 		p.setMaxSize(n)
@@ -199,6 +212,8 @@ func (s *Store) CloneBloblessNonInteractive(ctx context.Context, cfg model.RepoC
 func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEnv []string) error {
 	if _, err := os.Stat(cfg.GitDir); err == nil {
 		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	parent := filepath.Dir(cfg.GitDir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -387,8 +402,10 @@ func isTransientGitMessage(message string) bool {
 }
 
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
-	_, err := runGit(ctx, repo.GitDir, "fetch", "--no-tags", "origin")
-	return err
+	return s.retryGitOperation(ctx, GitOperationFetch, repo.Name, func() error {
+		_, err := runGit(ctx, repo.GitDir, "fetch", "--no-tags", "origin")
+		return err
+	})
 }
 
 func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
@@ -530,9 +547,13 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	nodes := []model.BaseNode{rootNode(repo.ID)}
 	var blobOIDs []string
 	blobIndex := map[string][]int{} // oid -> indices into nodes
+	var parseErr error
 	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
 		n, typ, ok := parseTreeRecord(repo.ID, line)
 		if !ok {
+			if typ != "commit" && parseErr == nil {
+				parseErr = fmt.Errorf("invalid ls-tree record %q", line)
+			}
 			return
 		}
 		idx := len(nodes)
@@ -545,6 +566,9 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 		}
 	}); err != nil {
 		return nil, err
+	}
+	if parseErr != nil {
+		return nil, parseErr
 	}
 
 	// Batch-resolve sizes using cat-file --batch-check. This reads from local
@@ -588,13 +612,16 @@ func readNullDelimited(r io.Reader, fn func(string)) error {
 	reader := bufio.NewReader(r)
 	for {
 		record, err := reader.ReadString('\x00')
-		if record != "" {
+		if err == nil && record != "" {
 			record = strings.TrimSuffix(record, "\x00")
 			if record != "" {
 				fn(record)
 			}
 		}
 		if errors.Is(err, io.EOF) {
+			if record != "" {
+				return io.ErrUnexpectedEOF
+			}
 			return nil
 		}
 		if err != nil {
@@ -615,7 +642,10 @@ func parseTreeRecord(repoID model.RepoID, line string) (model.BaseNode, string, 
 	modeStr := meta[0]
 	typ := meta[1]
 	oid := meta[2]
-	mode64, _ := strconv.ParseUint(modeStr, 8, 32)
+	mode64, err := strconv.ParseUint(modeStr, 8, 32)
+	if err != nil {
+		return model.BaseNode{}, typ, false
+	}
 	mode := uint32(mode64)
 	if typ == "commit" {
 		return model.BaseNode{}, typ, false
@@ -719,30 +749,33 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return 0, err
 	}
-	pool := s.getPool(repo.GitDir)
-	batch, err := pool.acquire()
+	pool, err := s.getPool(repo.GitDir)
+	if err != nil {
+		return 0, err
+	}
+	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return 0, err
 	}
 	size, err = fetchBatchToFile(ctx, batch, objectOID, dstPath)
 	if err != nil {
+		pool.discard(batch)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0, err
 		}
 		// Process may have died or be desynchronized; discard and retry.
-		batch.close()
-		batch, err = pool.acquire()
+		batch, err = pool.acquire(ctx)
 		if err != nil {
 			return 0, err
 		}
 		size, err = fetchBatchToFile(ctx, batch, objectOID, dstPath)
 		if err != nil {
+			pool.discard(batch)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return 0, err
 			}
 			// Retry also failed; close instead of returning a potentially
 			// corrupted process to the pool.
-			batch.close()
 			return 0, err
 		}
 	}
@@ -770,8 +803,11 @@ func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID s
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
 	}
-	pool := s.getPool(repo.GitDir)
-	batch, err := pool.acquire()
+	pool, err := s.getPool(repo.GitDir)
+	if err != nil {
+		return nil, err
+	}
+	batch, err := pool.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -781,22 +817,22 @@ func (s *Store) ReadBlob(ctx context.Context, repo model.RepoConfig, objectOID s
 		return data, nil
 	}
 	if errors.Is(err, model.ErrBlobTooLarge) {
-		batch.kill()
+		pool.discard(batch)
 		return nil, err
 	}
-	batch.close()
+	pool.discard(batch)
 
-	batch, err = pool.acquire()
+	batch, err = pool.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
 	data, err = readBatchBlob(ctx, batch, objectOID, maxBytes)
 	if err != nil {
 		if errors.Is(err, model.ErrBlobTooLarge) {
-			batch.kill()
+			pool.discard(batch)
 			return nil, err
 		}
-		batch.close()
+		pool.discard(batch)
 		return nil, err
 	}
 	pool.release(batch)
@@ -826,75 +862,147 @@ func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID
 	return strings.TrimSpace(out) == objectOID, nil
 }
 
-func (s *Store) getPool(gitDir string) *batchPool {
+func (s *Store) getPool(gitDir string) (*batchPool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p, ok := s.pools[gitDir]; ok {
-		return p
+	if s.closed {
+		return nil, errors.New("git store closed")
 	}
-	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize}
+	if p, ok := s.pools[gitDir]; ok {
+		return p, nil
+	}
+	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize, all: map[*batchCatFile]struct{}{}, changed: make(chan struct{})}
 	s.pools[gitDir] = p
-	return p
+	return p, nil
 }
 
 // batchPool maintains a pool of reusable cat-file --batch processes so
 // multiple hydrator workers can fetch blobs concurrently.
 type batchPool struct {
-	mu      sync.Mutex
-	free    []*batchCatFile
-	gitDir  string
-	logger  *slog.Logger
-	maxSize int
+	mu       sync.Mutex
+	free     []*batchCatFile
+	gitDir   string
+	logger   *slog.Logger
+	maxSize  int
+	creating int
+	all      map[*batchCatFile]struct{}
+	closed   bool
+	changed  chan struct{}
 }
 
-func (p *batchPool) acquire() (*batchCatFile, error) {
-	p.mu.Lock()
-	if n := len(p.free); n > 0 {
-		b := p.free[n-1]
-		p.free = p.free[:n-1]
-		p.mu.Unlock()
-		if b.alive() {
+func (p *batchPool) acquire(ctx context.Context) (*batchCatFile, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errors.New("git batch pool closed")
+		}
+		if n := len(p.free); n > 0 {
+			b := p.free[n-1]
+			p.free = p.free[:n-1]
+			p.mu.Unlock()
+			if b.alive() {
+				return b, nil
+			}
+			p.discard(b)
+			continue
+		}
+		if len(p.all)+p.creating < p.maxSize {
+			p.creating++
+			p.mu.Unlock()
+			b, err := newBatchCatFile(p.gitDir, p.logger)
+			p.mu.Lock()
+			p.creating--
+			if err == nil && !p.closed {
+				p.all[b] = struct{}{}
+			}
+			closed := p.closed
+			p.signalLocked()
+			p.mu.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			if closed {
+				b.kill()
+				return nil, errors.New("git batch pool closed")
+			}
 			return b, nil
 		}
-		b.close()
-	} else {
+		changed := p.changed
 		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
 	}
-	return newBatchCatFile(p.gitDir, p.logger)
 }
 
 func (p *batchPool) release(b *batchCatFile) {
 	if !b.alive() {
-		b.close()
+		p.discard(b)
 		return
 	}
 	p.mu.Lock()
-	if len(p.free) < p.maxSize {
+	if !p.closed && len(p.all) <= p.maxSize {
 		p.free = append(p.free, b)
+		p.signalLocked()
 		p.mu.Unlock()
 		return
 	}
+	delete(p.all, b)
+	p.signalLocked()
 	p.mu.Unlock()
 	b.close()
 }
 
+func (p *batchPool) discard(b *batchCatFile) {
+	p.mu.Lock()
+	if _, ok := p.all[b]; ok {
+		delete(p.all, b)
+		p.signalLocked()
+	}
+	p.mu.Unlock()
+	b.kill()
+}
+
+func (p *batchPool) signalLocked() {
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
 func (p *batchPool) closeAll() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, b := range p.free {
-		b.close()
+	if p.closed {
+		p.mu.Unlock()
+		return
 	}
+	p.closed = true
+	all := make([]*batchCatFile, 0, len(p.all))
+	for b := range p.all {
+		all = append(all, b)
+	}
+	p.all = map[*batchCatFile]struct{}{}
 	p.free = nil
+	p.signalLocked()
+	p.mu.Unlock()
+	for _, b := range all {
+		b.kill()
+	}
 }
 
 func (p *batchPool) setMaxSize(n int) {
 	var extras []*batchCatFile
 	p.mu.Lock()
 	p.maxSize = n
-	if len(p.free) > n {
-		extras = append(extras, p.free[n:]...)
-		p.free = p.free[:n]
+	for len(p.all) > n && len(p.free) > 0 {
+		idx := len(p.free) - 1
+		b := p.free[idx]
+		p.free = p.free[:idx]
+		delete(p.all, b)
+		extras = append(extras, b)
 	}
+	p.signalLocked()
 	p.mu.Unlock()
 	for _, b := range extras {
 		b.close()
@@ -911,6 +1019,7 @@ type batchCatFile struct {
 	stdoutPipe io.ReadCloser
 	stdout     *bufio.Reader
 	logger     *slog.Logger
+	closeOnce  sync.Once
 }
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
@@ -944,20 +1053,29 @@ func (b *batchCatFile) alive() bool {
 }
 
 func (b *batchCatFile) close() {
-	if b.stdin != nil {
-		b.stdin.Close()
-	}
-	if b.cmd != nil && b.cmd.Process != nil {
-		b.cmd.Wait()
-	}
+	b.shutdown(false)
 }
 
 func (b *batchCatFile) kill() {
-	if b.stdoutPipe != nil {
-		_ = b.stdoutPipe.Close()
-	}
-	_ = killCommandProcessGroup(b.cmd)
-	b.close()
+	b.shutdown(true)
+
+}
+
+func (b *batchCatFile) shutdown(kill bool) {
+	b.closeOnce.Do(func() {
+		if kill {
+			if b.stdoutPipe != nil {
+				_ = b.stdoutPipe.Close()
+			}
+			_ = killCommandProcessGroup(b.cmd)
+		}
+		if b.stdin != nil {
+			_ = b.stdin.Close()
+		}
+		if b.cmd != nil && b.cmd.Process != nil {
+			_ = b.cmd.Wait()
+		}
+	})
 }
 
 // fetchToFile writes oid to the batch process stdin, reads the response header
@@ -980,19 +1098,23 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 
 	// Stream blob content to a temp file, then atomic rename. The blob cache is
 	// reconstructible from git, so we prefer throughput over per-object fsync.
-	tmp := dstPath + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(dstPath), ".artifact-fs-blob-*")
 	if err != nil {
 		// Drain the blob content so the protocol stays in sync.
-		io.CopyN(io.Discard, b.stdout, size+1) // +1 for trailing LF
+		_, _ = io.CopyN(io.Discard, b.stdout, size+1) // +1 for trailing LF
 		return 0, err
 	}
+	tmp := f.Name()
 	written, copyErr := io.CopyN(f, b.stdout, size)
 	// Read the trailing LF that git appends after the content. If this fails
 	// the batch protocol is desynchronized and the caller must discard the
 	// process.
-	if _, lfErr := b.stdout.ReadByte(); lfErr != nil && copyErr == nil {
-		copyErr = fmt.Errorf("batch read trailing LF: %w", lfErr)
+	if lf, lfErr := b.stdout.ReadByte(); copyErr == nil {
+		if lfErr != nil {
+			copyErr = fmt.Errorf("batch read trailing LF: %w", lfErr)
+		} else if lf != '\n' {
+			copyErr = fmt.Errorf("batch read trailing byte: got %#x, want newline", lf)
+		}
 	}
 	closeErr := f.Close()
 
@@ -1039,8 +1161,12 @@ func (b *batchCatFile) readBlob(oid string, maxBytes int64) ([]byte, error) {
 	if _, err := io.ReadFull(b.stdout, data); err != nil {
 		return nil, fmt.Errorf("batch read content: %w", err)
 	}
-	if _, err := b.stdout.ReadByte(); err != nil {
+	lf, err := b.stdout.ReadByte()
+	if err != nil {
 		return nil, fmt.Errorf("batch read trailing LF: %w", err)
+	}
+	if lf != '\n' {
+		return nil, fmt.Errorf("batch read trailing byte: got %#x, want newline", lf)
 	}
 	return data, nil
 }
@@ -1056,11 +1182,17 @@ func (b *batchCatFile) readObjectSize(oid string) (int64, error) {
 	if len(fields) < 2 {
 		return 0, fmt.Errorf("unexpected batch header: %q", header)
 	}
+	if fields[0] != oid {
+		return 0, fmt.Errorf("unexpected batch object: got %q, want %q", fields[0], oid)
+	}
 	if fields[1] == "missing" {
 		return 0, fmt.Errorf("object %s missing", oid)
 	}
 	if len(fields) < 3 {
 		return 0, fmt.Errorf("unexpected batch header: %q", header)
+	}
+	if fields[1] != "blob" {
+		return 0, fmt.Errorf("unexpected batch object type: %q", fields[1])
 	}
 	size, err := strconv.ParseInt(fields[2], 10, 64)
 	if err != nil {
@@ -1082,8 +1214,8 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 	return ts, nil
 }
 
-// ReadTreeHEAD updates the git index to match HEAD. Must be called after HEAD
-// changes (branch switch, commit) so git status inside the mount is correct.
+// ReadTreeHEAD initializes the index during controlled clone or preparation.
+// Do not call it from delayed HEAD watchers: it can discard newer staged work.
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 	_, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD")
 	return err

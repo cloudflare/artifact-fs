@@ -427,6 +427,91 @@ func TestValidateCachedBlobKeepsFileOnVerifyError(t *testing.T) {
 	}
 }
 
+func TestEnsureHydratedRevalidatesChangedCacheFile(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
+	cachePath := filepath.Join(tmp, node.ObjectOID)
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &fakeBlobFetcher{payload: []byte("correct"), verifyOK: true}
+	h := New(fetcher)
+	h.Start(1, cfg)
+	defer h.Stop()
+
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachePath, []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Second)
+	if err := os.Chtimes(cachePath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	fetcher.mu.Lock()
+	fetcher.verifyOK = false
+	fetcher.mu.Unlock()
+
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); err != nil {
+		t.Fatal(err)
+	}
+	if fetcher.VerifyCalls() != 3 {
+		t.Fatalf("verify calls = %d, want 3", fetcher.VerifyCalls())
+	}
+	if fetcher.Calls() != 1 {
+		t.Fatalf("fetch calls = %d, want 1", fetcher.Calls())
+	}
+}
+
+func TestReadCachedBlobRejectsShortRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(path, []byte("short"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCachedBlob(path, 10, 10); err == nil {
+		t.Fatal("expected short cache read error")
+	}
+}
+
+func TestStopWaitsForWorkerAndRejectsLaterWork(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fetcher := &fakeBlobFetcher{payload: []byte("content"), fetchStarted: started, fetchWait: release}
+	h := New(fetcher)
+	h.Start(1, cfg)
+	go func() { _, _, _ = h.EnsureHydrated(context.Background(), cfg, node) }()
+	<-started
+
+	stopped := make(chan struct{})
+	go func() {
+		h.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while worker was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return after worker exited")
+	}
+	if _, _, err := h.EnsureHydrated(context.Background(), cfg, node); !errors.Is(err, ErrStopped) {
+		t.Fatalf("EnsureHydrated after Stop err = %v, want ErrStopped", err)
+	}
+	h.Enqueue(model.HydrationTask{RepoID: cfg.ID, ObjectOID: "other"})
+	if depth := h.QueueDepth(cfg.ID); depth != 0 {
+		t.Fatalf("queue depth after Stop = %d, want 0", depth)
+	}
+}
+
 func TestReadBlobRejectsKnownOversizedWithoutFetch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

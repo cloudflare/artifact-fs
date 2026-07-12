@@ -2,7 +2,9 @@ package overlay
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
+	"fmt"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -201,6 +203,38 @@ func TestRenameSamePathNoop(t *testing.T) {
 	}
 }
 
+func TestRenameThenRecreateSourceUsesDistinctBacking(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateFile(ctx, "a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "a.txt", 0, []byte("renamed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, "a.txt", 0, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.Get("a.txt")
+	b, _ := s.Get("b.txt")
+	if a.BackingPath == b.BackingPath {
+		t.Fatalf("recreated source and renamed destination share backing %q", a.BackingPath)
+	}
+	data, err := os.ReadFile(b.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "renamed" {
+		t.Fatalf("renamed content = %q, want renamed", data)
+	}
+}
+
 func TestRenameSameMissingPathReturnsNotExist(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
@@ -255,7 +289,8 @@ func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(s.backingPath("src"), 0); err != nil {
+	src, _ := s.Get("src")
+	if err := os.Chmod(src.BackingPath, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rename(ctx, "src", "dst"); err != nil {
@@ -356,7 +391,7 @@ func TestRenameOverlayDirectoryCleansUTF8DeletedDescendants(t *testing.T) {
 	}
 }
 
-func TestRenameOverlayDirectoryRollbackRestoresDeletedDescendants(t *testing.T) {
+func TestRenameOverlayDirectoryDoesNotDependOnDestinationBackingPath(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
@@ -369,18 +404,14 @@ func TestRenameOverlayDirectoryRollbackRestoresDeletedDescendants(t *testing.T) 
 	if err := s.Remove(ctx, "src/a.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(s.backingPath("dst"), 0o755); err != nil {
-		t.Fatal(err)
+	if err := s.Rename(ctx, "src", "dst"); err != nil {
+		t.Fatalf("Rename: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(s.backingPath("dst"), "file.txt"), []byte("busy"), 0o644); err != nil {
-		t.Fatal(err)
+	if _, ok := s.Get("src/a.txt"); ok {
+		t.Fatal("deleted descendant tombstone should be removed")
 	}
-
-	if err := s.Rename(ctx, "src", "dst"); err == nil {
-		t.Fatal("expected filesystem rename failure")
-	}
-	if e, ok := s.Get("src/a.txt"); !ok || !e.IsDeleted() {
-		t.Fatalf("deleted descendant tombstone should be restored on rollback, got %+v ok=%v", e, ok)
+	if e, ok := s.Get("dst"); !ok || e.Kind != model.OverlayKindMkdir {
+		t.Fatalf("destination entry = %+v, ok=%v", e, ok)
 	}
 }
 
@@ -426,7 +457,7 @@ func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
 	}
 }
 
-func TestReconcileRemovesSourceWhiteoutForStaleRename(t *testing.T) {
+func TestReconcilePreservesDivergentRenameAcrossBaseChange(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
@@ -450,15 +481,47 @@ func TestReconcileRemovesSourceWhiteoutForStaleRename(t *testing.T) {
 	if err := s.Reconcile(ctx, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := s.Get("b.txt"); ok {
-		t.Fatalf("stale rename should be removed, got %+v", e)
+	if e, ok := s.Get("b.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
+		t.Fatalf("divergent rename should be preserved against new base, got %+v ok=%v", e, ok)
 	}
-	if e, ok := s.Get("a.txt"); ok {
-		t.Fatalf("paired source whiteout should be removed with stale rename, got %+v", e)
+	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("source whiteout should remain with divergent rename, got %+v ok=%v", e, ok)
 	}
 }
 
-func TestReconcileRemovesIntermediateWhiteoutsForStaleChainedRename(t *testing.T) {
+func TestReconcileKeepsRenameWhenIdenticalSourceStillExists(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	payload := []byte("same")
+	oid := testBlobOID(payload)
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: oid}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "a.txt", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(path string) (model.BaseNode, bool) {
+		if path == "a.txt" || path == "b.txt" {
+			return model.BaseNode{Path: path, Type: "file", ObjectOID: oid}, true
+		}
+		return model.BaseNode{}, false
+	}
+	if err := s.Reconcile(ctx, lookup); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("b.txt"); !ok || e.Kind != model.OverlayKindRename {
+		t.Fatalf("rename should remain pending, got %+v ok=%v", e, ok)
+	}
+	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("source whiteout should remain pending, got %+v ok=%v", e, ok)
+	}
+}
+
+func TestReconcilePreservesDivergentChainedRenameAndRemovesIntermediateWhiteout(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
@@ -489,10 +552,14 @@ func TestReconcileRemovesIntermediateWhiteoutsForStaleChainedRename(t *testing.T
 	if err := s.Reconcile(ctx, baseLookup); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"a.txt", "b.txt", "c.txt"} {
-		if e, ok := s.Get(path); ok {
-			t.Fatalf("%s should be removed after stale chained rename reconcile, got %+v", path, e)
-		}
+	if e, ok := s.Get("a.txt"); !ok || !e.IsDeleted() {
+		t.Fatalf("source whiteout should remain, got %+v ok=%v", e, ok)
+	}
+	if e, ok := s.Get("b.txt"); ok {
+		t.Fatalf("intermediate whiteout should be removed, got %+v", e)
+	}
+	if e, ok := s.Get("c.txt"); !ok || e.Kind != model.OverlayKindRename || e.SourceOID != "bbb" {
+		t.Fatalf("final rename should remain rebased, got %+v ok=%v", e, ok)
 	}
 }
 
@@ -583,7 +650,8 @@ func TestSetMtimeRepairsGitTreeDirectoryMode(t *testing.T) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(s.backingPath("src"), 0); err != nil {
+	src, _ := s.Get("src")
+	if err := os.Chmod(src.BackingPath, 0); err != nil {
 		t.Fatal(err)
 	}
 	target := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
@@ -713,9 +781,9 @@ func TestReconcileAfterCommit(t *testing.T) {
 	baseLookup := func(path string) (model.BaseNode, bool) {
 		switch path {
 		case "foo.txt":
-			return model.BaseNode{Path: "foo.txt", ObjectOID: "bbb"}, true
+			return model.BaseNode{Path: "foo.txt", ObjectOID: testBlobOID([]byte("modified"))}, true
 		case "new.txt":
-			return model.BaseNode{Path: "new.txt", ObjectOID: "ccc"}, true
+			return model.BaseNode{Path: "new.txt", ObjectOID: testBlobOID(nil)}, true
 		default:
 			return model.BaseNode{}, false
 		}
@@ -734,6 +802,13 @@ func TestReconcileAfterCommit(t *testing.T) {
 	if _, ok := s.Get("gone.txt"); ok {
 		t.Fatal("gone.txt whiteout should be removed (not in base)")
 	}
+}
+
+func testBlobOID(data []byte) string {
+	h := sha1.New()
+	_, _ = fmt.Fprintf(h, "blob %d\x00", len(data))
+	_, _ = h.Write(data)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func TestReconcileKeepsValidEntries(t *testing.T) {

@@ -60,3 +60,29 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 		t.Fatalf("PrepareError = %q, want clone failed", got.PrepareError)
 	}
 }
+
+func TestSubsecondRefreshRoundTripsWithoutChangingPrepareState(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", RefreshInterval: time.Second, PrepareState: model.PrepareStatePreparing}
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRefresh(ctx, cfg.ID, 250*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RefreshInterval != 250*time.Millisecond {
+		t.Fatalf("refresh interval = %v, want 250ms", got.RefreshInterval)
+	}
+	if got.PrepareState != model.PrepareStatePreparing {
+		t.Fatalf("prepare state = %q, want preparing", got.PrepareState)
+	}
+}
