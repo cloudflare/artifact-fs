@@ -133,6 +133,41 @@ func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
 	}
 }
 
+func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*ArtifactFuse) error
+	}{
+		{name: "open", call: func(fs *ArtifactFuse) error {
+			return fs.OpenFile(context.Background(), &fuseops.OpenFileOp{})
+		}},
+		{name: "setattr", call: func(fs *ArtifactFuse) error {
+			return fs.SetInodeAttributes(context.Background(), &fuseops.SetInodeAttributesOp{})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := &ArtifactFuse{}
+			fs.handleOps.Lock()
+			done := make(chan struct{})
+			go func() {
+				_ = test.call(fs)
+				close(done)
+			}()
+			select {
+			case <-done:
+				t.Fatal("operation did not wait for namespace mutation")
+			case <-time.After(25 * time.Millisecond):
+			}
+			fs.handleOps.Unlock()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("operation remained blocked after namespace mutation")
+			}
+		})
+	}
+}
+
 func TestRootInodeAttributesUseStableResolverAttrsWhenReady(t *testing.T) {
 	resolver := &Resolver{
 		Snapshot: &fakeSnapshot{nodes: map[string]model.BaseNode{
@@ -443,6 +478,15 @@ func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfi
 		return "", 0, f.err
 	}
 	return f.path, f.size, nil
+}
+
+func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+	path, size, err := f.EnsureHydrated(ctx, repo, node)
+	if err != nil {
+		return nil, 0, err
+	}
+	file, err := os.Open(path)
+	return file, size, err
 }
 
 func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {

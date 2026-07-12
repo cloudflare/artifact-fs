@@ -385,14 +385,6 @@ func isTransientGitMessage(message string) bool {
 		"bytes of body are still expected",
 		"bytes of length header were received",
 		"early eof",
-		"index-pack failed",
-		"invalid index-pack output",
-		"pack has bad object at offset",
-		"pack is corrupted",
-		"premature end of pack file",
-		"inflate: data stream error",
-		"inflate returned",
-		"serious inflate inconsistency",
 	} {
 		if strings.Contains(message, symptom) {
 			return true

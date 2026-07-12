@@ -121,9 +121,20 @@ func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bo
 	return e, true, nil
 }
 
-// EnsureCopyOnWrite promotes a base file into the overlay. If the blob is not
-// cached, an empty overlay file is created and the caller must hydrate first.
 func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
+	var src *os.File
+	if base.ObjectOID != "" {
+		var err error
+		src, err = os.Open(filepath.Join(repo.BlobCacheDir, base.ObjectOID))
+		if err != nil {
+			return model.OverlayEntry{}, err
+		}
+		defer src.Close()
+	}
+	return s.EnsureCopyOnWriteFrom(ctx, repo, path, base, src)
+}
+
+func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, path string, base model.BaseNode, src *os.File) (model.OverlayEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok, err := s.Lookup(ctx, path); err != nil {
@@ -140,14 +151,11 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 		os.Remove(backing)
 		return model.OverlayEntry{}, err
 	}
-	if base.ObjectOID != "" {
-		cachePath := filepath.Join(repo.BlobCacheDir, base.ObjectOID)
-		if err := copyFileContents(cachePath, backing, os.FileMode(base.Mode)); err != nil && !os.IsNotExist(err) {
+	if src != nil {
+		if err := copyFileFrom(src, backing, os.FileMode(base.Mode)); err != nil {
 			os.Remove(backing)
 			return model.OverlayEntry{}, fmt.Errorf("copy-on-write %s: %w", path, err)
 		}
-		// If the cache file doesn't exist yet, the overlay starts empty and
-		// the caller must hydrate before writing.
 	}
 	if err := os.Chmod(backing, os.FileMode(base.Mode)); err != nil {
 		os.Remove(backing)
@@ -360,6 +368,11 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	} else if exists {
 		replaced = dst
 	}
+	if normalizedDirMode && newBacking != "" {
+		if err := os.Chmod(newBacking, os.FileMode(mode)); err != nil {
+			return err
+		}
+	}
 	// Backing files have stable identities independent of their visible path, so
 	// the database transaction is the complete rename operation.
 	now := time.Now().UnixNano()
@@ -390,11 +403,6 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return err
-	}
-	if normalizedDirMode && newBacking != "" {
-		if err := os.Chmod(newBacking, os.FileMode(mode)); err != nil {
-			return err
-		}
 	}
 	if replaced.BackingPath != "" && replaced.BackingPath != newBacking {
 		_ = os.RemoveAll(replaced.BackingPath)
@@ -812,11 +820,18 @@ func copyFileContents(src string, dst string, mode os.FileMode) error {
 		return err
 	}
 	defer f.Close()
+	return copyFileFrom(f, dst, mode)
+}
+
+func copyFileFrom(src *os.File, dst string, mode os.FileMode) error {
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	tf, err := os.OpenFile(dst, os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(tf, f); err != nil {
+	if _, err := io.Copy(tf, src); err != nil {
 		tf.Close()
 		return err
 	}

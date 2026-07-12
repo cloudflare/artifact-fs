@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -181,6 +182,7 @@ type OverlayStore interface {
 	Get(path string) (OverlayEntry, bool)
 	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
+	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoConfig, path string, base BaseNode, src *os.File) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
 	SyncFile(ctx context.Context, path string) error
@@ -200,6 +202,7 @@ type Hydrator interface {
 	Enqueue(task HydrationTask)
 	EnqueueBatch(tasks []HydrationTask)
 	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
+	OpenHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (*os.File, int64, error)
 	ReadBlob(ctx context.Context, repo RepoConfig, node BaseNode, maxBytes int64) ([]byte, error)
 	QueueDepth(repoID RepoID) int
 }

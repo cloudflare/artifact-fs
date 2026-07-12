@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	iofs "io/fs"
+	"os"
 	"testing"
 	"time"
 
@@ -62,6 +63,9 @@ func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, p
 	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, Mode: base.Mode, MtimeUnixNs: now, CtimeUnixNs: now, SourceOID: base.ObjectOID}
 	f.entries[e.Path] = e
 	return e, nil
+}
+func (f *fakeOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+	return f.EnsureCopyOnWrite(ctx, repo, path, base)
 }
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil

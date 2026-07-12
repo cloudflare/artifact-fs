@@ -3,6 +3,7 @@ package hydrator
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -462,6 +463,76 @@ func TestEnsureHydratedRevalidatesChangedCacheFile(t *testing.T) {
 	}
 	if fetcher.Calls() != 1 {
 		t.Fatalf("fetch calls = %d, want 1", fetcher.Calls())
+	}
+}
+
+func TestValidateCachedBlobRejectsReplacementDuringVerification(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
+	cachePath := filepath.Join(tmp, node.ObjectOID)
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fetcher := &fakeBlobFetcher{verifyOK: true, verifyStarted: started, verifyWait: release}
+	h := New(fetcher)
+	defer h.Stop()
+	type validation struct {
+		ok  bool
+		err error
+	}
+	done := make(chan validation, 1)
+	go func() {
+		_, ok, err := h.validateCachedBlob(context.Background(), cfg, cachePath, node)
+		done <- validation{ok: ok, err: err}
+	}()
+	<-started
+	replacement := filepath.Join(tmp, "replacement")
+	if err := os.WriteFile(replacement, []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, cachePath); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	result := <-done
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.ok {
+		t.Fatal("replacement cache file was trusted without verification")
+	}
+}
+
+func TestOpenHydratedPinsVerifiedCacheFile(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, ObjectOID: "blob", SizeState: "known", SizeBytes: 7}
+	cachePath := filepath.Join(tmp, node.ObjectOID)
+	if err := os.WriteFile(cachePath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := New(&fakeBlobFetcher{verifyOK: true})
+	file, _, err := h.OpenHydrated(context.Background(), cfg, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	replacement := filepath.Join(tmp, "replacement")
+	if err := os.WriteFile(replacement, []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, cachePath); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "content" {
+		t.Fatalf("opened data = %q, want verified content", data)
 	}
 }
 

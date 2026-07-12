@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -66,6 +67,61 @@ func (shortWriter) Write(p []byte) (int, error) {
 func TestWriteHookFieldRejectsShortWrite(t *testing.T) {
 	if err := writeHookField(shortWriter{}, "token"); err != io.ErrShortWrite {
 		t.Fatalf("err = %v, want io.ErrShortWrite", err)
+	}
+}
+
+type blockingMountedFS struct {
+	started    chan context.Context
+	release    chan struct{}
+	unmountErr error
+}
+
+func (m *blockingMountedFS) Join(ctx context.Context) error {
+	m.started <- ctx
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.release:
+		return nil
+	}
+}
+
+func (m *blockingMountedFS) Unmount() error { return m.unmountErr }
+
+func TestJoinRuntimeMountIsNotCanceledWithWorkers(t *testing.T) {
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	mfs := &blockingMountedFS{started: make(chan context.Context, 1), release: make(chan struct{})}
+	rt := &repoRuntime{ctx: runtimeCtx, mfs: mfs, stopping: true}
+	svc := &Service{}
+	svc.joinRuntimeMount(rt)
+	joinCtx := <-mfs.started
+	cancel()
+	select {
+	case <-joinCtx.Done():
+		t.Fatal("Join context was canceled with runtime workers")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(mfs.release)
+	select {
+	case <-rt.joinDone:
+	case <-time.After(time.Second):
+		t.Fatal("Join did not finish after mount drained")
+	}
+}
+
+func TestStopRuntimeKeepsWorkersAliveWhenUnmountFails(t *testing.T) {
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	rt := &repoRuntime{
+		ctx:    runtimeCtx,
+		cancel: cancel,
+		mfs:    &blockingMountedFS{unmountErr: errors.New("busy")},
+		cfg:    model.RepoConfig{Name: "repo"},
+	}
+	if err := (&Service{}).stopRuntime(rt); err == nil {
+		t.Fatal("expected unmount failure")
+	}
+	if err := runtimeCtx.Err(); err != nil {
+		t.Fatalf("runtime context canceled after failed unmount: %v", err)
 	}
 }
 

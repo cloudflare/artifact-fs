@@ -307,18 +307,13 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 	seq := fh.invalidateSeq
 	fh.mu.Unlock()
 
-	cachePath, gen, ok, err := engine.BaseCachePath(ctx, path)
+	f, gen, ok, err := engine.BaseCacheFile(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return engine.Read(ctx, path, off, size)
 	}
-	f, err := os.Open(cachePath)
-	if err != nil {
-		return nil, err
-	}
-
 	fh.mu.Lock()
 	if fh.invalidateSeq != seq || gen != engine.Resolver.Generation() {
 		fh.mu.Unlock()
@@ -457,7 +452,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 }
 
 func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uint32, size int64, nodeType string, mtime time.Time, ctime time.Time, err error) {
-	n, err := fs.resolver.ResolvePath(path)
+	n, generation, commitTime, err := fs.resolver.ResolvePathState(path)
 	if err != nil {
 		return 0, 0, "", time.Time{}, time.Time{}, err
 	}
@@ -480,15 +475,17 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 
 	// Base files use the HEAD commit timestamp for mtime so tools like
 	// make see a stable, meaningful value.
-	ct := fs.resolver.CommitTime()
+	ct := commitTime
 	if ct == 0 {
-		ct = fs.resolver.Generation() // fallback: commit time unavailable
+		ct = generation // fallback: commit time unavailable
 	}
 	mt := time.Unix(ct, 0)
 	return mode, size, n.Base.Type, mt, mt, nil
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -539,10 +536,8 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	if err != nil {
 		return err
 	}
-	gen := fs.resolver.Generation()
-	commitTime := fs.resolver.CommitTime()
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
-	entries, err := fs.resolver.ReaddirTypedAt(ctx, ref.Path, gen)
+	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(ctx, ref.Path)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -664,6 +659,8 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 }
 
 func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -683,15 +680,11 @@ func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) er
 			fh.cacheFile = f
 			fh.cacheGeneration = -1
 		} else {
-			cachePath, gen, base, err := fs.engine.BaseCachePath(ctx, ref.Path)
+			f, gen, base, err := fs.engine.BaseCacheFile(ctx, ref.Path)
 			if err != nil {
 				return syscall.EIO
 			}
 			if base {
-				f, err := os.Open(cachePath)
-				if err != nil {
-					return syscall.EIO
-				}
 				fh.cacheFile = f
 				fh.cacheGeneration = gen
 			}
@@ -776,6 +769,8 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 }
 
 func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err
@@ -970,6 +965,8 @@ func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) er
 }
 
 func (fs *ArtifactFuse) ReleaseFileHandle(_ context.Context, op *fuseops.ReleaseFileHandleOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	fs.mu.Lock()
 	fh := fs.fileHandles[op.Handle]
 	delete(fs.fileHandles, op.Handle)
