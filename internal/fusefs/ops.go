@@ -36,9 +36,13 @@ func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
 		return err
 	}
 	if n.Base.ObjectOID != "" {
-		if _, _, hErr := e.Hydrator.EnsureHydrated(ctx, e.Repo, n.Base); hErr != nil {
+		src, _, hErr := e.Hydrator.OpenHydrated(ctx, e.Repo, n.Base)
+		if hErr != nil {
 			return hErr
 		}
+		defer src.Close()
+		_, err = e.Overlay.EnsureCopyOnWriteFrom(ctx, e.Repo, path, n.Base, src)
+		return err
 	}
 	_, err = e.Overlay.EnsureCopyOnWrite(ctx, e.Repo, path, n.Base)
 	return err
@@ -59,38 +63,39 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 	if err != nil {
 		return nil, err
 	}
-	cachePath, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, n.Base)
+	f, _, err := e.Hydrator.OpenHydrated(ctx, e.Repo, n.Base)
 	if err != nil {
 		return nil, err
 	}
-	return readFileChunk(cachePath, off, size)
+	defer f.Close()
+	return readFileChunkFrom(f, off, size)
 }
 
-func (e *Engine) BaseCachePath(ctx context.Context, path string) (string, int64, bool, error) {
+func (e *Engine) BaseCacheFile(ctx context.Context, path string) (*os.File, int64, bool, error) {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
 	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
-		return "", 0, false, err
+		return nil, 0, false, err
 	} else if ok {
 		if ov.IsDeleted() {
-			return "", 0, false, os.ErrNotExist
+			return nil, 0, false, os.ErrNotExist
 		}
-		return "", 0, false, nil
+		return nil, 0, false, nil
 	}
 	gen := e.Resolver.Generation()
 	n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, path)
 	if err != nil {
-		return "", 0, false, err
+		return nil, 0, false, err
 	}
 	if !ok {
-		return "", 0, false, fs.ErrNotExist
+		return nil, 0, false, fs.ErrNotExist
 	}
-	cachePath, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, n)
+	f, _, err := e.Hydrator.OpenHydrated(ctx, e.Repo, n)
 	if err != nil {
-		return "", 0, false, err
+		return nil, 0, false, err
 	}
-	return cachePath, gen, true, nil
+	return f, gen, true, nil
 }
 
 func (e *Engine) Write(ctx context.Context, path string, off int64, data []byte) (int, error) {

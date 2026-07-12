@@ -47,6 +47,15 @@ func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig
 	return f.path, 0, nil
 }
 
+func (f *fakeBatchHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+	path, size, err := f.EnsureHydrated(ctx, repo, node)
+	if err != nil {
+		return nil, 0, err
+	}
+	file, err := os.Open(path)
+	return file, size, err
+}
+
 func (f *fakeBatchHydrator) ReadBlob(context.Context, model.RepoConfig, model.BaseNode, int64) ([]byte, error) {
 	return nil, nil
 }
@@ -78,6 +87,10 @@ func (o *blockingCopyOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoC
 	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, BackingPath: o.backingPath, Mode: base.Mode, MtimeUnixNs: now, CtimeUnixNs: now, SourceOID: base.ObjectOID}
 	o.entries[e.Path] = e
 	return e, nil
+}
+
+func (o *blockingCopyOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode, _ *os.File) (model.OverlayEntry, error) {
+	return o.EnsureCopyOnWrite(ctx, repo, path, base)
 }
 
 func (o *blockingCopyOverlay) WriteFile(_ context.Context, path string, off int64, data []byte) (int, error) {

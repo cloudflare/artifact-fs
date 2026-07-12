@@ -53,6 +53,8 @@ type Service struct {
 	preparing            map[model.RepoID]int64
 	prepareSeq           int64
 	mountFailures        map[model.RepoID]*mountFailure
+	prepareWorkers       sync.WaitGroup
+	closing              bool
 }
 
 type mountFailure struct {
@@ -80,6 +82,7 @@ type repoRuntime struct {
 	detached bool
 	headMu   sync.Mutex
 	workers  sync.WaitGroup
+	mounts   sync.WaitGroup
 }
 
 type aheadBehind struct {
@@ -133,6 +136,7 @@ func (s *Service) hydrationWorkers() int {
 
 func (s *Service) Close() error {
 	s.mu.Lock()
+	s.closing = true
 	ids := make([]model.RepoID, 0, len(s.running))
 	for id := range s.running {
 		ids = append(ids, id)
@@ -147,6 +151,7 @@ func (s *Service) Close() error {
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
+	s.prepareWorkers.Wait()
 	s.git.Close()
 	return s.registry.Close()
 }
@@ -582,6 +587,15 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig) 
 			return nil, "", "", 0, err
 		}
 	}
+	s.mu.Lock()
+	runtimeMounted := s.running[cfg.ID] != nil
+	s.mu.Unlock()
+	if !runtimeMounted {
+		if err := snap.PruneGenerations(ctx, gen); err != nil {
+			snap.Close()
+			return nil, "", "", 0, err
+		}
+	}
 	return snap, headOID, headRef, gen, nil
 }
 
@@ -738,6 +752,10 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 
 func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) {
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
 	if _, ok := s.preparing[cfg.ID]; ok {
 		s.mu.Unlock()
 		return
@@ -745,13 +763,21 @@ func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) 
 	s.prepareSeq++
 	token := s.prepareSeq
 	workerCtx := ctx
-	if rt := s.running[cfg.ID]; rt != nil && rt.ctx != nil {
+	rt := s.running[cfg.ID]
+	trackedRuntime := rt != nil && rt.ctx != nil && !rt.stopping
+	if trackedRuntime {
 		workerCtx = rt.ctx
+		rt.workers.Add(1)
 	}
 	s.preparing[cfg.ID] = token
+	s.prepareWorkers.Add(1)
 	s.mu.Unlock()
 
 	go func() {
+		defer s.prepareWorkers.Done()
+		if trackedRuntime {
+			defer rt.workers.Done()
+		}
 		defer func() {
 			s.mu.Lock()
 			if s.preparing[cfg.ID] == token {
@@ -863,6 +889,7 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	if closeSnap {
 		defer snap.Close()
 	}
+	_, _, prevGen, _ := snap.ReadState(ctx)
 	gen, _, err := s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
 	if err != nil {
 		return fail(err)
@@ -884,6 +911,11 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	if err := s.completePreparedRuntime(ctx, cfg, headOID, headRef, gen); err != nil {
 		return fail(err)
 	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	if err := snap.PruneGenerations(cleanupCtx, min(prevGen, gen-1)); err != nil {
+		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
+	}
+	cleanupCancel()
 	s.configureStatusOptimization(ctx, cfg)
 	return nil
 }
@@ -939,14 +971,25 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return rt.snapshot.LookupNode(ctx, gen, path)
 	}
-	if err := rt.overlay.ReconcileChecked(ctx, baseLookup); err != nil {
+	commitTime := int64(0)
+	if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
+		commitTime = ts
+	} else {
+		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", err)
+	}
+	if err := rt.resolver.Transition(func() error {
+		if err := rt.overlay.ReconcileChecked(ctx, baseLookup); err != nil {
+			return err
+		}
+		rt.resolver.SetCommitTime(commitTime)
+		rt.resolver.SetGeneration(gen)
+		return nil
+	}); err != nil {
 		return err
 	}
 	if !s.prepareConfigStillCurrent(ctx, cfg) {
 		return registry.ErrRepoChanged
 	}
-	s.refreshCommitTime(ctx, cfg, headOID, rt.resolver, "commit timestamp unavailable")
-	rt.resolver.SetGeneration(gen)
 	s.mu.Lock()
 	if s.running[cfg.ID] != rt || !samePrepareConfig(rt.cfg, cfg) {
 		s.mu.Unlock()
@@ -1057,10 +1100,17 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
 		return rt.snapshot.LookupNode(ctx, gen, path)
 	}
+	commitTime := int64(0)
+	if ts, timestampErr := s.git.CommitTimestamp(ctx, cfg, oid); timestampErr == nil {
+		commitTime = ts
+	} else {
+		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", timestampErr)
+	}
 	err = rt.resolver.Transition(func() error {
 		if err := rt.overlay.ReconcileChecked(ctx, baseLookup); err != nil {
 			return err
 		}
+		rt.resolver.SetCommitTime(commitTime)
 		rt.resolver.SetGeneration(gen)
 		return nil
 	})
@@ -1069,8 +1119,6 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		s.scheduleHEADRetry(rt)
 		return
 	}
-
-	s.refreshCommitTime(ctx, cfg, oid, rt.resolver, "commit timestamp unavailable")
 
 	s.mu.Lock()
 	if s.running[cfg.ID] == rt {
@@ -1402,7 +1450,7 @@ func (s *Service) joinRuntimeMount(rt *repoRuntime) {
 	rt.joinDone = done
 	s.mu.Unlock()
 	go func() {
-		_ = mfs.Join(rt.ctx)
+		_ = mfs.Join(context.Background())
 		close(done)
 		s.mu.Lock()
 		if !rt.stopping && !rt.detached && rt.mfs == mfs {
@@ -1426,7 +1474,9 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 		return
 	}
 	cfg, resolver, engine, gate := rt.cfg, rt.resolver, rt.engine, rt.gate
+	rt.mounts.Add(1)
 	s.mu.Unlock()
+	defer rt.mounts.Done()
 
 	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
 	s.mu.Lock()
@@ -1448,15 +1498,19 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	if s.running[cfg.ID] != rt || rt.mfs != nil {
 		s.mu.Unlock()
 		_ = mfs.Unmount()
+		_ = mfs.Join(context.Background())
 		return
 	}
 	rt.mfs = mfs
 	delete(s.mountFailures, cfg.ID)
-	if rt.state.State == repoStateDegraded {
+	stopping := rt.stopping || rt.ctx.Err() != nil
+	if !stopping && rt.state.State == repoStateDegraded {
 		rt.state.State = repoStateMounted
 	}
 	s.mu.Unlock()
-	s.configureStatusOptimization(rt.ctx, cfg)
+	if !stopping {
+		s.configureStatusOptimization(rt.ctx, cfg)
+	}
 	s.joinRuntimeMount(rt)
 }
 
@@ -1600,11 +1654,18 @@ func (s *Service) unmount(id model.RepoID) error {
 }
 
 func (s *Service) stopRuntime(rt *repoRuntime) error {
-	if rt.mfs != nil && !rt.detached {
-		if err := rt.mfs.Unmount(); err != nil {
+	rt.mounts.Wait()
+	s.mu.Lock()
+	mfs := rt.mfs
+	detached := rt.detached
+	s.mu.Unlock()
+	if mfs != nil && !detached {
+		if err := mfs.Unmount(); err != nil {
 			return fmt.Errorf("unmount %s: %w", rt.cfg.Name, err)
 		}
+		s.mu.Lock()
 		rt.detached = true
+		s.mu.Unlock()
 	}
 	if rt.cancel != nil {
 		rt.cancel()
@@ -1612,16 +1673,20 @@ func (s *Service) stopRuntime(rt *repoRuntime) error {
 	if rt.gate != nil {
 		rt.gate.MarkFailed(context.Canceled)
 	}
-	if rt.joinDone != nil {
+	rt.workers.Wait()
+	s.joinRuntimeMount(rt)
+	s.mu.Lock()
+	joinDone := rt.joinDone
+	s.mu.Unlock()
+	if joinDone != nil {
 		timer := time.NewTimer(30 * time.Second)
 		defer timer.Stop()
 		select {
-		case <-rt.joinDone:
+		case <-joinDone:
 		case <-timer.C:
 			return fmt.Errorf("timed out draining unmounted repo %s", rt.cfg.Name)
 		}
 	}
-	rt.workers.Wait()
 	if rt.hydrator != nil {
 		rt.hydrator.Stop()
 	}

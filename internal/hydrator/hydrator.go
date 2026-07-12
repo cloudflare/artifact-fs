@@ -231,6 +231,35 @@ func (s *Service) awaitHydration(ctx context.Context, key string, ch chan result
 	}
 }
 
+func (s *Service) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+	key := taskKey(repo.ID, node.ObjectOID)
+	for {
+		cachePath, size, err := s.EnsureHydrated(ctx, repo, node)
+		if err != nil {
+			return nil, 0, err
+		}
+		f, err := os.Open(cachePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				s.clearVerified(key)
+				continue
+			}
+			return nil, 0, err
+		}
+		st, err := f.Stat()
+		if err == nil && s.isVerified(key, st) {
+			return f, size, nil
+		}
+		_ = f.Close()
+		if err != nil {
+			return nil, 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+	}
+}
+
 func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node model.BaseNode, maxBytes int64) ([]byte, error) {
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("negative max bytes: %d", maxBytes)
@@ -246,12 +275,36 @@ func (s *Service) ReadBlob(ctx context.Context, repo model.RepoConfig, node mode
 	} else if st.Size() > maxBytes {
 		return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
 	}
-	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
-		return nil, err
-	} else if ok {
-		return readCachedBlob(cachePath, size, maxBytes)
+	key := taskKey(repo.ID, node.ObjectOID)
+	for {
+		size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
+		}
+		f, err := os.Open(cachePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		st, statErr := f.Stat()
+		if statErr == nil && s.isVerified(key, st) {
+			data, readErr := readCachedBlobFrom(f, size, maxBytes)
+			_ = f.Close()
+			return data, readErr
+		}
+		_ = f.Close()
+		if statErr != nil {
+			return nil, statErr
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
-	return s.fetcher.ReadBlob(ctx, repo, node.ObjectOID, maxBytes)
 }
 
 func readCachedBlob(cachePath string, size int64, maxBytes int64) ([]byte, error) {
@@ -263,6 +316,10 @@ func readCachedBlob(cachePath string, size int64, maxBytes int64) ([]byte, error
 		return nil, err
 	}
 	defer f.Close()
+	return readCachedBlobFrom(f, size, maxBytes)
+}
+
+func readCachedBlobFrom(f *os.File, size int64, maxBytes int64) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
 		return nil, err
@@ -288,11 +345,12 @@ func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig,
 		s.clearVerified(taskKey(repo.ID, node.ObjectOID))
 		return 0, false, nil
 	}
+	verifiedFile := st
 	key := taskKey(repo.ID, node.ObjectOID)
 	if s.isVerified(key, st) {
 		return st.Size(), true, nil
 	}
-	ok, err = s.verifyBlobOnce(ctx, key, cachePath, func(verifyCtx context.Context) (bool, error) {
+	ok, err = s.verifyBlobOnce(ctx, key, verifiedFile, cachePath, func(verifyCtx context.Context) (bool, error) {
 		return s.fetcher.VerifyBlob(verifyCtx, repo, node.ObjectOID, cachePath)
 	})
 	if err != nil {
@@ -312,6 +370,10 @@ func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig,
 		}
 		return 0, false, err
 	}
+	if !sameFileInfo(verifiedFile, st) {
+		s.clearVerified(key)
+		return 0, false, nil
+	}
 	s.rememberVerified(key, st)
 	return st.Size(), true, nil
 }
@@ -323,11 +385,15 @@ func (s *Service) isVerified(key string, current os.FileInfo) bool {
 	if !ok {
 		return false
 	}
-	if previous.Size() != current.Size() || !previous.ModTime().Equal(current.ModTime()) || !os.SameFile(previous, current) {
+	if !sameFileInfo(previous, current) {
 		delete(s.verified, key)
 		return false
 	}
 	return true
+}
+
+func sameFileInfo(a, b os.FileInfo) bool {
+	return a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && os.SameFile(a, b)
 }
 
 func (s *Service) rememberVerified(key string, info os.FileInfo) {
@@ -342,7 +408,7 @@ func (s *Service) clearVerified(key string) {
 	delete(s.verified, key)
 }
 
-func (s *Service) verifyBlobOnce(ctx context.Context, key string, cachePath string, verify func(context.Context) (bool, error)) (bool, error) {
+func (s *Service) verifyBlobOnce(ctx context.Context, key string, file os.FileInfo, cachePath string, verify func(context.Context) (bool, error)) (bool, error) {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
@@ -358,7 +424,7 @@ func (s *Service) verifyBlobOnce(ctx context.Context, key string, cachePath stri
 	if first {
 		go func() {
 			defer s.background.Done()
-			s.runVerification(key, cachePath, verify)
+			s.runVerification(key, file, cachePath, verify)
 		}()
 	}
 	return s.awaitVerification(ctx, key, ch)
@@ -376,7 +442,7 @@ func (s *Service) awaitVerification(ctx context.Context, key string, ch chan ver
 	}
 }
 
-func (s *Service) runVerification(key string, cachePath string, verify func(context.Context) (bool, error)) {
+func (s *Service) runVerification(key string, file os.FileInfo, cachePath string, verify func(context.Context) (bool, error)) {
 	verifyCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -388,13 +454,17 @@ func (s *Service) runVerification(key string, cachePath string, verify func(cont
 	}()
 
 	ok, err := verify(verifyCtx)
+	if err == nil && ok {
+		current, statErr := os.Stat(cachePath)
+		if statErr != nil || !sameFileInfo(file, current) {
+			ok = false
+		}
+	}
 	r := verifyResult{ok: ok, err: err}
 
 	s.mu.Lock()
 	if err == nil && ok {
-		if st, statErr := os.Stat(cachePath); statErr == nil {
-			s.verified[key] = st
-		}
+		s.verified[key] = file
 	}
 	waiters := s.verifying.take(key)
 	s.mu.Unlock()

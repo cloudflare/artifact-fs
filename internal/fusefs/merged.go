@@ -65,6 +65,13 @@ func (r *Resolver) ResolvePath(path string) (ResolvedNode, error) {
 	return r.resolvePath(path)
 }
 
+func (r *Resolver) ResolvePathState(path string) (ResolvedNode, int64, int64, error) {
+	r.transition.RLock()
+	defer r.transition.RUnlock()
+	n, err := r.resolvePath(path)
+	return n, r.Generation(), r.CommitTime(), err
+}
+
 func (r *Resolver) resolvePath(path string) (ResolvedNode, error) {
 	path = model.CleanPath(path)
 	if ov, ok, err := r.Overlay.Lookup(context.Background(), path); err != nil {
@@ -148,6 +155,14 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	r.transition.RLock()
 	defer r.transition.RUnlock()
 	return r.readdirTypedAt(ctx, path, r.Generation())
+}
+
+func (r *Resolver) ReaddirSnapshot(ctx context.Context, path string) ([]ReaddirEntry, int64, int64, error) {
+	r.transition.RLock()
+	defer r.transition.RUnlock()
+	gen := r.Generation()
+	entries, err := r.readdirTypedAt(ctx, path, gen)
+	return entries, gen, r.CommitTime(), err
 }
 
 func (r *Resolver) ReaddirTypedAt(ctx context.Context, path string, generation int64) ([]ReaddirEntry, error) {

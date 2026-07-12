@@ -5,6 +5,7 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 	"testing"
 
@@ -29,6 +30,10 @@ func (f *fakeSymlinkHydrator) EnqueueBatch([]model.HydrationTask) {}
 func (f *fakeSymlinkHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, _ model.BaseNode) (string, int64, error) {
 	f.calls++
 	return f.cachePath, f.size, f.err
+}
+
+func (f *fakeSymlinkHydrator) OpenHydrated(context.Context, model.RepoConfig, model.BaseNode) (*os.File, int64, error) {
+	return nil, 0, f.err
 }
 
 func (f *fakeSymlinkHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {

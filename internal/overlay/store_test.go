@@ -33,6 +33,13 @@ func testStore(t *testing.T) (*Store, model.RepoConfig) {
 	return s, cfg
 }
 
+func cacheTestBlob(t *testing.T, cfg model.RepoConfig, oid string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateAndGet(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
@@ -130,6 +137,7 @@ func TestRenameDBFirst(t *testing.T) {
 	ctx := context.Background()
 
 	base := model.BaseNode{Path: "old.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "old.txt", base); err != nil {
 		t.Fatal(err)
 	}
@@ -419,6 +427,7 @@ func TestRenameChainPreservesOriginalSourceForReconcile(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
@@ -461,6 +470,7 @@ func TestReconcilePreservesDivergentRenameAcrossBaseChange(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
@@ -525,6 +535,7 @@ func TestReconcilePreservesDivergentChainedRenameAndRemovesIntermediateWhiteout(
 	s, cfg := testStore(t)
 	ctx := context.Background()
 	base := model.BaseNode{Path: "a.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 
 	if _, err := s.EnsureCopyOnWrite(ctx, cfg, "a.txt", base); err != nil {
 		t.Fatal(err)
@@ -675,6 +686,30 @@ func TestSetMtimeRepairsGitTreeDirectoryMode(t *testing.T) {
 	}
 }
 
+func TestRenameRepairsDirectoryModeBeforeCommitting(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src, _ := s.Get("src")
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=? WHERE path=?`, 0o40000, "src"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src.BackingPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Rename(ctx, "src", "dst"); err == nil {
+		t.Fatal("expected backing mode repair failure")
+	}
+	if _, ok := s.Get("src"); !ok {
+		t.Fatal("source entry was removed despite rename failure")
+	}
+	if _, ok := s.Get("dst"); ok {
+		t.Fatal("destination entry was committed despite rename failure")
+	}
+}
+
 func TestTruncateUpdatesSizeAndTimes(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
@@ -765,6 +800,7 @@ func TestReconcileAfterCommit(t *testing.T) {
 	// Simulate: user modified foo.txt (source_oid="aaa") then committed.
 	// After commit, the base has foo.txt with a new OID ("bbb").
 	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
 	s.WriteFile(ctx, "foo.txt", 0, []byte("modified"))
 
@@ -817,6 +853,7 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 
 	// Modify foo.txt from base OID "aaa" -- but base hasn't changed.
 	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, base.ObjectOID)
 	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
 	s.WriteFile(ctx, "foo.txt", 0, []byte("local change"))
 

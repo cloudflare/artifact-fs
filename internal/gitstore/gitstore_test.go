@@ -782,13 +782,19 @@ func TestTransientGitErrorIndependentSignatures(t *testing.T) {
 		"fetch-pack: 12 bytes of body are still expected",
 		"fetch-pack: 3 bytes of length header were received",
 		"fatal: early EOF",
-		"fatal: index-pack failed",
 	} {
 		t.Run(message, func(t *testing.T) {
 			if !isTransientGitError(errors.New(message)) {
 				t.Fatalf("isTransientGitError(%q) = false, want true", message)
 			}
 		})
+	}
+}
+
+func TestTransientGitErrorRejectsStandaloneLocalIndexPackFailure(t *testing.T) {
+	message := "fatal: unable to write file: Input/output error\nfatal: index-pack failed"
+	if isTransientGitError(errors.New(message)) {
+		t.Fatalf("isTransientGitError(%q) = true, want false", message)
 	}
 }
 
