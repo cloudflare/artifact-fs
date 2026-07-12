@@ -35,6 +35,7 @@ type ArtifactFuse struct {
 	gitfileContent []byte // synthesized .git gitfile, computed once
 
 	mu           sync.RWMutex
+	handleOps    sync.RWMutex
 	inodes       map[fuseops.InodeID]*InodeRef
 	pathToInode  map[string]fuseops.InodeID
 	nextInodeID  fuseops.InodeID
@@ -68,6 +69,7 @@ type FileHandle struct {
 	cacheFile       *os.File
 	cacheGeneration int64
 	invalidateSeq   uint64
+	detached        bool
 }
 
 // ReaddirEntry holds child metadata, avoiding per-child Getattr or snapshot lookups.
@@ -189,7 +191,10 @@ func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	fs.mu.RLock()
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
-		if fh.path == path {
+		fh.mu.Lock()
+		matches := fh.path == path
+		fh.mu.Unlock()
+		if matches {
 			handles = append(handles, fh)
 		}
 	}
@@ -199,10 +204,94 @@ func (fs *ArtifactFuse) closeCachedFilesForPath(path string) {
 	}
 }
 
+func (fs *ArtifactFuse) pinOpenHandles(path string) error {
+	ov, ok, err := fs.engine.Overlay.Lookup(context.Background(), path)
+	if err != nil || !ok || ov.IsDeleted() || ov.BackingPath == "" {
+		return err
+	}
+	fs.mu.RLock()
+	var handles []*FileHandle
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		matches := fh.path == path
+		fh.mu.Unlock()
+		if matches {
+			handles = append(handles, fh)
+		}
+	}
+	fs.mu.RUnlock()
+	for _, fh := range handles {
+		fh.mu.Lock()
+		if fh.cacheFile == nil || fh.cacheGeneration != -1 {
+			f, openErr := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
+			if openErr != nil {
+				f, openErr = os.Open(ov.BackingPath)
+				if openErr != nil {
+					fh.mu.Unlock()
+					return openErr
+				}
+			}
+			old := fh.cacheFile
+			fh.cacheFile = f
+			fh.cacheGeneration = -1
+			if old != nil {
+				_ = old.Close()
+			}
+		}
+		fh.mu.Unlock()
+	}
+	return nil
+}
+
+func (fs *ArtifactFuse) detachOpenHandles(path string) {
+	fs.mu.RLock()
+	var handles []*FileHandle
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		matches := fh.path == path
+		fh.mu.Unlock()
+		if matches {
+			handles = append(handles, fh)
+		}
+	}
+	fs.mu.RUnlock()
+	for _, fh := range handles {
+		fh.mu.Lock()
+		fh.detached = true
+		fh.mu.Unlock()
+	}
+}
+
+func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
+	fs.mu.RLock()
+	var handles []*FileHandle
+	for _, fh := range fs.fileHandles {
+		fh.mu.Lock()
+		matches := fh.path == oldPath
+		fh.mu.Unlock()
+		if matches {
+			handles = append(handles, fh)
+		}
+	}
+	fs.mu.RUnlock()
+	for _, fh := range handles {
+		fh.mu.Lock()
+		fh.path = newPath
+		fh.mu.Unlock()
+	}
+}
+
 func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size int) ([]byte, error) {
+	fh.mu.Lock()
+	path := fh.path
+	if fh.detached && fh.cacheFile != nil {
+		defer fh.mu.Unlock()
+		return readFileChunkFrom(fh.cacheFile, off, size)
+	}
+	fh.mu.Unlock()
 	currentGen := engine.Resolver.Generation()
 	fh.mu.Lock()
-	if fh.cacheFile != nil && fh.cacheGeneration == currentGen {
+	if fh.cacheFile != nil && (fh.cacheGeneration == -1 || fh.cacheGeneration == currentGen) {
 		defer fh.mu.Unlock()
 		return readFileChunkFrom(fh.cacheFile, off, size)
 	}
@@ -218,12 +307,12 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 	seq := fh.invalidateSeq
 	fh.mu.Unlock()
 
-	cachePath, gen, ok, err := engine.BaseCachePath(ctx, fh.path)
+	cachePath, gen, ok, err := engine.BaseCachePath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return engine.Read(ctx, fh.path, off, size)
+		return engine.Read(ctx, path, off, size)
 	}
 	f, err := os.Open(cachePath)
 	if err != nil {
@@ -234,7 +323,7 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 	if fh.invalidateSeq != seq || gen != engine.Resolver.Generation() {
 		fh.mu.Unlock()
 		_ = f.Close()
-		return engine.Read(ctx, fh.path, off, size)
+		return engine.Read(ctx, path, off, size)
 	}
 	if fh.cacheFile != nil && fh.cacheGeneration == gen {
 		_ = f.Close()
@@ -252,10 +341,24 @@ func (fh *FileHandle) read(ctx context.Context, engine *Engine, off int64, size 
 
 func (fh *FileHandle) closeCachedFile() {
 	fh.mu.Lock()
+	if fh.detached {
+		fh.mu.Unlock()
+		return
+	}
 	f := fh.cacheFile
 	fh.cacheFile = nil
 	fh.cacheGeneration = 0
 	fh.invalidateSeq++
+	fh.mu.Unlock()
+	if f != nil {
+		_ = f.Close()
+	}
+}
+
+func (fh *FileHandle) release() {
+	fh.mu.Lock()
+	f := fh.cacheFile
+	fh.cacheFile = nil
 	fh.mu.Unlock()
 	if f != nil {
 		_ = f.Close()
@@ -560,12 +663,40 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 	return nil
 }
 
-func (fs *ArtifactFuse) OpenFile(_ context.Context, op *fuseops.OpenFileOp) error {
+func (fs *ArtifactFuse) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
 	}
 	fh := &FileHandle{inode: ref, path: ref.Path}
+	if ref.Path != ".git" {
+		if ov, ok, err := fs.engine.Overlay.Lookup(ctx, ref.Path); err != nil {
+			return syscall.EIO
+		} else if ok && !ov.IsDeleted() {
+			f, err := os.OpenFile(ov.BackingPath, os.O_RDWR, 0)
+			if err != nil {
+				f, err = os.Open(ov.BackingPath)
+			}
+			if err != nil {
+				return syscall.EIO
+			}
+			fh.cacheFile = f
+			fh.cacheGeneration = -1
+		} else {
+			cachePath, gen, base, err := fs.engine.BaseCachePath(ctx, ref.Path)
+			if err != nil {
+				return syscall.EIO
+			}
+			if base {
+				f, err := os.Open(cachePath)
+				if err != nil {
+					return syscall.EIO
+				}
+				fh.cacheFile = f
+				fh.cacheGeneration = gen
+			}
+		}
+	}
 	fs.mu.Lock()
 	handle := fs.nextHandleID
 	fs.nextHandleID++
@@ -577,12 +708,17 @@ func (fs *ArtifactFuse) OpenFile(_ context.Context, op *fuseops.OpenFileOp) erro
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	fh, err := fs.fileHandle(op.Handle)
 	if err != nil {
 		return err
 	}
 
-	if fh.path == ".git" {
+	fh.mu.Lock()
+	path := fh.path
+	fh.mu.Unlock()
+	if path == ".git" {
 		start := int(op.Offset)
 		if start >= len(fs.gitfileContent) {
 			op.BytesRead = 0
@@ -607,16 +743,35 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 }
 
 func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	fh, err := fs.fileHandle(op.Handle)
 	if err != nil {
 		return err
 	}
-	fs.closeCachedFilesForPath(fh.path)
-	_, err = fs.engine.Write(ctx, fh.path, op.Offset, op.Data)
+	fh.mu.Lock()
+	if fh.detached {
+		f := fh.cacheFile
+		fh.mu.Unlock()
+		if f == nil {
+			return syscall.EIO
+		}
+		if _, err := f.WriteAt(op.Data, op.Offset); err != nil {
+			return syscall.EIO
+		}
+		return nil
+	}
+	path := fh.path
+	fh.mu.Unlock()
+	fs.closeCachedFilesForPath(path)
+	n, err := fs.engine.Write(ctx, path, op.Offset, op.Data)
 	if err != nil {
 		return syscall.EIO
 	}
-	fs.closeCachedFilesForPath(fh.path)
+	if n != len(op.Data) {
+		return syscall.EIO
+	}
+	fs.closeCachedFilesForPath(path)
 	return nil
 }
 
@@ -678,19 +833,28 @@ func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 }
 
 func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
+	fs.handleOps.Lock()
+	defer fs.handleOps.Unlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err
 	}
-	fs.closeCachedFilesForPath(childPath)
+	if err := fs.engine.ensureOverlay(ctx, childPath); err != nil {
+		return syscall.EIO
+	}
+	if err := fs.pinOpenHandles(childPath); err != nil {
+		return syscall.EIO
+	}
 	if err := fs.engine.Unlink(ctx, childPath); err != nil {
 		return syscall.EIO
 	}
-	fs.closeCachedFilesForPath(childPath)
+	fs.detachOpenHandles(childPath)
 	return nil
 }
 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
+	fs.handleOps.Lock()
+	defer fs.handleOps.Unlock()
 	oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
 	if err != nil {
 		return err
@@ -701,16 +865,31 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
-	fs.closeCachedFilesForPath(oldPath)
-	fs.closeCachedFilesForPath(newPath)
+	if oldPath == newPath {
+		return nil
+	}
+	if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
+		return syscall.EIO
+	}
+	if err := fs.pinOpenHandles(oldPath); err != nil {
+		return syscall.EIO
+	}
+	if _, err := fs.resolver.ResolvePath(newPath); err == nil {
+		if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+			return syscall.EIO
+		}
+		if err := fs.pinOpenHandles(newPath); err != nil {
+			return syscall.EIO
+		}
+	}
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		if errors.Is(err, iofs.ErrInvalid) {
 			return syscall.ENOTSUP
 		}
 		return syscall.EIO
 	}
-	fs.closeCachedFilesForPath(oldPath)
-	fs.closeCachedFilesForPath(newPath)
+	fs.detachOpenHandles(newPath)
+	fs.moveOpenHandles(oldPath, newPath)
 	return nil
 }
 
@@ -762,7 +941,31 @@ func (fs *ArtifactFuse) FlushFile(_ context.Context, _ *fuseops.FlushFileOp) err
 	return nil
 }
 
-func (fs *ArtifactFuse) SyncFile(_ context.Context, _ *fuseops.SyncFileOp) error {
+func (fs *ArtifactFuse) SyncFile(ctx context.Context, op *fuseops.SyncFileOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
+	fh, err := fs.fileHandle(op.Handle)
+	if err != nil {
+		return err
+	}
+	fh.mu.Lock()
+	if fh.detached {
+		f := fh.cacheFile
+		fh.mu.Unlock()
+		if f == nil || f.Sync() != nil {
+			return syscall.EIO
+		}
+		return nil
+	}
+	path := fh.path
+	if fh.cacheFile != nil && fh.cacheGeneration >= 0 {
+		fh.mu.Unlock()
+		return nil
+	}
+	fh.mu.Unlock()
+	if err := fs.engine.Sync(ctx, path); err != nil {
+		return syscall.EIO
+	}
 	return nil
 }
 
@@ -772,7 +975,7 @@ func (fs *ArtifactFuse) ReleaseFileHandle(_ context.Context, op *fuseops.Release
 	delete(fs.fileHandles, op.Handle)
 	fs.mu.Unlock()
 	if fh != nil {
-		fh.closeCachedFile()
+		fh.release()
 	}
 	return nil
 }

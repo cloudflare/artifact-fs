@@ -173,14 +173,17 @@ type GitStore interface {
 type SnapshotStore interface {
 	PublishGeneration(ctx context.Context, headOID string, ref string, nodes []BaseNode) (generation int64, err error)
 	GetNode(generation int64, path string) (BaseNode, bool)
+	LookupNode(ctx context.Context, generation int64, path string) (BaseNode, bool, error)
 	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
 type OverlayStore interface {
 	Get(path string) (OverlayEntry, bool)
+	Lookup(ctx context.Context, path string) (OverlayEntry, bool, error)
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
+	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string) error
@@ -188,6 +191,7 @@ type OverlayStore interface {
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
+	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error)) error
 	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 }

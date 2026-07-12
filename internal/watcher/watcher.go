@@ -10,7 +10,7 @@ import (
 
 type Poller struct {
 	interval        time.Duration
-	prev            map[string]time.Time
+	prev            map[string]string
 	firstSeenChange map[string]struct{}
 }
 
@@ -18,11 +18,15 @@ func New(interval time.Duration) *Poller {
 	if interval <= 0 {
 		interval = 500 * time.Millisecond
 	}
-	return &Poller{interval: interval, prev: map[string]time.Time{}, firstSeenChange: map[string]struct{}{}}
+	return &Poller{interval: interval, prev: map[string]string{}, firstSeenChange: map[string]struct{}{}}
 }
 
 func (p *Poller) Watch(ctx context.Context, gitDir string, fn func()) {
 	headPath := filepath.Join(gitDir, "HEAD")
+	// Prime first, then reconcile. A change during reconciliation is observed by
+	// the next poll instead of falling into the startup baseline window.
+	_ = p.headChanged(headPath)
+	fn()
 	t := time.NewTicker(p.interval)
 	defer t.Stop()
 	for {
@@ -83,13 +87,13 @@ func (p *Poller) headRefPath(headPath string) (string, bool) {
 }
 
 func (p *Poller) changed(path string) bool {
-	st, err := os.Stat(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	mtime := st.ModTime()
+	value := string(data)
 	prev, ok := p.prev[path]
-	p.prev[path] = mtime
+	p.prev[path] = value
 	if !ok {
 		if _, changeOnFirstSeen := p.firstSeenChange[path]; changeOnFirstSeen {
 			delete(p.firstSeenChange, path)
@@ -98,5 +102,5 @@ func (p *Poller) changed(path string) bool {
 		return false
 	}
 	delete(p.firstSeenChange, path)
-	return mtime.After(prev)
+	return value != prev
 }

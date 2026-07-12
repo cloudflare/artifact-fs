@@ -23,6 +23,10 @@ func (f *fakeSnapshot) GetNode(_ int64, path string) (model.BaseNode, bool) {
 	n, ok := f.nodes[path]
 	return n, ok
 }
+func (f *fakeSnapshot) LookupNode(_ context.Context, generation int64, path string) (model.BaseNode, bool, error) {
+	n, ok := f.GetNode(generation, path)
+	return n, ok, nil
+}
 
 func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, error) {
 	if v, ok := f.kids[path]; ok {
@@ -35,11 +39,17 @@ func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, err
 type fakeOverlay struct {
 	entries map[string]model.OverlayEntry
 	list    []model.OverlayEntry
+	writes  int
+	data    []byte
 }
 
 func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
 	v, ok := f.entries[path]
 	return v, ok
+}
+func (f *fakeOverlay) Lookup(_ context.Context, path string) (model.OverlayEntry, bool, error) {
+	e, ok := f.Get(path)
+	return e, ok, nil
 }
 func (f *fakeOverlay) ListByPrefix(_ context.Context, _ string) ([]model.OverlayEntry, error) {
 	return f.list, nil
@@ -56,9 +66,12 @@ func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, p
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil
 }
-func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, _ []byte) (int, error) {
-	return 0, nil
+func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, data []byte) (int, error) {
+	f.writes++
+	f.data = append([]byte(nil), data...)
+	return len(data), nil
 }
+func (f *fakeOverlay) SyncFile(_ context.Context, _ string) error          { return nil }
 func (f *fakeOverlay) Truncate(_ context.Context, _ string, _ int64) error { return nil }
 func (f *fakeOverlay) Remove(_ context.Context, _ string) error            { return nil }
 func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
@@ -96,6 +109,9 @@ func (f *fakeOverlay) SetMtime(_ context.Context, path string, t time.Time) erro
 	return nil
 }
 func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
+	return nil
+}
+func (f *fakeOverlay) ReconcileChecked(_ context.Context, _ func(string) (model.BaseNode, bool, error)) error {
 	return nil
 }
 func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }

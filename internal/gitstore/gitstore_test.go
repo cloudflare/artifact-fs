@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -1633,7 +1634,10 @@ func TestNonInteractiveGitEnvPreservesEscapedDollar(t *testing.T) {
 func TestSetBatchPoolSizeUpdatesExistingAndNewPools(t *testing.T) {
 	t.Parallel()
 	store := New(nil)
-	first := store.getPool("/tmp/repo-a.git")
+	first, err := store.getPool("/tmp/repo-a.git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if first.maxSize != 4 {
 		t.Fatalf("initial pool maxSize = %d, want 4", first.maxSize)
 	}
@@ -1642,10 +1646,54 @@ func TestSetBatchPoolSizeUpdatesExistingAndNewPools(t *testing.T) {
 	if first.maxSize != 12 {
 		t.Fatalf("updated existing pool maxSize = %d, want 12", first.maxSize)
 	}
-	second := store.getPool("/tmp/repo-b.git")
+	second, err := store.getPool("/tmp/repo-b.git")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if second.maxSize != 12 {
 		t.Fatalf("new pool maxSize = %d, want 12", second.maxSize)
 	}
+}
+
+func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
+	var records []string
+	err := readNullDelimited(strings.NewReader("first\x00partial"), func(record string) {
+		records = append(records, record)
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if !slices.Equal(records, []string{"first"}) {
+		t.Fatalf("records = %v, want [first]", records)
+	}
+}
+
+func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	p := &batchPool{
+		gitDir:  filepath.Join(repo, ".git"),
+		logger:  slog.Default(),
+		maxSize: 1,
+		all:     map[*batchCatFile]struct{}{},
+		changed: make(chan struct{}),
+	}
+	first, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := p.acquire(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire err = %v, want deadline exceeded", err)
+	}
+	p.release(first)
+	second, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.release(second)
+	p.closeAll()
 }
 
 func run(t *testing.T, name string, args ...string) {

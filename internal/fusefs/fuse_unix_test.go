@@ -5,6 +5,8 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -65,6 +67,69 @@ func TestRootInodeAttributesDoNotRequireResolver(t *testing.T) {
 	}
 	if op.Attributes.Size == 0 {
 		t.Fatal("root size = 0, want non-zero placeholder size")
+	}
+}
+
+func TestDetachedFileHandleRemainsReadableWritableAndSyncable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unlinked")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{path: "file.txt", cacheFile: f, cacheGeneration: -1, detached: true}
+	fs := &ArtifactFuse{fileHandles: map[fuseops.HandleID]*FileHandle{1: fh}}
+
+	write := &fuseops.WriteFileOp{Handle: 1, Offset: 0, Data: []byte("after!")}
+	if err := fs.WriteFile(context.Background(), write); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	read := &fuseops.ReadFileOp{Handle: 1, Offset: 0, Size: 6}
+	if err := fs.ReadFile(context.Background(), read); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if got := string(read.Data[0]); got != "after!" {
+		t.Fatalf("read = %q, want after!", got)
+	}
+	if err := fs.SyncFile(context.Background(), &fuseops.SyncFileOp{Handle: 1}); err != nil {
+		t.Fatalf("SyncFile: %v", err)
+	}
+	if err := fs.ReleaseFileHandle(context.Background(), &fuseops.ReleaseFileHandleOp{Handle: 1}); err != nil {
+		t.Fatalf("ReleaseFileHandle: %v", err)
+	}
+}
+
+func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := model.RepoConfig{ID: "repo"}
+	base := model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "file", Mode: 0o644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
+	snap := &fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": base}}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(snap, ov)
+	h := &fakeLookupHydrator{size: 4, path: cachePath}
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: h}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	open := &fuseops.OpenFileOp{Inode: lookup.Entry.Child}
+	if err := fs.OpenFile(context.Background(), open); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(context.Background(), &fuseops.WriteFileOp{Handle: open.Handle, Data: []byte("local")}); err != nil {
+		t.Fatal(err)
+	}
+	if ov.writes != 1 || string(ov.data) != "local" {
+		t.Fatalf("overlay writes = %d, data = %q", ov.writes, ov.data)
 	}
 }
 
@@ -365,6 +430,7 @@ type fakeLookupHydrator struct {
 	size  int64
 	calls int
 	err   error
+	path  string
 }
 
 func (f *fakeLookupHydrator) Enqueue(model.HydrationTask) {}
@@ -376,7 +442,7 @@ func (f *fakeLookupHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfi
 	if f.err != nil {
 		return "", 0, f.err
 	}
-	return "", f.size, nil
+	return f.path, f.size, nil
 }
 
 func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {

@@ -27,14 +27,14 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
 		t.Fatalf("mkdir git: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "blob-a"), []byte("abc"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, strings.Repeat("a", 40)), []byte("abc"), 0o644); err != nil {
 		t.Fatalf("write blob-a: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cacheDir, "nested"), 0o755); err != nil {
-		t.Fatalf("mkdir nested: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "nested", "blob-b"), []byte("hello"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, strings.Repeat("b", 64)), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("write blob-b: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, ".artifact-fs-blob-partial"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	svc := &Service{}
@@ -51,6 +51,21 @@ func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	}
 	if st.HydratedBlobBytes != 8 {
 		t.Fatalf("HydratedBlobBytes = %d, want 8", st.HydratedBlobBytes)
+	}
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
+}
+
+func TestWriteHookFieldRejectsShortWrite(t *testing.T) {
+	if err := writeHookField(shortWriter{}, "token"); err != io.ErrShortWrite {
+		t.Fatalf("err = %v, want io.ErrShortWrite", err)
 	}
 }
 

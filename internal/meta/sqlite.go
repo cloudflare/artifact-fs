@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -14,11 +15,15 @@ func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir db dir: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	params := url.Values{}
+	params.Add("_pragma", "busy_timeout(5000)")
+	params.Add("_pragma", "foreign_keys(ON)")
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: params.Encode()}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
 		db.Close()
 		return nil, err
 	}

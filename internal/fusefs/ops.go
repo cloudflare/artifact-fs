@@ -26,10 +26,12 @@ type Engine struct {
 // ensureOverlay promotes a base file to the overlay (hydrate → copy-on-write).
 // No-op if the path already has an overlay entry.
 func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
-	if _, ok := e.Overlay.Get(path); ok {
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return err
+	} else if ok {
 		return nil
 	}
-	n, err := e.Resolver.ResolvePath(path)
+	n, err := e.Resolver.resolvePath(path)
 	if err != nil {
 		return err
 	}
@@ -43,13 +45,17 @@ func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
 }
 
 func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]byte, error) {
-	if ov, ok := e.Overlay.Get(path); ok {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return nil, err
+	} else if ok {
 		if ov.IsDeleted() {
 			return nil, os.ErrNotExist
 		}
 		return readFileChunk(ov.BackingPath, off, size)
 	}
-	n, err := e.Resolver.ResolvePath(path)
+	n, err := e.Resolver.resolvePath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -61,15 +67,22 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 }
 
 func (e *Engine) BaseCachePath(ctx context.Context, path string) (string, int64, bool, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
-	if ov, ok := e.Overlay.Get(path); ok {
+	if ov, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return "", 0, false, err
+	} else if ok {
 		if ov.IsDeleted() {
 			return "", 0, false, os.ErrNotExist
 		}
 		return "", 0, false, nil
 	}
 	gen := e.Resolver.Generation()
-	n, ok := e.Resolver.Snapshot.GetNode(gen, path)
+	n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, path)
+	if err != nil {
+		return "", 0, false, err
+	}
 	if !ok {
 		return "", 0, false, fs.ErrNotExist
 	}
@@ -81,6 +94,8 @@ func (e *Engine) BaseCachePath(ctx context.Context, path string) (string, int64,
 }
 
 func (e *Engine) Write(ctx context.Context, path string, off int64, data []byte) (int, error) {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	if err := e.ensureOverlay(ctx, path); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return 0, err
@@ -93,32 +108,48 @@ func (e *Engine) Write(ctx context.Context, path string, off int64, data []byte)
 	return e.Overlay.WriteFile(ctx, path, off, data)
 }
 
+func (e *Engine) Sync(ctx context.Context, path string) error {
+	return e.Overlay.SyncFile(ctx, path)
+}
+
 func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	_, err := e.Overlay.CreateFile(ctx, path, mode)
 	return err
 }
 
 func (e *Engine) Unlink(ctx context.Context, path string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	return e.Overlay.Remove(ctx, path)
 }
 
 func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	if oldPath == newPath {
-		_, err := e.Resolver.ResolvePath(oldPath)
+		_, err := e.Resolver.resolvePath(oldPath)
 		return err
 	}
-	if ov, ok := e.Overlay.Get(oldPath); ok {
+	if ov, ok, lookupErr := e.Overlay.Lookup(ctx, oldPath); lookupErr != nil {
+		return lookupErr
+	} else if ok {
 		if ov.IsDeleted() {
 			return os.ErrNotExist
 		}
 		if ov.Kind == model.OverlayKindMkdir {
-			if _, ok := e.Resolver.Snapshot.GetNode(e.Resolver.Generation(), oldPath); ok {
+			if _, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), oldPath); err != nil {
+				return err
+			} else if ok {
 				return fs.ErrInvalid
 			}
 		}
-		if dst, ok := e.Resolver.Snapshot.GetNode(e.Resolver.Generation(), newPath); ok {
+		if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
+			return err
+		} else if ok {
 			if dst.Type == "dir" || ov.Kind == model.OverlayKindMkdir {
 				return fs.ErrInvalid
 			}
@@ -128,17 +159,21 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 		}
 		return e.Overlay.Rename(ctx, oldPath, newPath)
 	}
-	if n, ok := e.Resolver.Snapshot.GetNode(e.Resolver.Generation(), oldPath); ok && n.Type == "dir" {
+	if n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), oldPath); err != nil {
+		return err
+	} else if ok && n.Type == "dir" {
 		return fs.ErrInvalid
 	}
-	n, err := e.Resolver.ResolvePath(oldPath)
+	n, err := e.Resolver.resolvePath(oldPath)
 	if err != nil {
 		return err
 	}
 	if n.Base.Type == "dir" {
 		return fs.ErrInvalid
 	}
-	if dst, ok := e.Resolver.Snapshot.GetNode(e.Resolver.Generation(), newPath); ok && dst.Type == "dir" {
+	if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
+		return err
+	} else if ok && dst.Type == "dir" {
 		return fs.ErrInvalid
 	}
 	if err := e.ensureOverlay(ctx, oldPath); err != nil {
@@ -148,12 +183,16 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 }
 
 func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	return e.Overlay.Mkdir(ctx, path, mode)
 }
 
 func (e *Engine) Rmdir(ctx context.Context, path string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	// Only allow rmdir if the merged directory is empty
-	children, err := e.Resolver.Readdir(ctx, path)
+	children, err := e.Resolver.readdirTypedAt(ctx, path, e.Resolver.Generation())
 	if err != nil {
 		return err
 	}
@@ -166,12 +205,16 @@ func (e *Engine) Rmdir(ctx context.Context, path string) error {
 // SetMtime promotes base files/directories before updating mtime so the
 // caller-controlled timestamp never overwrites base snapshot attrs.
 func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	path = model.CleanPath(path)
 	if path == "." {
 		return fs.ErrInvalid
 	}
-	if _, ok := e.Overlay.Get(path); !ok {
-		n, err := e.Resolver.ResolvePath(path)
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return err
+	} else if !ok {
+		n, err := e.Resolver.resolvePath(path)
 		if err != nil {
 			return err
 		}
@@ -192,6 +235,8 @@ func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) error {
 }
 
 func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
 	if err := e.ensureOverlay(ctx, path); err != nil {
 		return err
 	}

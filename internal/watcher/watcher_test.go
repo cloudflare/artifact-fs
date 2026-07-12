@@ -34,8 +34,12 @@ func TestWatchTriggersOnHeadChange(t *testing.T) {
 		default:
 		}
 	})
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial reconciliation")
+	}
 
-	// Prime the previous mtime snapshot before changing HEAD.
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(headPath, []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
 		t.Fatalf("update HEAD: %v", err)
@@ -71,8 +75,12 @@ func TestWatchTriggersOnCurrentBranchAdvance(t *testing.T) {
 		default:
 		}
 	})
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial reconciliation")
+	}
 
-	// Prime the previous mtime snapshots before advancing the current branch ref.
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(refPath, []byte("commit-2"), 0o644); err != nil {
 		t.Fatalf("update ref: %v", err)
@@ -187,6 +195,38 @@ func TestHeadChangedTreatsPackedStartupRefAppearanceAsChange(t *testing.T) {
 	}
 }
 
+func TestHeadChangedDetectsRefContentChangeWithSameMtime(t *testing.T) {
+	gitDir := t.TempDir()
+	headPath := filepath.Join(gitDir, "HEAD")
+	refPath := filepath.Join(gitDir, "refs", "heads", "main")
+	if err := os.MkdirAll(filepath.Dir(refPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(refPath, []byte("commit-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(refPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(time.Second)
+	if p.headChanged(headPath) {
+		t.Fatal("initial poll should prime state")
+	}
+	if err := os.WriteFile(refPath, []byte("commit-2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(refPath, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if !p.headChanged(headPath) {
+		t.Fatal("expected content change with unchanged mtime")
+	}
+}
+
 func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 	gitDir := t.TempDir()
 	headPath := filepath.Join(gitDir, "HEAD")
@@ -207,8 +247,12 @@ func TestWatchIgnoresIndexOnlyChanges(t *testing.T) {
 		default:
 		}
 	})
+	select {
+	case <-changed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected initial reconciliation")
+	}
 
-	// Prime the previous mtime snapshot before changing only the index.
 	time.Sleep(15 * time.Millisecond)
 	if err := os.WriteFile(indexPath, []byte("index updated"), 0o644); err != nil {
 		t.Fatalf("update index: %v", err)
