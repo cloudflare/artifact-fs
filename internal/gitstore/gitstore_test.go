@@ -1180,7 +1180,13 @@ func TestCloneBloblessRetriesTransientTransportErrors(t *testing.T) {
 	if strings.Contains(string(commands), "super-secret") || strings.Contains(string(commands), "user@example.com") {
 		t.Fatalf("credential appeared in git command: %s", commands)
 	}
-	if !strings.Contains(logs.String(), "retryable") || strings.Contains(logs.String(), "super-secret") || strings.Contains(logs.String(), "log-secret") {
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) ||
+		!strings.Contains(logOutput, `"msg":"`+logGitOperationRecovered+`"`) ||
+		!strings.Contains(logOutput, `"error":"error: RPC failed; HTTP 503 curl 22`) ||
+		!strings.Contains(logOutput, `"duration_ms":`) ||
+		!strings.Contains(logOutput, `"next_attempt":2`) ||
+		strings.Contains(logOutput, "super-secret") || strings.Contains(logOutput, "log-secret") {
 		t.Fatalf("clone retry logs were not structured/redacted: %s", logs.String())
 	}
 }
@@ -1242,7 +1248,9 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	err := New(nil).CloneBlobless(ctx, model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	err := store.CloneBlobless(ctx, model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context deadline exceeded", err)
 	}
@@ -1262,6 +1270,11 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	}
 	if string(count) != "1" {
 		t.Fatalf("clone attempts = %q, want 1", count)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) ||
+		!strings.Contains(logOutput, `"timed_out":true`) ||
+		!strings.Contains(logOutput, `"error":"error: RPC failed; HTTP 500 curl 22`) {
+		t.Fatalf("deadline failure was not logged with its transport cause: %s", logOutput)
 	}
 }
 
@@ -1289,7 +1302,8 @@ func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
 func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testing.T) {
 	ctx := &stagedErrorContext{Context: context.Background(), errAt: 3}
 	transportErr := errors.New("HTTP 500 transport failure")
-	store := New(nil)
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{0}
 	attempts := 0
 	err := store.retryGitOperation(ctx, GitOperationClone, "repo", func() error {
@@ -1305,6 +1319,28 @@ func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testi
 	}
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationInterrupted+`"`) || !strings.Contains(logOutput, `"canceled":true`) {
+		t.Fatalf("next-attempt cancellation terminal log incomplete: %s", logOutput)
+	}
+}
+
+func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = []time.Duration{time.Second}
+	err := store.retryGitOperation(ctx, GitOperationFetch, "repo", func() error {
+		time.AfterFunc(20*time.Millisecond, cancel)
+		return errors.New("HTTP 503 transport failure")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want canceled", err)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationInterrupted+`"`) ||
+		!strings.Contains(logOutput, `"canceled":true`) || !strings.Contains(logOutput, `"attempts":1`) {
+		t.Fatalf("backoff cancellation terminal log incomplete: %s", logOutput)
 	}
 }
 
@@ -1339,6 +1375,36 @@ func TestTransientGitErrorRejectsStandaloneLocalIndexPackFailure(t *testing.T) {
 	message := "fatal: unable to write file: Input/output error\nfatal: index-pack failed"
 	if isTransientGitError(errors.New(message)) {
 		t.Fatalf("isTransientGitError(%q) = true, want false", message)
+	}
+}
+
+func TestBoundedGitErrorPreservesClassificationAfterTruncation(t *testing.T) {
+	var stderr boundedGitError
+	stderr.limit = 16
+	_, _ = stderr.Write([]byte(strings.Repeat("x", 32)))
+	_, _ = stderr.Write([]byte(" HTTP 503 Service Unavailable"))
+	if !stderr.Retryable() {
+		t.Fatal("bounded stderr lost transient classification after truncation")
+	}
+	if got := stderr.String(); len(got) > stderr.limit+len(gitErrorTruncatedLabel)+1 || !strings.Contains(got, gitErrorTruncatedLabel) {
+		t.Fatalf("bounded stderr = %q, want capped output with truncation label", got)
+	}
+
+	var permanent boundedGitError
+	permanent.limit = 16
+	_, _ = permanent.Write([]byte("HTTP 503"))
+	_, _ = permanent.Write([]byte(" permission denied"))
+	if permanent.Retryable() {
+		t.Fatal("local permanent failure was classified as retryable")
+	}
+}
+
+func TestRedactTruncatedCredentialPrefix(t *testing.T) {
+	credential := "super-secret-token"
+	message := "fatal: authentication failed: super-secret-tok\n" + gitErrorTruncatedLabel
+	got := redactTruncatedCredentialPrefix(message, []string{credential})
+	if strings.Contains(got, "super-secret") || !strings.Contains(got, "REDACTED") {
+		t.Fatalf("truncated credential prefix leaked in %q", got)
 	}
 }
 
@@ -1430,6 +1496,35 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRetryGitOperationRedactsExactLocalRemote(t *testing.T) {
+	const remote = "/private/customer/repo.git"
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = nil
+	err := store.retryGitOperationForRemotes(context.Background(), GitOperationClone, "repo", []string{remote}, func() error {
+		return errors.New("HTTP 503 cloning " + remote)
+	})
+	if err == nil {
+		t.Fatal("expected clone failure")
+	}
+	if logOutput := logs.String(); strings.Contains(logOutput, remote) || !strings.Contains(logOutput, "REDACTED_REMOTE") {
+		t.Fatalf("local remote was not redacted from retry log: %s", logOutput)
+	}
+}
+
+func TestRemotesForLoggingIncludesConfiguredAndActualOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir := filepath.Join(tmp, "repo.git")
+	run(t, "git", "init", "--bare", gitDir)
+	const configured = "https://example.com/old/repo.git"
+	actual := filepath.Join(tmp, "private", "repo.git")
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", actual)
+	got := New(nil).remotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
+	if !slices.Contains(got, configured) || !slices.Contains(got, actual) {
+		t.Fatalf("remotesForLogging = %q, want configured and actual remotes", got)
 	}
 }
 

@@ -92,13 +92,15 @@ Check the state of a mounted repo with `status`:
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
 
-To monitor hydration activity, watch the daemon's JSON log output:
+To monitor repository preparation and hydration failures, watch the daemon's JSON log output:
 
 ```bash
 ./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
 # In another terminal:
-tail -f /tmp/daemon.log | grep -i hydrat
+tail -f /tmp/daemon.log | grep -Ei 'prepar|git operation|hydrat'
 ```
+
+Repository preparation emits structured lifecycle records with the mode, source, attempt, duration, and failure phase. Transient clone and fetch failures include a bounded, redacted Git error, attempt timing, and retry schedule; a later successful attempt emits `git operation recovered`. Diagnostics remove complete remote references as well as credentials. Synchronous `add-repo` preparation has a 30-minute timeout, and non-cancellation failures are persisted for `status` as well as logged.
 
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
 

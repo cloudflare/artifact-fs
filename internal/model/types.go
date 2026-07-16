@@ -54,6 +54,7 @@ type RepoConfig struct {
 	AcquiredRef           string
 	AcquiredCommit        string
 	AcquiredAt            time.Time
+	ConfigVersion         string
 }
 
 type RepoRuntimeState struct {

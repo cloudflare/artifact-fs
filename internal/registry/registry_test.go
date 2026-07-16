@@ -38,6 +38,7 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 		RequiredCommit:        "0123456789012345678901234567890123456789",
 		HistoryDepth:          1,
 		RemoteRefreshDisabled: true,
+		ConfigVersion:         "version-1",
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -74,6 +75,39 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	}
 	if got.AcquiredRef != cfg.Branch || got.AcquiredCommit != cfg.RequiredCommit || got.AcquiredAt.IsZero() {
 		t.Fatalf("acquisition receipt = %+v", got)
+	}
+	if got.ConfigVersion != "version-1" {
+		t.Fatalf("ConfigVersion = %q, want version-1", got.ConfigVersion)
+	}
+}
+
+func TestPrepareStateUpdateRejectsOlderConfigVersion(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", ConfigVersion: "version-1"}
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stale := cfg
+	cfg.ConfigVersion = "version-2"
+	cfg.PrepareState = model.PrepareStatePreparing
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdatePrepareStateForConfig(ctx, stale, "", "old failure"); err != ErrRepoChanged {
+		t.Fatalf("stale update error = %v, want ErrRepoChanged", err)
+	}
+	got, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigVersion != "version-2" || got.PrepareState != model.PrepareStatePreparing || got.PrepareError != "" {
+		t.Fatalf("new config changed: version/state/error = %q/%q/%q", got.ConfigVersion, got.PrepareState, got.PrepareError)
 	}
 }
 
