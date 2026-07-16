@@ -92,20 +92,42 @@ Check the state of a mounted repo with `status`:
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
 
-To monitor repository preparation and hydration failures, watch the daemon's JSON log output:
-
-```bash
-./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
-# In another terminal:
-tail -f /tmp/daemon.log | grep -Ei 'prepar|git operation|hydrat'
-```
-
-Repository preparation emits structured lifecycle records with the mode, source, attempt, duration, and failure phase. Transient clone and fetch failures include a bounded, redacted Git error, attempt timing, and retry schedule; a later successful attempt emits `git operation recovered`. Diagnostics remove complete remote references as well as credentials. Synchronous `add-repo` preparation has a 30-minute timeout, and non-cancellation failures are persisted for `status` as well as logged.
-
 Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
 
 ```bash
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8
+```
+
+## Logging
+
+ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline.
+
+Successful `add-repo`:
+
+```json
+{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"main","fetch_ref":"main","deadline_set":true,"timeout_ms":1800000}
+{"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1800000,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
+```
+
+Transient network failure followed by recovery:
+
+```json
+{"time":"2026-07-16T12:01:00Z","level":"WARN","msg":"git operation attempt failed","operation":"clone","repo":"workers-sdk","attempt":1,"max_attempts":3,"retryable":true,"duration_ms":842,"timed_out":false,"canceled":false,"error":"HTTP 503: unexpected disconnect"}
+{"time":"2026-07-16T12:01:00Z","level":"INFO","msg":"retrying transient git operation failure","operation":"clone","repo":"workers-sdk","attempt":1,"next_attempt":2,"backoff":"214ms"}
+{"time":"2026-07-16T12:01:02Z","level":"INFO","msg":"git operation recovered","operation":"clone","repo":"workers-sdk","attempts":2,"duration_ms":2087}
+```
+
+Preparation timeout:
+
+```json
+{"time":"2026-07-16T12:30:00Z","level":"ERROR","msg":"repo preparation failed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"clone","state":"failed","duration_ms":1800000,"deadline_set":true,"timeout_ms":1800000,"timed_out":true,"canceled":false,"error":"git clone failed after 1 attempt; caller context: context deadline exceeded"}
+```
+
+Diagnostics are bounded and redact credentials and complete remote references. To follow preparation and network activity:
+
+```bash
+./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
+tail -f /tmp/daemon.log | grep -Ei 'prepar|git operation'
 ```
 
 ## Async repo preparation
