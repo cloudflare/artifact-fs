@@ -540,6 +540,138 @@ func TestAddRepoSyncCancellationIsLoggedWithoutPersistingFailure(t *testing.T) {
 	}
 }
 
+func TestAddRepoSyncBuildTreeCancellationDoesNotPersistFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	runCmd(t, "git", "init", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", repo, "add", "README.md")
+	runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(tmp, "ls-tree-started")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = 'ls-tree' ]; then : > \"$AFS_GIT_STARTED\"; exec sleep 10; fi\n" +
+		"exec /usr/bin/git \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_GIT_STARTED", started)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	svc, err := New(context.Background(), filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(repo, ".git"), Branch: "master", Enabled: true})
+	}()
+	waitFor(t, time.Second, func() bool {
+		_, err := os.Stat(started)
+		return err == nil
+	})
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddRepo error = %v, want canceled", err)
+	}
+	got, err := svc.registry.GetRepo(context.Background(), "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrepareError != "" {
+		t.Fatalf("PrepareError = %q, want empty after cancellation", got.PrepareError)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"phase":"`+preparePhaseBuildTree+`"`) ||
+		!strings.Contains(logOutput, `"state":"`+prepareLogStateCanceled+`"`) {
+		t.Fatalf("build-tree cancellation log incomplete: %s", logOutput)
+	}
+}
+
+func TestSyncPrepareRetryPersistsCurrentFailure(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'new retry failure' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{Name: "repo", ID: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", PrepareError: "old failure", Enabled: true}
+	svc.fillPaths(&cfg)
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Prepare(ctx, "repo"); err == nil {
+		t.Fatal("expected prepare retry failure")
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.PrepareError, "new retry failure") || strings.Contains(got.PrepareError, "old failure") {
+		t.Fatalf("PrepareError = %q, want current retry failure", got.PrepareError)
+	}
+}
+
+func TestRunPrepareReportsRemoteConfigurationPhase(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nprintf '%s\\n' 'remote setup failed' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{Name: "repo", ID: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", FetchRef: "main", PrepareState: model.PrepareStatePreparing, Enabled: true}
+	svc.fillPaths(&cfg)
+	if err := os.MkdirAll(cfg.GitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.runPrepare(ctx, got); err == nil {
+		t.Fatal("expected remote setup failure")
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"phase":"`+preparePhaseConfigureRemote+`"`) ||
+		strings.Contains(logOutput, `"phase":"`+preparePhaseUpdateBranch+`"`) {
+		t.Fatalf("remote setup phase was misclassified: %s", logOutput)
+	}
+}
+
 func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

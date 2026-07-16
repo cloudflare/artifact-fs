@@ -105,6 +105,14 @@ type gitCommandError struct {
 	retryable  bool // Classified before cause is redacted.
 }
 
+type redactedCause struct {
+	message string
+	cause   error
+}
+
+func (e *redactedCause) Error() string { return e.message }
+func (e *redactedCause) Unwrap() error { return e.cause }
+
 func (e *gitCommandError) Error() string {
 	if e == nil {
 		return "git command failed"
@@ -585,13 +593,19 @@ func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, r
 }
 
 func (s *Store) retryGitOperationForRemotes(ctx context.Context, operation GitOperation, repoName string, remotes []string, attempt func() error) error {
+	return s.retryGitOperationForRemoteLookup(ctx, operation, repoName, func() ([]string, bool) {
+		return remotes, true
+	}, attempt)
+}
+
+func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation GitOperation, repoName string, remotesForLogging func() ([]string, bool), attempt func() error) error {
 	delays := s.gitRetryDelays
 	var lastErr *GitOperationError
 	operationStarted := time.Now()
 	safeRepoName := auth.RedactLogString(repoName)
 	logInterrupted := func(operationErr *GitOperationError, contextErr error) {
 		operationErr.contextErr = contextErr
-		args := []any{"operation", operation, "repo", safeRepoName, "attempts", operationErr.Attempts, "duration_ms", time.Since(operationStarted).Milliseconds(), "timed_out", errors.Is(contextErr, context.DeadlineExceeded), "canceled", errors.Is(contextErr, context.Canceled), "error", auth.RedactLogString(operationErr.Error(), remotes...)}
+		args := []any{"operation", operation, "repo", safeRepoName, "attempts", operationErr.Attempts, "duration_ms", time.Since(operationStarted).Milliseconds(), "timed_out", errors.Is(contextErr, context.DeadlineExceeded), "canceled", errors.Is(contextErr, context.Canceled), "error", auth.RedactLogString(operationErr.Error())}
 		if errors.Is(contextErr, context.Canceled) {
 			s.logger.Info(logGitOperationInterrupted, args...)
 		} else {
@@ -619,8 +633,13 @@ func (s *Store) retryGitOperationForRemotes(ctx context.Context, operation GitOp
 		if contextErr == nil {
 			contextErr = ctx.Err()
 		}
-		if cause != nil && len(remotes) > 0 {
-			cause = errors.New(auth.RedactLogString(cause.Error(), remotes...))
+		if cause != nil {
+			remotes, complete := remotesForLogging()
+			message := "git command failed"
+			if complete {
+				message = auth.RedactLogString(cause.Error(), remotes...)
+			}
+			cause = &redactedCause{message: message, cause: cause}
 		}
 		operationErr := &GitOperationError{
 			Operation:  operation,
@@ -632,11 +651,11 @@ func (s *Store) retryGitOperationForRemotes(ctx context.Context, operation GitOp
 		lastErr = operationErr
 		safeError := ""
 		if cause != nil {
-			safeError = auth.RedactLogString(cause.Error(), remotes...)
+			safeError = auth.RedactLogString(cause.Error())
 		} else if contextErr != nil {
-			safeError = auth.RedactLogString(contextErr.Error(), remotes...)
+			safeError = auth.RedactLogString(contextErr.Error())
 		} else {
-			safeError = auth.RedactLogString(operationErr.Error(), remotes...)
+			safeError = auth.RedactLogString(operationErr.Error())
 		}
 		s.logger.Warn(logGitOperationAttemptFailed,
 			"operation", operation,
@@ -755,8 +774,9 @@ func isTransientGitMessage(message string) bool {
 }
 
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
-	remotes := s.remotesForLogging(ctx, repo)
-	return s.retryGitOperationForRemotes(ctx, GitOperationFetch, repo.Name, remotes, func() error {
+	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
+	defer cancelLookup()
+	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		args := []string{"fetch", "--no-tags"}
 		if repo.HistoryDepth > 0 {
 			args = append(args, fmt.Sprintf("--depth=%d", repo.HistoryDepth))
@@ -776,26 +796,61 @@ func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfi
 	if target.branch != "" {
 		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
 	}
-	remotes := s.remotesForLogging(ctx, repo)
-	return s.retryGitOperationForRemotes(ctx, GitOperationFetch, repo.Name, remotes, func() error {
+	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
+	defer cancelLookup()
+	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		_, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
 		return err
 	})
 }
 
-func (s *Store) remotesForLogging(ctx context.Context, repo model.RepoConfig) []string {
-	remotes := []string{repo.RemoteURL}
-	remote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
-	if err == nil && strings.TrimSpace(remote) != "" && strings.TrimSpace(remote) != strings.TrimSpace(repo.RemoteURL) {
-		remotes = append(remotes, strings.TrimSpace(remote))
+func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), context.CancelFunc) {
+	type lookupResult struct {
+		remote string
+		err    error
 	}
-	return remotes
+	lookupCtx, cancel := context.WithCancel(ctx)
+	result := make(chan lookupResult, 1)
+	go func() {
+		remote, err := runGit(lookupCtx, repo.GitDir, "remote", "get-url", "origin")
+		result <- lookupResult{remote: strings.TrimSpace(remote), err: err}
+	}()
+
+	finished := false
+	known := false
+	actualRemote := ""
+	return func() ([]string, bool) {
+		if !finished {
+			select {
+			case lookup := <-result:
+				finished = true
+				known = lookup.err == nil
+				actualRemote = lookup.remote
+			default:
+			}
+		}
+		remotes := []string{repo.RemoteURL}
+		if known && actualRemote != "" && actualRemote != strings.TrimSpace(repo.RemoteURL) {
+			remotes = append(remotes, actualRemote)
+		}
+		return remotes, known
+	}, cancel
 }
 
 func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
 	if err := s.ValidateAmbientRemote(repo); err != nil {
 		return err
 	}
+	if err := s.ConfigureRemoteNonInteractive(ctx, repo); err != nil {
+		return err
+	}
+	if err := s.FetchRefNonInteractive(ctx, repo, repo.FetchRef); err != nil {
+		return err
+	}
+	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
+}
+
+func (s *Store) ConfigureRemoteNonInteractive(ctx context.Context, repo model.RepoConfig) error {
 	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
 	if err != nil {
 		return err
@@ -805,10 +860,7 @@ func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo mod
 			return err
 		}
 	}
-	if err := s.FetchRefNonInteractive(ctx, repo, repo.FetchRef); err != nil {
-		return err
-	}
-	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
+	return nil
 }
 
 func (s *Store) ValidateAmbientRemote(repo model.RepoConfig) error {
@@ -980,12 +1032,21 @@ func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn fu
 	readErr := readNullDelimited(stdout, fn)
 	waitErr := cmd.Wait()
 	if readErr != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return errors.Join(readErr, contextErr)
+		}
 		return readErr
 	}
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
 		if msg == "" {
 			msg = auth.RedactString(waitErr.Error())
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			if strings.EqualFold(msg, "signal: killed") {
+				return contextErr
+			}
+			return errors.Join(errors.New(msg), contextErr)
 		}
 		return errors.New(msg)
 	}

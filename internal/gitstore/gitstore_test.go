@@ -1501,30 +1501,88 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 
 func TestRetryGitOperationRedactsExactLocalRemote(t *testing.T) {
 	const remote = "/private/customer/repo.git"
+	sentinel := errors.New("sentinel failure")
 	var logs bytes.Buffer
 	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = nil
 	err := store.retryGitOperationForRemotes(context.Background(), GitOperationClone, "repo", []string{remote}, func() error {
-		return errors.New("HTTP 503 cloning " + remote)
+		return fmt.Errorf("HTTP 503 cloning %s: %w", remote, sentinel)
 	})
 	if err == nil {
 		t.Fatal("expected clone failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v, want preserved sentinel cause", err)
+	}
+	if strings.Contains(err.Error(), remote) || !strings.Contains(err.Error(), "REDACTED_REMOTE") {
+		t.Fatalf("returned error did not redact remote: %v", err)
 	}
 	if logOutput := logs.String(); strings.Contains(logOutput, remote) || !strings.Contains(logOutput, "REDACTED_REMOTE") {
 		t.Fatalf("local remote was not redacted from retry log: %s", logOutput)
 	}
 }
 
-func TestRemotesForLoggingIncludesConfiguredAndActualOrigin(t *testing.T) {
+func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetchStarted := filepath.Join(tmp, "fetch-started")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  'remote get-url origin') exec sleep 10;;\n" +
+		"  'fetch --no-tags origin') : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"esac\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_FETCH_STARTED", fetchStarted)
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := store.Fetch(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want immediate transport failure", err)
+	}
+	if _, statErr := os.Stat(fetchStarted); statErr != nil {
+		t.Fatalf("fetch did not start while remote lookup was blocked: %v", statErr)
+	}
+	var operationErr *GitOperationError
+	if !errors.As(err, &operationErr) || operationErr.Attempts != 1 {
+		t.Fatalf("Fetch error = %#v, want one attempted fetch", err)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) {
+		t.Fatalf("fetch failure terminal log missing: %s", logOutput)
+	}
+}
+
+func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
 	tmp := t.TempDir()
 	gitDir := filepath.Join(tmp, "repo.git")
 	run(t, "git", "init", "--bare", gitDir)
 	const configured = "https://example.com/old/repo.git"
 	actual := filepath.Join(tmp, "private", "repo.git")
 	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", actual)
-	got := New(nil).remotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
-	if !slices.Contains(got, configured) || !slices.Contains(got, actual) {
-		t.Fatalf("remotesForLogging = %q, want configured and actual remotes", got)
+	remotesForLogging, cancel := New(nil).startRemotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
+	defer cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		remotes, complete := remotesForLogging()
+		if complete {
+			if !slices.Contains(remotes, configured) || !slices.Contains(remotes, actual) {
+				t.Fatalf("remotesForLogging = %q, want configured and actual remotes", remotes)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("remote lookup did not complete")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -1569,6 +1627,7 @@ func TestFetchRefNonInteractiveRetriesTransientFailures(t *testing.T) {
 	countPath := filepath.Join(tmp, "fetch-count")
 	fakeGit := filepath.Join(bin, "git")
 	script := "#!/bin/sh\n" +
+		"if [ \"$*\" = 'remote get-url origin' ]; then exit 0; fi\n" +
 		"count=0; [ -f \"$AFS_FETCH_COUNT\" ] && count=$(cat \"$AFS_FETCH_COUNT\")\n" +
 		"count=$((count + 1)); printf '%s' \"$count\" > \"$AFS_FETCH_COUNT\"\n" +
 		"if [ \"$count\" -lt 3 ]; then printf '%s\\n' 'HTTP 503 Service Unavailable' >&2; exit 1; fi\n"
@@ -2310,6 +2369,25 @@ func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
 	}
 	if !slices.Equal(records, []string{"first"}) {
 		t.Fatalf("records = %v, want [first]", records)
+	}
+}
+
+func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := streamTreeRecords(ctx, filepath.Join(tmp, "repo.git"), "HEAD", func(string) {})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("streamTreeRecords error = %v, want deadline exceeded", err)
 	}
 }
 

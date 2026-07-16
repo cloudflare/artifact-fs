@@ -56,6 +56,7 @@ const (
 	preparePhaseValidate          = "validate"
 	preparePhaseInitializeStorage = "initialize_storage"
 	preparePhaseClone             = "clone"
+	preparePhaseConfigureRemote   = "configure_remote"
 	preparePhaseFetch             = "fetch"
 	preparePhaseUpdateBranch      = "update_branch"
 	preparePhaseResolveHEAD       = "resolve_head"
@@ -539,27 +540,35 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	cfg.RemoteURL = cloneURL
 	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
 	err := s.prepareRepo(prepareCtx, cfg)
+	prepareContextErr := prepareCtx.Err()
 	cancel()
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) {
-		return err
+	if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
+		err = errors.Join(err, prepareContextErr)
 	}
-	stateErr := err
-	if errors.Is(err, context.DeadlineExceeded) {
+	return s.persistSyncPrepareFailure(ctx, cfg, registeredCfg, err)
+}
+
+func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
+	if errors.Is(prepareErr, context.Canceled) {
+		return prepareErr
+	}
+	stateErr := prepareErr
+	if errors.Is(prepareErr, context.DeadlineExceeded) {
 		stateErr = errors.New("prepare timed out")
 	}
 	stateCtx, stateCancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
 	defer stateCancel()
 	if stateWriteErr := s.registry.UpdatePrepareStateForConfig(stateCtx, registeredCfg, "", auth.RedactLogString(stateErr.Error(), cfg.RemoteURL)); stateWriteErr != nil {
 		if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
-			return err
+			return prepareErr
 		}
-		s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(err), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
-		return errors.Join(err, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
+		s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
+		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
 	}
-	return err
+	return prepareErr
 }
 
 func (s *Service) RemoveRepo(ctx context.Context, name string) error {
@@ -687,9 +696,14 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	}
 	if !isAsyncRepo(cfg) {
 		prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
-		defer cancel()
-		if err := s.prepareRepo(prepareCtx, cfg); err != nil {
-			return err
+		err := s.prepareRepo(prepareCtx, cfg)
+		prepareContextErr := prepareCtx.Err()
+		cancel()
+		if err != nil {
+			if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
+				err = errors.Join(err, prepareContextErr)
+			}
+			return s.persistSyncPrepareFailure(ctx, cfg, cfg, err)
 		}
 		if cfg.PrepareError == "" {
 			return nil
@@ -1178,6 +1192,22 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 		}
 		return err
 	}
+	prepareExistingClone := func() error {
+		phase = preparePhaseValidate
+		if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+			return err
+		}
+		phase = preparePhaseConfigureRemote
+		if err := s.git.ConfigureRemoteNonInteractive(ctx, cfg); err != nil {
+			return err
+		}
+		phase = preparePhaseFetch
+		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+			return err
+		}
+		phase = preparePhaseUpdateBranch
+		return s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef)
+	}
 
 	var preparedSource model.PreparedSource
 	var err error
@@ -1212,15 +1242,7 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 				return fail(errors.New("remote URL is required for async clone"))
 			}
 			if _, err := os.Stat(cfg.GitDir); err == nil {
-				if err := s.git.ValidateAmbientRemote(cfg); err != nil {
-					return fail(err)
-				}
-				phase = preparePhaseFetch
-				if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
-					var operationErr *gitstore.GitOperationError
-					if !errors.As(err, &operationErr) || operationErr.Operation != gitstore.GitOperationFetch {
-						phase = preparePhaseUpdateBranch
-					}
+				if err := prepareExistingClone(); err != nil {
 					return fail(err)
 				}
 			} else if errors.Is(err, os.ErrNotExist) {
@@ -1232,12 +1254,7 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 					return fail(err)
 				}
 				if !sameBranchRef(cfg.FetchRef, cfg.Branch) {
-					phase = preparePhaseFetch
-					if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
-						var operationErr *gitstore.GitOperationError
-						if !errors.As(err, &operationErr) || operationErr.Operation != gitstore.GitOperationFetch {
-							phase = preparePhaseUpdateBranch
-						}
+					if err := prepareExistingClone(); err != nil {
 						return fail(err)
 					}
 				}
