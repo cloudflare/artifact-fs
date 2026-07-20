@@ -788,6 +788,18 @@ func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
 }
 
 func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
+	return s.fetchRef(ctx, repo, ref, nonInteractiveGitEnv())
+}
+
+func (s *Store) FetchRefWithCredentials(ctx context.Context, repo model.RepoConfig, ref string) error {
+	_, env, err := credentialEnv(repo.RemoteURL)
+	if err != nil {
+		return err
+	}
+	return s.fetchRef(ctx, repo, ref, env)
+}
+
+func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string, env []string) error {
 	target, err := fetchRefTarget(repo, ref)
 	if err != nil {
 		return err
@@ -799,7 +811,7 @@ func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfi
 	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
 	defer cancelLookup()
 	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
-		_, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
+		_, err := runGitWithEnv(ctx, repo.GitDir, env, "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
 		return err
 	})
 }
@@ -851,12 +863,24 @@ func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo mod
 }
 
 func (s *Store) ConfigureRemoteNonInteractive(ctx context.Context, repo model.RepoConfig) error {
-	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
+	return s.configureRemote(ctx, repo, repo.RemoteURL, nonInteractiveGitEnv())
+}
+
+func (s *Store) ConfigureRemoteWithCredentials(ctx context.Context, repo model.RepoConfig) error {
+	safeURL, env, err := credentialEnv(repo.RemoteURL)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(remoteURL) != strings.TrimSpace(repo.RemoteURL) {
-		if _, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "remote", "set-url", "origin", repo.RemoteURL); err != nil {
+	return s.configureRemote(ctx, repo, safeURL, env)
+}
+
+func (s *Store) configureRemote(ctx context.Context, repo model.RepoConfig, targetRemote string, env []string) error {
+	actualRemote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(actualRemote) != strings.TrimSpace(targetRemote) {
+		if _, err := runGitWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "origin", targetRemote); err != nil {
 			return err
 		}
 	}

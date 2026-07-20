@@ -1694,6 +1694,59 @@ func TestPrepareExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testing.T)
 	}
 }
 
+func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	commands := filepath.Join(tmp, "commands")
+	credentials := filepath.Join(tmp, "credentials")
+	fakeGit := filepath.Join(bin, "git")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$AFS_GIT_COMMANDS\"\n" +
+		"if [ \"$*\" = 'remote get-url origin' ]; then printf '%s\\n' 'https://example.com/old/repo.git'; exit 0; fi\n" +
+		"if [ \"$1\" = 'fetch' ]; then printf '%s:%s\\n' \"$ARTIFACT_FS_GIT_USERNAME\" \"$ARTIFACT_FS_GIT_PASSWORD\" > \"$AFS_GIT_CREDENTIALS\"; fi\n"
+	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_COMMANDS", commands)
+	t.Setenv("AFS_GIT_CREDENTIALS", credentials)
+
+	store := New(nil)
+	repo := model.RepoConfig{
+		Name:      "repo",
+		GitDir:    filepath.Join(tmp, "repo.git"),
+		RemoteURL: "https://alice:super-secret@example.com/org/repo.git",
+		Branch:    "main",
+	}
+	if err := store.ConfigureRemoteWithCredentials(context.Background(), repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FetchRefWithCredentials(context.Background(), repo, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	commandData, err := os.ReadFile(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(commandData), "alice") || strings.Contains(string(commandData), "super-secret") {
+		t.Fatalf("credentials appeared in git arguments: %s", commandData)
+	}
+	if !strings.Contains(string(commandData), "remote set-url origin https://example.com/org/repo.git") {
+		t.Fatalf("sanitized remote was not configured: %s", commandData)
+	}
+	credentialData, err := os.ReadFile(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(credentialData) != "alice:super-secret\n" {
+		t.Fatalf("credential helper environment = %q", credentialData)
+	}
+}
+
 func TestValidatePreparedGitDirRejectsCredentialedOrigin(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

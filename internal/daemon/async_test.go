@@ -54,6 +54,106 @@ func TestAddRepoAsyncRegistersWithoutClone(t *testing.T) {
 	}
 }
 
+func TestAddRepoSyncReregistrationUpdatesExistingCloneBranch(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	remote := filepath.Join(tmp, "remote")
+	runCmd(t, "git", "init", "--initial-branch", "main", remote)
+	if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", remote, "add", "README.md")
+	runCmd(t, "git", "-C", remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "main")
+	runCmd(t, "git", "-C", remote, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", remote, "add", "README.md")
+	runCmd(t, "git", "-C", remote, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "feature")
+	wantOID := strings.TrimSpace(runCmdOutput(t, "git", "-C", remote, "rev-parse", "feature"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "main", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: remote, Branch: "feature", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotOID, _, err := svc.git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOID != wantOID {
+		t.Fatalf("prepared HEAD = %s, want feature HEAD %s", gotOID, wantOID)
+	}
+}
+
+func TestRepoPrepareLockSerializesServices(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	first, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.withRepoPrepareLock(ctx, "repo", func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- second.withRepoPrepareLock(ctx, "repo", func() error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+	<-secondStarted
+	select {
+	case <-secondEntered:
+		t.Fatal("second service entered preparation while the first held the repo lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second service did not enter preparation after the lock was released")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAddRepoAsyncRejectsInlineCredentials(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
