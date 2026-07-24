@@ -62,6 +62,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
 				ucli.StringFlag{Name: "branch", Value: "main", Usage: "branch to track"},
+				ucli.StringFlag{Name: "mode", Value: string(model.RepoModeWorkspace), Usage: "repository mode: workspace or snapshot"},
+				ucli.StringFlag{Name: "ref", Usage: "branch or tag to mount in snapshot mode"},
+				ucli.StringFlag{Name: "expected-oid", Usage: "exact commit OID required in snapshot mode"},
 				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "refresh interval"},
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
@@ -72,6 +75,14 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				remote := strings.TrimSpace(c.String("remote"))
+				branch := strings.TrimSpace(c.String("branch"))
+				ref := strings.TrimSpace(c.String("ref"))
+				if ref != "" {
+					if c.IsSet("branch") {
+						return fmt.Errorf("--ref and --branch cannot be used together")
+					}
+					branch = ref
+				}
 				async := c.Bool("async")
 				preparedGitDir := c.Bool("prepared-gitdir")
 				if preparedGitDir && !async {
@@ -94,8 +105,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					Name:            name,
 					ID:              model.RepoID(name),
 					RemoteURL:       remote,
-					Branch:          c.String("branch"),
+					Branch:          branch,
 					RefreshInterval: d,
+					Mode:            model.RepoMode(strings.TrimSpace(c.String("mode"))),
+					ExpectedOID:     strings.TrimSpace(c.String("expected-oid")),
 					MountRoot:       c.String("mount-root"),
 					GitDir:          c.String("git-dir"),
 					PreparedGitDir:  preparedGitDir,
@@ -259,8 +272,17 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 }
 
 func formatStatusLine(st model.RepoRuntimeState) string {
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
-		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef,
+	mode := st.Mode
+	if mode == "" {
+		mode = model.RepoModeWorkspace
+	}
+	expectedOID := st.ExpectedOID
+	if expectedOID == "" {
+		expectedOID = "none"
+	}
+	targetVerified := st.TargetVerified || mode != model.RepoModeSnapshot
+	return fmt.Sprintf("repo=%s state=%s mode=%s head=%s ref=%s expected_oid=%s target_verified=%t ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+		st.RepoID, st.State, mode, st.CurrentHEADOID, st.CurrentHEADRef, expectedOID, targetVerified,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatPrepareError(st.PrepareError),

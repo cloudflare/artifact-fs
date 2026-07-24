@@ -80,7 +80,9 @@ func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 		"add-repo",
 		"--name", "repo",
 		"--remote", "https://github.com/example/repo.git",
-		"--branch", "main",
+		"--mode", "snapshot",
+		"--ref", "main",
+		"--expected-oid", "0123456789012345678901234567890123456789",
 		"--async",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -116,6 +118,26 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			name: "async_rejects_inline_credentials",
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://token@example.com/org/repo.git"},
 			want: "async repositories must use ambient credentials",
+		},
+		{
+			name: "snapshot_requires_expected_oid",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "snapshot"},
+			want: "--expected-oid is required in snapshot mode",
+		},
+		{
+			name: "workspace_rejects_expected_oid",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--expected-oid", "0123456789012345678901234567890123456789"},
+			want: "--expected-oid requires --mode snapshot",
+		},
+		{
+			name: "rejects_unknown_mode",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "other"},
+			want: "unsupported repository mode",
+		},
+		{
+			name: "ref_conflicts_with_branch",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "snapshot", "--ref", "main", "--branch", "main", "--expected-oid", "0123456789012345678901234567890123456789"},
+			want: "--ref and --branch cannot be used together",
 		},
 	}
 	for _, tt := range tests {

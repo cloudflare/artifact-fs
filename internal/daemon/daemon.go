@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -310,6 +311,8 @@ func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model
 func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 	return a.Branch == b.Branch &&
 		a.RemoteURL == b.RemoteURL &&
+		a.Mode == b.Mode &&
+		a.ExpectedOID == b.ExpectedOID &&
 		a.PreparedGitDir == b.PreparedGitDir &&
 		a.FetchRef == b.FetchRef &&
 		a.GitDir == b.GitDir &&
@@ -318,6 +321,32 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 		a.OverlayDBPath == b.OverlayDBPath &&
 		a.BlobCacheDir == b.BlobCacheDir &&
 		a.MountPath == b.MountPath
+}
+
+func normalizeRepoMode(cfg *model.RepoConfig) error {
+	if cfg.Mode == "" {
+		cfg.Mode = model.RepoModeWorkspace
+	}
+	cfg.ExpectedOID = strings.ToLower(strings.TrimSpace(cfg.ExpectedOID))
+	switch cfg.Mode {
+	case model.RepoModeWorkspace:
+		if cfg.ExpectedOID != "" {
+			return fmt.Errorf("--expected-oid requires --mode snapshot")
+		}
+	case model.RepoModeSnapshot:
+		if cfg.ExpectedOID == "" {
+			return fmt.Errorf("--expected-oid is required in snapshot mode")
+		}
+		if len(cfg.ExpectedOID) != 40 && len(cfg.ExpectedOID) != 64 {
+			return fmt.Errorf("--expected-oid must be a full 40- or 64-character commit OID")
+		}
+		if _, err := hex.DecodeString(cfg.ExpectedOID); err != nil {
+			return fmt.Errorf("--expected-oid must be hexadecimal")
+		}
+	default:
+		return fmt.Errorf("unsupported repository mode %q; expected workspace or snapshot", cfg.Mode)
+	}
+	return nil
 }
 
 func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoConfig) bool {
@@ -341,6 +370,9 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
 	}
+	if err := normalizeRepoMode(&cfg); err != nil {
+		return err
+	}
 	if cfg.ID == "" {
 		cfg.ID = model.RepoID(cfg.Name)
 	}
@@ -356,6 +388,9 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	cloneURL := cfg.RemoteURL
 	if cfg.PreparedGitDir && !opts.Async {
 		return fmt.Errorf("--prepared-gitdir requires --async")
+	}
+	if cfg.PreparedGitDir && cfg.Mode == model.RepoModeSnapshot {
+		return fmt.Errorf("--prepared-gitdir is not supported in snapshot mode")
 	}
 	if opts.Async {
 		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
@@ -462,6 +497,7 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		cfg = rt.cfg
 		s.mu.Unlock()
 		applyHydrationStats(&st, cfg.BlobCacheDir)
+		applyRepoModeStatus(&st, cfg)
 		return st, nil
 	}
 	s.mu.Unlock()
@@ -478,6 +514,9 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	}
 	if cfg.PrepareState == model.PrepareStateFailed {
 		return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+	}
+	if cfg.Mode == model.RepoModeSnapshot {
+		return errors.New("snapshot repositories are pinned and cannot be fetched")
 	}
 	if err := s.git.Fetch(ctx, cfg); err != nil {
 		return err
@@ -561,6 +600,16 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
 	return nil
 }
 
+func verifySnapshotHEAD(cfg model.RepoConfig, headOID string) error {
+	if cfg.Mode != model.RepoModeSnapshot {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(headOID), cfg.ExpectedOID) {
+		return fmt.Errorf("snapshot HEAD %s does not match expected OID %s", headOID, cfg.ExpectedOID)
+	}
+	return nil
+}
+
 // ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
 // The returned snapshot store remains open for callers that need to continue
 // into runtime startup.
@@ -573,6 +622,9 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig) 
 	}
 	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
+		return nil, "", "", 0, err
+	}
+	if err := verifySnapshotHEAD(cfg, headOID); err != nil {
 		return nil, "", "", 0, err
 	}
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
@@ -858,7 +910,11 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 			return fail(errors.New("remote URL is required for async clone"))
 		}
 		if _, err := os.Stat(cfg.GitDir); err == nil {
-			if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+			if cfg.Mode == model.RepoModeSnapshot {
+				if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
+					return fail(err)
+				}
+			} else if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
 				return fail(err)
 			}
 		} else if errors.Is(err, os.ErrNotExist) {
@@ -880,6 +936,9 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 
 	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
+		return fail(err)
+	}
+	if err := verifySnapshotHEAD(cfg, headOID); err != nil {
 		return fail(err)
 	}
 	snap, closeSnap, err := s.snapshotForPrepare(ctx, cfg)
@@ -1316,7 +1375,17 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 		st.LastFetchResult = "ok"
 	}
 	applyHydrationStats(&st, cfg.BlobCacheDir)
+	applyRepoModeStatus(&st, cfg)
 	return st
+}
+
+func applyRepoModeStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
+	st.Mode = cfg.Mode
+	if st.Mode == "" {
+		st.Mode = model.RepoModeWorkspace
+	}
+	st.ExpectedOID = cfg.ExpectedOID
+	st.TargetVerified = st.Mode != model.RepoModeSnapshot || strings.EqualFold(st.CurrentHEADOID, cfg.ExpectedOID)
 }
 
 func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
@@ -1522,13 +1591,20 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	}
 	rt.active = true
 	gitDir := rt.cfg.GitDir
-	rt.workers.Add(2)
+	snapshotMode := rt.cfg.Mode == model.RepoModeSnapshot
+	workerCount := 2
+	if snapshotMode {
+		workerCount = 1
+	}
+	rt.workers.Add(workerCount)
 	s.mu.Unlock()
 
-	go func() {
-		defer rt.workers.Done()
-		s.refreshLoop(rt)
-	}()
+	if !snapshotMode {
+		go func() {
+			defer rt.workers.Done()
+			s.refreshLoop(rt)
+		}()
+	}
 
 	w := watcher.New(500 * time.Millisecond)
 	go func() {

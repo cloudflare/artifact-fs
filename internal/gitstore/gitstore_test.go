@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -513,6 +514,91 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("DEV.md not found after existing clone prepare")
+	}
+}
+
+func TestCloneBloblessSnapshotIsShallowAndVerifiesHEAD(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+
+	run(t, "git", "init", "--bare", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "main")
+	for i, content := range []string{"one\n", "two\n", "three\n"} {
+		if err := os.WriteFile(filepath.Join(work, "README.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", work, "add", "README.md")
+		run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", fmt.Sprintf("commit %d", i+1))
+	}
+	run(t, "git", "-C", work, "push", "origin", "main")
+	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+
+	tip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	blobOID := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD:README.md"))
+	gitDir := filepath.Join(tmp, "snapshot.git")
+	cfg := model.RepoConfig{
+		ID:          "snapshot",
+		Name:        "snapshot",
+		GitDir:      gitDir,
+		RemoteURL:   "file://" + bare,
+		Branch:      "main",
+		Mode:        model.RepoModeSnapshot,
+		ExpectedOID: tip,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless: %v", err)
+	}
+
+	count, err := runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != "1" {
+		t.Fatalf("snapshot history count = %q, want 1", count)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "shallow")); err != nil {
+		t.Fatalf("snapshot clone is not shallow: %v", err)
+	}
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "-e", blobOID)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_NO_LAZY_FETCH=1")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("snapshot clone eagerly downloaded the HEAD blob")
+	}
+
+	// A server without partial-clone filtering still honors depth=1. Git falls
+	// back to transferring the tip's blobs, but not the branch's full history.
+	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "false")
+	fallbackDir := filepath.Join(tmp, "fallback.git")
+	cfg.GitDir = fallbackDir
+	if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
+		t.Fatalf("CloneBlobless fallback: %v", err)
+	}
+	fallbackCount, err := runGit(ctx, fallbackDir, "rev-list", "--count", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallbackCount != "1" {
+		t.Fatalf("fallback snapshot history count = %q, want 1", fallbackCount)
+	}
+	cmd = exec.CommandContext(ctx, "git", "cat-file", "-e", blobOID)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+fallbackDir, "GIT_NO_LAZY_FETCH=1")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("fallback snapshot did not download the HEAD blob: %v", err)
+	}
+
+	mismatchDir := filepath.Join(tmp, "mismatch.git")
+	cfg.GitDir = mismatchDir
+	cfg.ExpectedOID = strings.Repeat("0", 40)
+	err = New(nil).CloneBlobless(ctx, cfg)
+	if err == nil || !strings.Contains(err.Error(), "does not match expected OID") {
+		t.Fatalf("mismatched snapshot error = %v", err)
+	}
+	if _, statErr := os.Stat(mismatchDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("mismatched snapshot left git dir behind: %v", statErr)
 	}
 }
 
@@ -1704,9 +1790,15 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 
 func run(t *testing.T, name string, args ...string) {
 	t.Helper()
+	_ = runOutput(t, name, args...)
+}
+
+func runOutput(t *testing.T, name string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, string(out))
 	}
+	return string(out)
 }

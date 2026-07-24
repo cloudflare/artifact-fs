@@ -74,14 +74,16 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted head=d4c61587... ref=main ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
+# repo=workers-sdk state=mounted mode=workspace head=d4c61587... ref=main expected_oid=none target_verified=true ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `state` | `mounted` or `unmounted` |
+| `mode` | `workspace` or immutable-source `snapshot` mode |
 | `head` | Current HEAD commit OID |
-| `ref` | Tracked branch |
+| `ref` | Tracked branch or snapshot ref |
+| `expected_oid` / `target_verified` | Requested snapshot commit and whether the mounted HEAD matches it |
 | `ahead` / `behind` | Commits ahead/behind the remote tracking branch |
 | `overlay_dirty` | `true` if there are local writes (created, modified, or deleted files) |
 | `last_fetch` / `result` | Timestamp and outcome of the last background fetch |
@@ -139,6 +141,28 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --git-dir /tmp/workers-sdk.git \
   --fetch-ref main
 ```
+
+## Shallow snapshots
+
+Use snapshot mode when a job needs one exact repository revision rather than branch history, for example when checking the source that is about to be deployed:
+
+```bash
+artifact-fs add-repo \
+  --name workers-sdk-check \
+  --remote https://github.com/cloudflare/workers-sdk.git \
+  --mode snapshot \
+  --ref main \
+  --expected-oid "$DEPLOY_SHA" \
+  --mount-root /tmp
+```
+
+Snapshot mode adds `--depth=1` to the blobless clone and verifies the cloned `HEAD` before publishing the filesystem snapshot. The expected OID must be a full 40- or 64-character commit ID. If the named ref moved, preparation fails instead of checking different source.
+
+Snapshot repositories do not perform periodic remote fetches, and the `artifact-fs fetch` command rejects them. Their source revision stays pinned, while the mounted filesystem remains writable through ArtifactFS's local overlay. Create a fresh snapshot repository to check a different revision.
+
+The remote must advertise Git partial-clone filtering for file contents to hydrate over the network on demand. If it does not, Git downloads the current revision's blobs eagerly, but depth 1 still prevents historical commits and obsolete blob versions from being transferred.
+
+`--prepared-gitdir` is not supported in snapshot mode.
 
 ## Sandboxes and Containers
 
@@ -212,7 +236,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 ### Data flow
 
-1. **Clone/fetch** -- `add-repo` runs `git clone --filter=blob:none` (blobless) unless `--async` is used. In async mode, the daemon performs either the blobless clone or a fetch into a prepared gitdir. Only commits, trees, and refs are fetched. No file content is downloaded.
+1. **Clone/fetch** -- `add-repo` runs `git clone --filter=blob:none` (blobless) unless `--async` is used. Snapshot mode also requests `--depth=1`. In async mode, the daemon performs either the blobless clone or a fetch into a prepared gitdir. When the remote advertises partial-clone filtering, only commits, trees, and refs are fetched initially; otherwise Git falls back to downloading blobs eagerly.
 
 2. **Index** -- `git ls-tree -r -t -z HEAD` enumerates every path in the tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
 

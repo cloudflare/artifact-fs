@@ -35,6 +35,8 @@ var migrations = []string{
 	  fetch_ref TEXT NOT NULL DEFAULT '',
 	  prepare_state TEXT NOT NULL DEFAULT '',
 	  prepare_error TEXT NOT NULL DEFAULT '',
+	  mode TEXT NOT NULL DEFAULT 'workspace',
+	  expected_oid TEXT NOT NULL DEFAULT '',
 	  created_at_ns INTEGER NOT NULL,
 	  updated_at_ns INTEGER NOT NULL
 	);`,
@@ -63,10 +65,13 @@ func New(ctx context.Context, dbPath string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
+	if cfg.Mode == "" {
+		cfg.Mode = model.RepoModeWorkspace
+	}
 	now := time.Now().UnixNano()
 	_, err := s.db.ExecContext(ctx, `
-	INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, created_at_ns, updated_at_ns)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO repos (repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, mode, expected_oid, created_at_ns, updated_at_ns)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(repo_id) DO UPDATE SET
 	name=excluded.name,
 	mount_root=excluded.mount_root,
@@ -86,8 +91,10 @@ func (s *Store) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 	fetch_ref=excluded.fetch_ref,
 	prepare_state=excluded.prepare_state,
 	prepare_error=excluded.prepare_error,
+	mode=excluded.mode,
+	expected_oid=excluded.expected_oid,
 	updated_at_ns=excluded.updated_at_ns
-	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, now, now)
+	`, string(cfg.ID), cfg.Name, cfg.MountRoot, cfg.MountPath, cfg.RemoteURL, cfg.RemoteURLRedacted, cfg.Branch, int64(cfg.RefreshInterval.Seconds()), int64(cfg.RefreshInterval), cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, boolToInt(cfg.Enabled), boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.PrepareState, cfg.PrepareError, cfg.Mode, cfg.ExpectedOID, now, now)
 	return err
 }
 
@@ -137,7 +144,9 @@ func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoC
 	  AND meta_db_path=?
 	  AND overlay_db_path=?
 	  AND mount_path=?
-	`, state, prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath)
+	  AND mode=?
+	  AND expected_oid=?
+	`, state, prepareErr, time.Now().UnixNano(), string(cfg.ID), cfg.Branch, cfg.RemoteURL, boolToInt(cfg.PreparedGitDir), cfg.FetchRef, cfg.GitDir, cfg.OverlayDir, cfg.BlobCacheDir, cfg.MetaDBPath, cfg.OverlayDBPath, cfg.MountPath, cfg.Mode, cfg.ExpectedOID)
 	if err != nil {
 		return err
 	}
@@ -157,12 +166,12 @@ func (s *Store) RemoveRepo(ctx context.Context, name string) error {
 }
 
 func (s *Store) GetRepo(ctx context.Context, name string) (model.RepoConfig, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error FROM repos WHERE name=?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, mode, expected_oid FROM repos WHERE name=?`, name)
 	return scanRepo(row)
 }
 
 func (s *Store) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error FROM repos ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT repo_id, name, mount_root, mount_path, remote_url, remote_url_redacted, branch, refresh_interval_seconds, refresh_interval_ns, git_dir, overlay_dir, blob_cache_dir, meta_db_path, overlay_db_path, enabled, prepared_gitdir, fetch_ref, prepare_state, prepare_error, mode, expected_oid FROM repos ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +197,7 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	var refreshNS int64
 	var enabled int
 	var preparedGitDir int
-	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError); err != nil {
+	if err := s.Scan(&cfg.ID, &cfg.Name, &cfg.MountRoot, &cfg.MountPath, &cfg.RemoteURL, &cfg.RemoteURLRedacted, &cfg.Branch, &refresh, &refreshNS, &cfg.GitDir, &cfg.OverlayDir, &cfg.BlobCacheDir, &cfg.MetaDBPath, &cfg.OverlayDBPath, &enabled, &preparedGitDir, &cfg.FetchRef, &cfg.PrepareState, &cfg.PrepareError, &cfg.Mode, &cfg.ExpectedOID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return cfg, fmt.Errorf("repo not found")
 		}
@@ -203,6 +212,9 @@ func scanRepo(s scanner) (model.RepoConfig, error) {
 	}
 	cfg.Enabled = enabled == 1
 	cfg.PreparedGitDir = preparedGitDir == 1
+	if cfg.Mode == "" {
+		cfg.Mode = model.RepoModeWorkspace
+	}
 	return cfg, nil
 }
 
@@ -242,6 +254,8 @@ func ensureRepoColumns(ctx context.Context, db *sql.DB) error {
 		"prepare_state":       `TEXT NOT NULL DEFAULT ''`,
 		"prepare_error":       `TEXT NOT NULL DEFAULT ''`,
 		"refresh_interval_ns": `INTEGER NOT NULL DEFAULT 0`,
+		"mode":                `TEXT NOT NULL DEFAULT 'workspace'`,
+		"expected_oid":        `TEXT NOT NULL DEFAULT ''`,
 	}
 	for name, ddl := range add {
 		if cols[name] {

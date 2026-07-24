@@ -14,6 +14,13 @@ var ErrBlobTooLarge = errors.New("blob too large")
 
 type RepoID string
 
+type RepoMode string
+
+const (
+	RepoModeWorkspace RepoMode = "workspace"
+	RepoModeSnapshot  RepoMode = "snapshot"
+)
+
 type RepoConfig struct {
 	ID                RepoID
 	Name              string
@@ -33,6 +40,8 @@ type RepoConfig struct {
 	FetchRef          string
 	PrepareState      string
 	PrepareError      string
+	Mode              RepoMode
+	ExpectedOID       string
 }
 
 type RepoRuntimeState struct {
@@ -50,6 +59,9 @@ type RepoRuntimeState struct {
 	DirtyOverlay       bool
 	State              string
 	PrepareError       string
+	Mode               RepoMode
+	ExpectedOID        string
+	TargetVerified     bool
 }
 
 const (

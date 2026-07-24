@@ -238,7 +238,11 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		if err != nil {
 			return fmt.Errorf("mktemp clone dir: %w", err)
 		}
-		args := []string{"clone", "--filter=blob:none", "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target}
+		args := []string{"clone", "--filter=blob:none"}
+		if cfg.Mode == model.RepoModeSnapshot {
+			args = append(args, "--depth=1")
+		}
+		args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target)
 		_, err = runGitWithEnv(ctx, "", env, args...)
 		if err != nil {
 			_ = os.RemoveAll(target)
@@ -251,8 +255,19 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	}
 	defer os.RemoveAll(target)
 
+	targetGitDir := filepath.Join(target, ".git")
+	if cfg.Mode == model.RepoModeSnapshot {
+		headOID, err := runGit(ctx, targetGitDir, "rev-parse", "--verify", "HEAD^{commit}")
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(strings.TrimSpace(headOID), cfg.ExpectedOID) {
+			return fmt.Errorf("snapshot HEAD %s does not match expected OID %s", headOID, cfg.ExpectedOID)
+		}
+	}
+
 	// Populate the index so git status works inside the mount.
-	if _, err := runGit(ctx, filepath.Join(target, ".git"), "read-tree", "HEAD"); err != nil {
+	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
 		return err
 	}
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {

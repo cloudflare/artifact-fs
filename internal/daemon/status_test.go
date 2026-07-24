@@ -17,6 +17,40 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
+func TestSnapshotModeStatusAndFetchPolicy(t *testing.T) {
+	const expectedOID = "0123456789012345678901234567890123456789"
+	st := model.RepoRuntimeState{CurrentHEADOID: expectedOID}
+	cfg := model.RepoConfig{Mode: model.RepoModeSnapshot, ExpectedOID: expectedOID}
+	applyRepoModeStatus(&st, cfg)
+	if st.Mode != model.RepoModeSnapshot || st.ExpectedOID != expectedOID || !st.TargetVerified {
+		t.Fatalf("snapshot status = %+v", st)
+	}
+	st.CurrentHEADOID = strings.Repeat("f", 40)
+	applyRepoModeStatus(&st, cfg)
+	if st.TargetVerified {
+		t.Fatal("mismatched snapshot reported target_verified=true")
+	}
+
+	ctx := context.Background()
+	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg.ID = "snapshot"
+	cfg.Name = "snapshot"
+	cfg.Branch = "main"
+	cfg.PrepareState = model.PrepareStateReady
+	cfg.Enabled = true
+	svc.fillPaths(&cfg)
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "pinned") {
+		t.Fatalf("FetchNow error = %v, want pinned snapshot rejection", err)
+	}
+}
+
 func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()

@@ -35,6 +35,8 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 		PreparedGitDir:    true,
 		FetchRef:          "master",
 		PrepareState:      model.PrepareStatePreparing,
+		Mode:              model.RepoModeSnapshot,
+		ExpectedOID:       "0123456789012345678901234567890123456789",
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -58,6 +60,12 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	}
 	if got.PrepareError != "clone failed" {
 		t.Fatalf("PrepareError = %q, want clone failed", got.PrepareError)
+	}
+	if got.Mode != model.RepoModeSnapshot {
+		t.Fatalf("Mode = %q, want snapshot", got.Mode)
+	}
+	if got.ExpectedOID != cfg.ExpectedOID {
+		t.Fatalf("ExpectedOID = %q, want %q", got.ExpectedOID, cfg.ExpectedOID)
 	}
 }
 
