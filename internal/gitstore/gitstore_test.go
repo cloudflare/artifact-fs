@@ -517,7 +517,7 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	}
 }
 
-func TestCloneBloblessSnapshotIsShallowAndVerifiesHEAD(t *testing.T) {
+func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	tmp := t.TempDir()
 	bare := filepath.Join(tmp, "origin.git")
 	work := filepath.Join(tmp, "work")
@@ -539,18 +539,23 @@ func TestCloneBloblessSnapshotIsShallowAndVerifiesHEAD(t *testing.T) {
 	blobOID := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD:README.md"))
 	gitDir := filepath.Join(tmp, "snapshot.git")
 	cfg := model.RepoConfig{
-		ID:          "snapshot",
-		Name:        "snapshot",
-		GitDir:      gitDir,
-		RemoteURL:   "file://" + bare,
-		Branch:      "main",
-		Mode:        model.RepoModeSnapshot,
-		ExpectedOID: tip,
+		ID:             "verified",
+		Name:           "verified",
+		GitDir:         gitDir,
+		RemoteURL:      "file://" + bare,
+		Branch:         "refs/heads/main",
+		RequiredCommit: tip,
+		HistoryDepth:   1,
 	}
+	requirement := model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
-		t.Fatalf("CloneBlobless: %v", err)
+	prepared, err := New(nil).PrepareSource(ctx, cfg, requirement)
+	if err != nil {
+		t.Fatalf("PrepareSource: %v", err)
+	}
+	if !prepared.Verified || prepared.Ref != cfg.Branch || prepared.Commit != tip {
+		t.Fatalf("prepared source = %+v", prepared)
 	}
 
 	count, err := runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
@@ -574,8 +579,8 @@ func TestCloneBloblessSnapshotIsShallowAndVerifiesHEAD(t *testing.T) {
 	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "false")
 	fallbackDir := filepath.Join(tmp, "fallback.git")
 	cfg.GitDir = fallbackDir
-	if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
-		t.Fatalf("CloneBlobless fallback: %v", err)
+	if _, err := New(nil).PrepareSource(ctx, cfg, requirement); err != nil {
+		t.Fatalf("PrepareSource fallback: %v", err)
 	}
 	fallbackCount, err := runGit(ctx, fallbackDir, "rev-list", "--count", "HEAD")
 	if err != nil {
@@ -592,10 +597,10 @@ func TestCloneBloblessSnapshotIsShallowAndVerifiesHEAD(t *testing.T) {
 
 	mismatchDir := filepath.Join(tmp, "mismatch.git")
 	cfg.GitDir = mismatchDir
-	cfg.ExpectedOID = strings.Repeat("0", 40)
-	err = New(nil).CloneBlobless(ctx, cfg)
-	if err == nil || !strings.Contains(err.Error(), "does not match expected OID") {
-		t.Fatalf("mismatched snapshot error = %v", err)
+	requirement.RequiredCommit = strings.Repeat("0", 40)
+	_, err = New(nil).PrepareSource(ctx, cfg, requirement)
+	if err == nil || !strings.Contains(err.Error(), "source changed") {
+		t.Fatalf("mismatched source error = %v", err)
 	}
 	if _, statErr := os.Stat(mismatchDir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("mismatched snapshot left git dir behind: %v", statErr)

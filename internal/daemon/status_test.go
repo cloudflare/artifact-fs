@@ -17,18 +17,27 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
-func TestSnapshotModeStatusAndFetchPolicy(t *testing.T) {
-	const expectedOID = "0123456789012345678901234567890123456789"
-	st := model.RepoRuntimeState{CurrentHEADOID: expectedOID}
-	cfg := model.RepoConfig{Mode: model.RepoModeSnapshot, ExpectedOID: expectedOID}
-	applyRepoModeStatus(&st, cfg)
-	if st.Mode != model.RepoModeSnapshot || st.ExpectedOID != expectedOID || !st.TargetVerified {
-		t.Fatalf("snapshot status = %+v", st)
+func TestVerifiedSourceStatusAndRefreshPolicy(t *testing.T) {
+	const requiredCommit = "0123456789012345678901234567890123456789"
+	cfg := model.RepoConfig{
+		Branch:                "refs/heads/main",
+		RequiredCommit:        requiredCommit,
+		AcquiredRef:           "refs/heads/main",
+		AcquiredCommit:        requiredCommit,
+		AcquiredAt:            time.Now(),
+		RemoteRefreshDisabled: true,
 	}
+	st := model.RepoRuntimeState{CurrentHEADOID: requiredCommit}
+	applySourceStatus(&st, cfg)
+	if st.SourceRef != cfg.Branch || st.RequiredCommit != requiredCommit || st.Acquisition != "verified" || !st.RemoteRefreshDisabled {
+		t.Fatalf("verified source status = %+v", st)
+	}
+
+	// Acquisition is historical evidence, not a mutable comparison against HEAD.
 	st.CurrentHEADOID = strings.Repeat("f", 40)
-	applyRepoModeStatus(&st, cfg)
-	if st.TargetVerified {
-		t.Fatal("mismatched snapshot reported target_verified=true")
+	applySourceStatus(&st, cfg)
+	if st.Acquisition != "verified" {
+		t.Fatalf("acquisition = %q, want verified", st.Acquisition)
 	}
 
 	ctx := context.Background()
@@ -37,17 +46,29 @@ func TestSnapshotModeStatusAndFetchPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.Close()
-	cfg.ID = "snapshot"
-	cfg.Name = "snapshot"
-	cfg.Branch = "main"
+	cfg.ID = "verified"
+	cfg.Name = "verified"
 	cfg.PrepareState = model.PrepareStateReady
 	cfg.Enabled = true
 	svc.fillPaths(&cfg)
 	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "pinned") {
-		t.Fatalf("FetchNow error = %v, want pinned snapshot rejection", err)
+	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
+		t.Fatalf("FetchNow error = %v, want refresh-disabled rejection", err)
+	}
+}
+
+func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
+	const requiredCommit = "0123456789012345678901234567890123456789"
+	runtime := &repoRuntime{
+		cfg:   model.RepoConfig{ID: "verified", RequiredCommit: requiredCommit, GitDir: filepath.Join(t.TempDir(), "missing")},
+		state: model.RepoRuntimeState{CurrentHEADOID: requiredCommit, SnapshotGeneration: 1},
+	}
+	service := &Service{running: map[model.RepoID]*repoRuntime{"verified": runtime}}
+	service.onHEADChanged(context.Background(), runtime)
+	if runtime.state.CurrentHEADOID != requiredCommit || runtime.state.SnapshotGeneration != 1 {
+		t.Fatalf("fixed base changed: %+v", runtime.state)
 	}
 }
 

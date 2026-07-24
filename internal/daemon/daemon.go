@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -201,7 +200,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		s.mu.Unlock()
 		if running {
 			s.retryRuntimeMount(rt)
-			s.updateRuntimeRefresh(rt, repo.RefreshInterval)
+			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
 			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
 			continue
 		}
@@ -311,8 +310,9 @@ func (s *Service) restartRunningPrepareIfCurrent(ctx context.Context, repo model
 func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 	return a.Branch == b.Branch &&
 		a.RemoteURL == b.RemoteURL &&
-		a.Mode == b.Mode &&
-		a.ExpectedOID == b.ExpectedOID &&
+		a.RequiredCommit == b.RequiredCommit &&
+		a.HistoryDepth == b.HistoryDepth &&
+		a.RemoteRefreshDisabled == b.RemoteRefreshDisabled &&
 		a.PreparedGitDir == b.PreparedGitDir &&
 		a.FetchRef == b.FetchRef &&
 		a.GitDir == b.GitDir &&
@@ -323,28 +323,27 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 		a.MountPath == b.MountPath
 }
 
-func normalizeRepoMode(cfg *model.RepoConfig) error {
-	if cfg.Mode == "" {
-		cfg.Mode = model.RepoModeWorkspace
+func normalizeSourceConfig(cfg *model.RepoConfig) error {
+	cfg.Branch = strings.TrimSpace(cfg.Branch)
+	if cfg.Branch == "" {
+		cfg.Branch = "refs/heads/main"
+	} else if !strings.HasPrefix(cfg.Branch, "refs/") {
+		cfg.Branch = "refs/heads/" + cfg.Branch
 	}
-	cfg.ExpectedOID = strings.ToLower(strings.TrimSpace(cfg.ExpectedOID))
-	switch cfg.Mode {
-	case model.RepoModeWorkspace:
-		if cfg.ExpectedOID != "" {
-			return fmt.Errorf("--expected-oid requires --mode snapshot")
+	cfg.RequiredCommit = strings.ToLower(strings.TrimSpace(cfg.RequiredCommit))
+	if cfg.HistoryDepth < 0 {
+		return errors.New("--depth must not be negative")
+	}
+	if cfg.RequiredCommit == "" {
+		return nil
+	}
+	if len(cfg.RequiredCommit) != 40 && len(cfg.RequiredCommit) != 64 {
+		return errors.New("--require-commit must be a full 40- or 64-character commit OID")
+	}
+	for _, character := range cfg.RequiredCommit {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return errors.New("--require-commit must be hexadecimal")
 		}
-	case model.RepoModeSnapshot:
-		if cfg.ExpectedOID == "" {
-			return fmt.Errorf("--expected-oid is required in snapshot mode")
-		}
-		if len(cfg.ExpectedOID) != 40 && len(cfg.ExpectedOID) != 64 {
-			return fmt.Errorf("--expected-oid must be a full 40- or 64-character commit OID")
-		}
-		if _, err := hex.DecodeString(cfg.ExpectedOID); err != nil {
-			return fmt.Errorf("--expected-oid must be hexadecimal")
-		}
-	default:
-		return fmt.Errorf("unsupported repository mode %q; expected workspace or snapshot", cfg.Mode)
 	}
 	return nil
 }
@@ -357,7 +356,7 @@ func (s *Service) prepareConfigStillCurrent(ctx context.Context, cfg model.RepoC
 	}
 	s.fillPaths(&latest)
 	if strings.TrimSpace(latest.FetchRef) == "" {
-		latest.FetchRef = latest.Branch
+		latest.FetchRef = defaultFetchRef(latest.Branch)
 	}
 	return samePrepareConfig(cfg, latest)
 }
@@ -370,7 +369,7 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
 	}
-	if err := normalizeRepoMode(&cfg); err != nil {
+	if err := normalizeSourceConfig(&cfg); err != nil {
 		return err
 	}
 	if cfg.ID == "" {
@@ -383,14 +382,14 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
 	s.fillPaths(&cfg)
 	if strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = cfg.Branch
+		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	cloneURL := cfg.RemoteURL
 	if cfg.PreparedGitDir && !opts.Async {
 		return fmt.Errorf("--prepared-gitdir requires --async")
 	}
-	if cfg.PreparedGitDir && cfg.Mode == model.RepoModeSnapshot {
-		return fmt.Errorf("--prepared-gitdir is not supported in snapshot mode")
+	if cfg.PreparedGitDir && cfg.RequiredCommit != "" {
+		return fmt.Errorf("--prepared-gitdir is not supported with --require-commit")
 	}
 	if opts.Async {
 		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
@@ -434,8 +433,8 @@ func (s *Service) ListRepos(ctx context.Context) ([]model.RepoConfig, error) {
 	return s.registry.ListRepos(ctx)
 }
 
-func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Duration) error {
-	if interval <= 0 {
+func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Duration, disabled bool) error {
+	if interval <= 0 && !disabled {
 		return errors.New("refresh interval must be positive")
 	}
 	cfg, err := s.registry.GetRepo(ctx, name)
@@ -443,29 +442,31 @@ func (s *Service) SetRefresh(ctx context.Context, name string, interval time.Dur
 		return err
 	}
 	cfg.RefreshInterval = interval
-	if err := s.registry.UpdateRefresh(ctx, cfg.ID, interval); err != nil {
+	cfg.RemoteRefreshDisabled = disabled
+	if err := s.registry.UpdateRefresh(ctx, cfg.ID, interval, disabled); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	rt := s.running[cfg.ID]
 	s.mu.Unlock()
-	s.updateRuntimeRefresh(rt, interval)
+	s.updateRuntimeRefresh(rt, interval, disabled)
 	return nil
 }
 
-func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration) {
-	if rt == nil || interval <= 0 {
+func (s *Service) updateRuntimeRefresh(rt *repoRuntime, interval time.Duration, disabled bool) {
+	if rt == nil {
 		return
 	}
 	s.mu.Lock()
-	if rt.cfg.RefreshInterval == interval {
+	if rt.cfg.RefreshInterval == interval && rt.cfg.RemoteRefreshDisabled == disabled {
 		s.mu.Unlock()
 		return
 	}
 	rt.cfg.RefreshInterval = interval
+	rt.cfg.RemoteRefreshDisabled = disabled
 	refresh := rt.refresh
 	s.mu.Unlock()
-	if refresh != nil {
+	if refresh != nil && interval > 0 {
 		select {
 		case refresh <- interval:
 		default:
@@ -494,10 +495,10 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		dirty, _ := rt.overlay.DirtyCount(ctx)
 		rt.state.DirtyOverlay = dirty > 0
 		st := rt.state // copy under lock
-		cfg = rt.cfg
+		blobCacheDir := rt.cfg.BlobCacheDir
 		s.mu.Unlock()
-		applyHydrationStats(&st, cfg.BlobCacheDir)
-		applyRepoModeStatus(&st, cfg)
+		applyHydrationStats(&st, blobCacheDir)
+		applySourceStatus(&st, cfg)
 		return st, nil
 	}
 	s.mu.Unlock()
@@ -515,8 +516,8 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	if cfg.PrepareState == model.PrepareStateFailed {
 		return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
 	}
-	if cfg.Mode == model.RepoModeSnapshot {
-		return errors.New("snapshot repositories are pinned and cannot be fetched")
+	if cfg.RemoteRefreshDisabled {
+		return errors.New("remote refresh is disabled for this repository")
 	}
 	if err := s.git.Fetch(ctx, cfg); err != nil {
 		return err
@@ -547,7 +548,7 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	cfg.PrepareState = model.PrepareStatePreparing
 	cfg.PrepareError = ""
 	if strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = cfg.Branch
+		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 	if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, model.PrepareStatePreparing, ""); err != nil {
 		return err
@@ -600,14 +601,29 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
 	return nil
 }
 
-func verifySnapshotHEAD(cfg model.RepoConfig, headOID string) error {
-	if cfg.Mode != model.RepoModeSnapshot {
+func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (model.PreparedSource, error) {
+	if cfg.RequiredCommit != "" {
+		return s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
+			Ref:            cfg.Branch,
+			RequiredCommit: cfg.RequiredCommit,
+			Depth:          cfg.HistoryDepth,
+		})
+	}
+	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
+		return model.PreparedSource{}, err
+	}
+	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		return model.PreparedSource{}, err
+	}
+	return model.PreparedSource{Ref: headRef, Commit: headOID}, nil
+}
+
+func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
+	if !source.Verified || (cfg.AcquiredRef == source.Ref && strings.EqualFold(cfg.AcquiredCommit, source.Commit)) {
 		return nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(headOID), cfg.ExpectedOID) {
-		return fmt.Errorf("snapshot HEAD %s does not match expected OID %s", headOID, cfg.ExpectedOID)
-	}
-	return nil
+	return s.registry.RecordAcquisition(ctx, cfg, source)
 }
 
 // ensurePreparedRepo makes sure the repo is cloned and has an initial snapshot.
@@ -617,16 +633,11 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig) 
 	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
 		return nil, "", "", 0, err
 	}
-	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
-		return nil, "", "", 0, err
-	}
-	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+	source, err := s.prepareSource(ctx, cfg)
 	if err != nil {
 		return nil, "", "", 0, err
 	}
-	if err := verifySnapshotHEAD(cfg, headOID); err != nil {
-		return nil, "", "", 0, err
-	}
+	headOID, headRef := source.Commit, source.Ref
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		return nil, "", "", 0, err
@@ -642,6 +653,10 @@ func (s *Service) ensurePreparedRepo(ctx context.Context, cfg model.RepoConfig) 
 	s.mu.Lock()
 	runtimeMounted := s.running[cfg.ID] != nil
 	s.mu.Unlock()
+	if err := s.recordAcquisition(ctx, cfg, source); err != nil {
+		snap.Close()
+		return nil, "", "", 0, err
+	}
 	if !runtimeMounted {
 		if err := snap.PruneGenerations(ctx, gen); err != nil {
 			snap.Close()
@@ -671,10 +686,12 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		snap.Close()
 		return err
 	}
-	if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
-		ov.Close()
-		snap.Close()
-		return err
+	if cfg.RequiredCommit == "" {
+		if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
+			ov.Close()
+			snap.Close()
+			return err
+		}
 	}
 	h := hydrator.New(s.git)
 
@@ -875,7 +892,7 @@ func (s *Service) resetRunningPrepareState(cfg model.RepoConfig) bool {
 func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	s.fillPaths(&cfg)
 	if strings.TrimSpace(cfg.FetchRef) == "" {
-		cfg.FetchRef = cfg.Branch
+		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
 
 	fail := func(err error) error {
@@ -895,51 +912,62 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 
-	if cfg.PreparedGitDir {
-		if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
-			return fail(err)
-		}
-		if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-			return fail(err)
-		}
-		if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+	var source model.PreparedSource
+	if cfg.RequiredCommit != "" {
+		var err error
+		source, err = s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
+			Ref:            cfg.Branch,
+			RequiredCommit: cfg.RequiredCommit,
+			Depth:          cfg.HistoryDepth,
+		})
+		if err != nil {
 			return fail(err)
 		}
 	} else {
-		if strings.TrimSpace(cfg.RemoteURL) == "" {
-			return fail(errors.New("remote URL is required for async clone"))
-		}
-		if _, err := os.Stat(cfg.GitDir); err == nil {
-			if cfg.Mode == model.RepoModeSnapshot {
-				if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
-					return fail(err)
-				}
-			} else if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+		if cfg.PreparedGitDir {
+			if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
 				return fail(err)
 			}
-		} else if errors.Is(err, os.ErrNotExist) {
-			if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+			if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
 				return fail(err)
 			}
-			if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
+			if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
 				return fail(err)
 			}
-			if !sameBranchRef(cfg.FetchRef, cfg.Branch) {
+		} else {
+			if strings.TrimSpace(cfg.RemoteURL) == "" {
+				return fail(errors.New("remote URL is required for async clone"))
+			}
+			if _, err := os.Stat(cfg.GitDir); err == nil {
 				if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
 					return fail(err)
 				}
+			} else if errors.Is(err, os.ErrNotExist) {
+				if err := s.git.ValidateAmbientRemote(cfg); err != nil {
+					return fail(err)
+				}
+				if err := s.git.CloneBloblessNonInteractive(ctx, cfg); err != nil {
+					return fail(err)
+				}
+				if !sameBranchRef(cfg.FetchRef, cfg.Branch) {
+					if err := s.git.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
+						return fail(err)
+					}
+				}
+			} else {
+				return fail(err)
 			}
-		} else {
+		}
+		headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
+		if err != nil {
 			return fail(err)
 		}
+		source = model.PreparedSource{Ref: headRef, Commit: headOID}
 	}
 
-	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
-	if err != nil {
-		return fail(err)
-	}
-	if err := verifySnapshotHEAD(cfg, headOID); err != nil {
-		return fail(err)
+	headOID, headRef := source.Commit, source.Ref
+	if !s.prepareConfigStillCurrent(ctx, cfg) {
+		return errors.New("prepare superseded by newer repo config")
 	}
 	snap, closeSnap, err := s.snapshotForPrepare(ctx, cfg)
 	if err != nil {
@@ -953,13 +981,16 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	if err != nil {
 		return fail(err)
 	}
+	if err := s.recordAcquisition(ctx, cfg, source); err != nil {
+		return fail(err)
+	}
 	latest, err := s.registry.GetRepo(ctx, cfg.Name)
 	if err != nil {
 		return fail(err)
 	}
 	s.fillPaths(&latest)
 	if strings.TrimSpace(latest.FetchRef) == "" {
-		latest.FetchRef = latest.Branch
+		latest.FetchRef = defaultFetchRef(latest.Branch)
 	}
 	if !samePrepareConfig(cfg, latest) {
 		return errors.New("prepare superseded by newer repo config")
@@ -977,6 +1008,13 @@ func (s *Service) runPrepare(ctx context.Context, cfg model.RepoConfig) error {
 	cleanupCancel()
 	s.configureStatusOptimization(ctx, cfg)
 	return nil
+}
+
+func defaultFetchRef(sourceRef string) string {
+	if branch := branchRefName(sourceRef); branch != "" {
+		return branch
+	}
+	return strings.TrimSpace(sourceRef)
 }
 
 func sameBranchRef(fetchRef string, branch string) bool {
@@ -1121,6 +1159,9 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	}
 	cfg := rt.cfg
 	s.mu.Unlock()
+	if cfg.RequiredCommit != "" {
+		return
+	}
 	oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
 		s.logger.Error("HEAD resolve failed", "repo", cfg.Name, "error", err)
@@ -1311,6 +1352,9 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			s.mu.Lock()
 			cfg := rt.cfg
 			s.mu.Unlock()
+			if cfg.RemoteRefreshDisabled {
+				continue
+			}
 			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
 			err := s.git.Fetch(ctx, cfg)
 			if err != nil {
@@ -1375,17 +1419,22 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 		st.LastFetchResult = "ok"
 	}
 	applyHydrationStats(&st, cfg.BlobCacheDir)
-	applyRepoModeStatus(&st, cfg)
+	applySourceStatus(&st, cfg)
 	return st
 }
 
-func applyRepoModeStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
-	st.Mode = cfg.Mode
-	if st.Mode == "" {
-		st.Mode = model.RepoModeWorkspace
+func applySourceStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
+	st.SourceRef = cfg.Branch
+	st.RequiredCommit = cfg.RequiredCommit
+	st.RemoteRefreshDisabled = cfg.RemoteRefreshDisabled
+	switch {
+	case cfg.RequiredCommit == "":
+		st.Acquisition = "not_required"
+	case cfg.AcquiredRef == cfg.Branch && strings.EqualFold(cfg.AcquiredCommit, cfg.RequiredCommit) && !cfg.AcquiredAt.IsZero():
+		st.Acquisition = "verified"
+	default:
+		st.Acquisition = "pending"
 	}
-	st.ExpectedOID = cfg.ExpectedOID
-	st.TargetVerified = st.Mode != model.RepoModeSnapshot || strings.EqualFold(st.CurrentHEADOID, cfg.ExpectedOID)
 }
 
 func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
@@ -1591,28 +1640,28 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	}
 	rt.active = true
 	gitDir := rt.cfg.GitDir
-	snapshotMode := rt.cfg.Mode == model.RepoModeSnapshot
+	fixedBase := rt.cfg.RequiredCommit != ""
 	workerCount := 2
-	if snapshotMode {
+	if fixedBase {
 		workerCount = 1
 	}
 	rt.workers.Add(workerCount)
 	s.mu.Unlock()
 
-	if !snapshotMode {
-		go func() {
-			defer rt.workers.Done()
-			s.refreshLoop(rt)
-		}()
-	}
-
-	w := watcher.New(500 * time.Millisecond)
 	go func() {
 		defer rt.workers.Done()
-		w.Watch(rt.ctx, gitDir, func() {
-			s.onHEADChanged(rt.ctx, rt)
-		})
+		s.refreshLoop(rt)
 	}()
+
+	if !fixedBase {
+		w := watcher.New(500 * time.Millisecond)
+		go func() {
+			defer rt.workers.Done()
+			w.Watch(rt.ctx, gitDir, func() {
+				s.onHEADChanged(rt.ctx, rt)
+			})
+		}()
+	}
 }
 
 func newRuntimeState(repoID model.RepoID, headOID string, headRef string, gen int64) model.RepoRuntimeState {
@@ -1807,6 +1856,9 @@ func (s *Service) fillPaths(cfg *model.RepoConfig) {
 }
 
 func ParseRefresh(v string) (time.Duration, error) {
+	if strings.EqualFold(strings.TrimSpace(v), "never") {
+		return 0, nil
+	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
 		return 0, fmt.Errorf("invalid refresh interval %q", v)

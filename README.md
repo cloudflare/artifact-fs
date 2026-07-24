@@ -52,7 +52,7 @@ export ARTIFACT_FS_ROOT=/tmp/artifact-fs-test
 ./artifact-fs add-repo \
   --name workers-sdk \
   --remote https://github.com/cloudflare/workers-sdk.git \
-  --branch main \
+  --ref refs/heads/main \
   --mount-root /tmp
 
 # Start the daemon (mounts via FUSE, blocks until killed)
@@ -74,16 +74,17 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted mode=workspace head=d4c61587... ref=main expected_oid=none target_verified=true ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
+# repo=workers-sdk state=mounted source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `state` | `mounted` or `unmounted` |
-| `mode` | `workspace` or immutable-source `snapshot` mode |
-| `head` | Current HEAD commit OID |
-| `ref` | Tracked branch or snapshot ref |
-| `expected_oid` / `target_verified` | Requested snapshot commit and whether the mounted HEAD matches it |
+| `source_ref` | Canonical remote ref selected during acquisition |
+| `required_commit` | Required source commit, or `none` |
+| `acquisition` | Historical acquisition evidence: `not_required`, `pending`, or `verified` |
+| `base_commit` | Commit backing the currently published filesystem generation |
+| `remote_refresh` | Whether daemon and manual remote refreshes are enabled |
 | `ahead` / `behind` | Commits ahead/behind the remote tracking branch |
 | `overlay_dirty` | `true` if there are local writes (created, modified, or deleted files) |
 | `last_fetch` / `result` | Timestamp and outcome of the last background fetch |
@@ -112,7 +113,7 @@ By default, `add-repo` waits for the blobless clone and initial snapshot before 
 ./artifact-fs add-repo \
   --name workers-sdk \
   --remote https://github.com/cloudflare/workers-sdk.git \
-  --branch main \
+  --ref refs/heads/main \
   --mount-root /tmp \
   --async
 ```
@@ -134,7 +135,7 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
 
 ./artifact-fs add-repo \
   --name workers-sdk \
-  --branch main \
+  --ref refs/heads/main \
   --mount-root /tmp \
   --async \
   --prepared-gitdir \
@@ -142,27 +143,30 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
-## Shallow snapshots
+## Verified shallow sources
 
-Use snapshot mode when a job needs one exact repository revision rather than branch history, for example when checking the source that is about to be deployed:
+Use a verified source when a job must inspect the exact revision selected for a deployment:
 
 ```bash
 artifact-fs add-repo \
   --name workers-sdk-check \
   --remote https://github.com/cloudflare/workers-sdk.git \
-  --mode snapshot \
-  --ref main \
-  --expected-oid "$DEPLOY_SHA" \
+  --ref refs/heads/main \
+  --require-commit "$DEPLOY_SHA" \
+  --depth 1 \
+  --refresh never \
   --mount-root /tmp
 ```
 
-Snapshot mode adds `--depth=1` to the blobless clone and verifies the cloned `HEAD` before publishing the filesystem snapshot. The expected OID must be a full 40- or 64-character commit ID. If the named ref moved, preparation fails instead of checking different source.
+These options express three independent policies: `--require-commit` asserts what the canonical source ref must resolve to, `--depth` bounds transferred history, and `--refresh never` disables daemon and manual remote refreshes. The required commit must be a full 40- or 64-character object ID. If the fetched ref resolves to a different commit, preparation fails before any filesystem generation is published.
 
-Snapshot repositories do not perform periodic remote fetches, and the `artifact-fs fetch` command rejects them. Their source revision stays pinned, while the mounted filesystem remains writable through ArtifactFS's local overlay. Create a fresh snapshot repository to check a different revision.
+ArtifactFS fetches the canonical ref into a private candidate ref, verifies its peeled commit, and publishes directly from that commit rather than ambient `HEAD`. A successful acquisition receipt is persisted and reported as `acquisition=verified`. Verified acquisition is historical evidence, not a continuously re-evaluated boolean.
 
-The remote must advertise Git partial-clone filtering for file contents to hydrate over the network on demand. If it does not, Git downloads the current revision's blobs eagerly, but depth 1 still prevents historical commits and obsolete blob versions from being transferred.
+A required source commit fixes the published base generation: ArtifactFS does not start its HEAD watcher for that repository, so later local Git ref changes are not adopted by the mount. The mounted filesystem remains writable through the overlay, and blob hydration may still contact the promisor remote. This is therefore a **verified source**, not an immutable filesystem.
 
-`--prepared-gitdir` is not supported in snapshot mode.
+The remote must advertise Git partial-clone filtering for file contents to hydrate over the network on demand. If it does not, Git downloads the selected revision's blobs eagerly, but depth 1 still prevents historical commits and obsolete blob versions from being transferred.
+
+`--prepared-gitdir` is not supported with `--require-commit` because verified acquisition atomically installs a private Git directory.
 
 ## Sandboxes and Containers
 
@@ -236,9 +240,9 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 ### Data flow
 
-1. **Clone/fetch** -- `add-repo` runs `git clone --filter=blob:none` (blobless) unless `--async` is used. Snapshot mode also requests `--depth=1`. In async mode, the daemon performs either the blobless clone or a fetch into a prepared gitdir. When the remote advertises partial-clone filtering, only commits, trees, and refs are fetched initially; otherwise Git falls back to downloading blobs eagerly.
+1. **Clone/fetch** -- `add-repo` runs a blobless clone or verified source acquisition. `--depth` controls transferred history independently. Verified acquisition fetches the canonical source ref into a private candidate ref and checks `--require-commit` before atomically installing the Git directory. When the remote advertises partial-clone filtering, only commits, trees, and refs are fetched initially; otherwise Git falls back to downloading blobs eagerly.
 
-2. **Index** -- `git ls-tree -r -t -z HEAD` enumerates every path in the tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
+2. **Index** -- `git ls-tree -r -t -z <selected-commit>` enumerates every path in the selected tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
 
 3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
 
@@ -246,7 +250,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
 
-6. **Background** -- A watcher polls HEAD/refs every 500ms. On HEAD changes (commit, branch switch, fetch), the daemon re-indexes the tree, publishes a new snapshot generation, reconciles stale overlay entries, and refreshes the git index.
+6. **Background** -- For ordinary workspaces, a watcher polls HEAD/refs every 500ms and republishes HEAD changes. Repositories with `--require-commit` do not run this watcher, so their verified base commit remains fixed. Remote polling is controlled separately by `--refresh`.
 
 ### Subsystems
 

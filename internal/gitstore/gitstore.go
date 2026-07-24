@@ -146,6 +146,7 @@ type fetchBlobResult struct {
 const maxReadBlobBytes int64 = 1<<31 - 1
 
 const fetchedFullRefRemoteTrackingRef = "refs/remotes/artifact-fs/fetch-ref"
+const acquiredSourceRef = "refs/artifact-fs/acquired"
 
 const zeroOID = "0000000000000000000000000000000000000000"
 
@@ -239,10 +240,10 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 			return fmt.Errorf("mktemp clone dir: %w", err)
 		}
 		args := []string{"clone", "--filter=blob:none"}
-		if cfg.Mode == model.RepoModeSnapshot {
-			args = append(args, "--depth=1")
+		if cfg.HistoryDepth > 0 {
+			args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
 		}
-		args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", cfg.Branch, safeURL, target)
+		args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", cloneRefName(cfg.Branch), safeURL, target)
 		_, err = runGitWithEnv(ctx, "", env, args...)
 		if err != nil {
 			_ = os.RemoveAll(target)
@@ -256,15 +257,6 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	defer os.RemoveAll(target)
 
 	targetGitDir := filepath.Join(target, ".git")
-	if cfg.Mode == model.RepoModeSnapshot {
-		headOID, err := runGit(ctx, targetGitDir, "rev-parse", "--verify", "HEAD^{commit}")
-		if err != nil {
-			return err
-		}
-		if !strings.EqualFold(strings.TrimSpace(headOID), cfg.ExpectedOID) {
-			return fmt.Errorf("snapshot HEAD %s does not match expected OID %s", headOID, cfg.ExpectedOID)
-		}
-	}
 
 	// Populate the index so git status works inside the mount.
 	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
@@ -274,6 +266,136 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		return err
 	}
 	return nil
+}
+
+// PrepareSource acquires and verifies one exact remote source revision.
+func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, requirement model.SourceRequirement) (model.PreparedSource, error) {
+	requirement.Ref = strings.TrimSpace(requirement.Ref)
+	requirement.RequiredCommit = strings.ToLower(strings.TrimSpace(requirement.RequiredCommit))
+	if requirement.Ref == "" || !strings.HasPrefix(requirement.Ref, "refs/") {
+		return model.PreparedSource{}, errors.New("source ref must be a canonical refs/... name")
+	}
+	if _, err := runGit(ctx, "", "check-ref-format", requirement.Ref); err != nil {
+		return model.PreparedSource{}, fmt.Errorf("invalid source ref %q", requirement.Ref)
+	}
+	if requirement.RequiredCommit == "" {
+		return model.PreparedSource{}, errors.New("required commit is required")
+	}
+	if requirement.Depth < 0 {
+		return model.PreparedSource{}, errors.New("history depth must not be negative")
+	}
+
+	prepared := model.PreparedSource{Ref: requirement.Ref, Commit: requirement.RequiredCommit, Verified: true}
+	if cfg.AcquiredRef == requirement.Ref && strings.EqualFold(cfg.AcquiredCommit, requirement.RequiredCommit) {
+		if err := prepareFixedHEAD(ctx, cfg.GitDir, requirement.RequiredCommit); err != nil {
+			return model.PreparedSource{}, err
+		}
+		return prepared, nil
+	}
+
+	parent := filepath.Dir(cfg.GitDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return model.PreparedSource{}, err
+	}
+	safeURL, credHelper, err := credentialEnv(cfg.RemoteURL)
+	if err != nil {
+		return model.PreparedSource{}, err
+	}
+	env := append(nonInteractiveGitEnv(), credHelper...)
+	var candidateGitDir string
+	attempt := func() error {
+		if candidateGitDir != "" {
+			_ = os.RemoveAll(candidateGitDir)
+		}
+		candidateGitDir, err = os.MkdirTemp(parent, ".source-*")
+		if err != nil {
+			return fmt.Errorf("mktemp source dir: %w", err)
+		}
+		if _, err := runGitWithEnv(ctx, "", env, "init", "--bare", candidateGitDir); err != nil {
+			return err
+		}
+		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
+			return err
+		}
+		args := []string{"fetch", "--filter=blob:none", "--no-tags"}
+		if requirement.Depth > 0 {
+			args = append(args, fmt.Sprintf("--depth=%d", requirement.Depth))
+		}
+		args = append(args, "origin", "+"+requirement.Ref+":"+acquiredSourceRef)
+		if _, err := runGitWithEnv(ctx, candidateGitDir, env, args...); err != nil {
+			return err
+		}
+		observed, err := runGit(ctx, candidateGitDir, "rev-parse", "--verify", acquiredSourceRef+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("source ref %s did not resolve to a commit: %w", requirement.Ref, err)
+		}
+		observed = strings.ToLower(strings.TrimSpace(observed))
+		if observed != requirement.RequiredCommit {
+			return fmt.Errorf("source changed: %s resolved to %s, required %s", requirement.Ref, observed, requirement.RequiredCommit)
+		}
+		return prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit)
+	}
+	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
+		if candidateGitDir != "" {
+			_ = os.RemoveAll(candidateGitDir)
+		}
+		return model.PreparedSource{}, err
+	}
+	defer os.RemoveAll(candidateGitDir)
+	if err := installGitDir(candidateGitDir, cfg.GitDir); err != nil {
+		return model.PreparedSource{}, err
+	}
+	candidateGitDir = ""
+	return prepared, nil
+}
+
+func prepareFixedHEAD(ctx context.Context, gitDir string, commit string) error {
+	resolved, err := runGit(ctx, gitDir, "rev-parse", "--verify", commit+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("required commit %s is unavailable: %w", commit, err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(resolved), commit) {
+		return fmt.Errorf("required commit %s resolved unexpectedly", commit)
+	}
+	if _, err := runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", commit); err != nil {
+		return err
+	}
+	_, err = runGit(ctx, gitDir, "read-tree", commit)
+	return err
+}
+
+func installGitDir(candidate string, destination string) error {
+	if _, err := os.Stat(destination); errors.Is(err, os.ErrNotExist) {
+		return os.Rename(candidate, destination)
+	} else if err != nil {
+		return err
+	}
+	backup, err := os.MkdirTemp(filepath.Dir(destination), ".replaced-*")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	if err := os.Rename(destination, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(candidate, destination); err != nil {
+		_ = os.Rename(backup, destination)
+		return err
+	}
+	_ = os.RemoveAll(backup)
+	return nil
+}
+
+func cloneRefName(ref string) string {
+	if after, ok := strings.CutPrefix(strings.TrimSpace(ref), "refs/heads/"); ok {
+		return after
+	}
+	if after, ok := strings.CutPrefix(strings.TrimSpace(ref), "refs/tags/"); ok {
+		return after
+	}
+	return strings.TrimSpace(ref)
 }
 
 func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, repoName string, attempt func() error) error {
@@ -1306,7 +1428,11 @@ func markIndexFSMonitorValid(ctx context.Context, gitDir, workTree string) error
 }
 
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {
-	rangeSpec := fmt.Sprintf("HEAD...origin/%s", repo.Branch)
+	branch := branchName(repo.Branch)
+	if branch == "" {
+		return 0, 0, false, nil
+	}
+	rangeSpec := fmt.Sprintf("HEAD...origin/%s", branch)
 	out, err := runGit(ctx, repo.GitDir, "rev-list", "--left-right", "--count", rangeSpec)
 	if err != nil {
 		if strings.Contains(err.Error(), "unknown revision") {

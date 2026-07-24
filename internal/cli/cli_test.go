@@ -25,6 +25,10 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 	for _, want := range []string{
 		"last_fetch=never",
 		"result=never",
+		"required_commit=none",
+		"acquisition=not_required",
+		"base_commit=abc123",
+		"remote_refresh=enabled",
 		"prepare_error=none",
 		"hydrated_blobs=3",
 		"hydrated_bytes=42",
@@ -80,9 +84,10 @@ func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 		"add-repo",
 		"--name", "repo",
 		"--remote", "https://github.com/example/repo.git",
-		"--mode", "snapshot",
-		"--ref", "main",
-		"--expected-oid", "0123456789012345678901234567890123456789",
+		"--ref", "refs/heads/main",
+		"--require-commit", "0123456789012345678901234567890123456789",
+		"--depth", "1",
+		"--refresh", "never",
 		"--async",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -120,23 +125,23 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			want: "async repositories must use ambient credentials",
 		},
 		{
-			name: "snapshot_requires_expected_oid",
-			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "snapshot"},
-			want: "--expected-oid is required in snapshot mode",
+			name: "required_commit_requires_explicit_ref",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--require-commit", "0123456789012345678901234567890123456789"},
+			want: "--require-commit requires an explicit --ref",
 		},
 		{
-			name: "workspace_rejects_expected_oid",
-			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--expected-oid", "0123456789012345678901234567890123456789"},
-			want: "--expected-oid requires --mode snapshot",
+			name: "rejects_invalid_required_commit",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--require-commit", "not-an-oid"},
+			want: "--require-commit must be a full",
 		},
 		{
-			name: "rejects_unknown_mode",
-			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "other"},
-			want: "unsupported repository mode",
+			name: "rejects_negative_depth",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--depth", "-1"},
+			want: "--depth must not be negative",
 		},
 		{
 			name: "ref_conflicts_with_branch",
-			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mode", "snapshot", "--ref", "main", "--branch", "main", "--expected-oid", "0123456789012345678901234567890123456789"},
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--branch", "main"},
 			want: "--ref and --branch cannot be used together",
 		},
 	}
