@@ -556,6 +556,8 @@ func TestE2EVerifiedSource(t *testing.T) {
 		"local-only.txt": "A ",
 	})
 
+	run(t, updateWork, "git", "fetch", "origin", "main")
+	run(t, updateWork, "git", "checkout", "-B", "main", "origin/main")
 	writeTestFile(t, updateWork, "REMOTE-ONLY.md", "new remote content\n")
 	run(t, updateWork, "git", "add", "REMOTE-ONLY.md")
 	run(t, updateWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance remote")
