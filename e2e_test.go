@@ -505,6 +505,9 @@ func TestE2EVerifiedSource(t *testing.T) {
 
 	gitDir := filepath.Join(root, "repos", repoName, "git")
 	blobCacheDir := filepath.Join(root, "cache", "blobs", repoName)
+	if got := strings.Fields(run(t, "", "git", "--git-dir", gitDir, "ls-files")); !slices.Equal(got, []string{"README.md"}) {
+		t.Fatalf("verified Git index before mount = %v, want [README.md]", got)
+	}
 	readmeOID := strings.TrimSpace(run(t, "", "git", "--git-dir", gitDir, "rev-parse", "HEAD:README.md"))
 	readmeCachePath := filepath.Join(blobCacheDir, readmeOID)
 	if _, err := os.Stat(readmeCachePath); !os.IsNotExist(err) {
@@ -526,6 +529,12 @@ func TestE2EVerifiedSource(t *testing.T) {
 			stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
 		}
 	}()
+	if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
+		t.Fatalf("mounted .git = %q, want %q", got, want)
+	}
+	if got := strings.Fields(gitCmd(t, mountPath, "ls-files")); !slices.Equal(got, []string{"README.md"}) {
+		t.Fatalf("verified Git index through mount = %v, want [README.md]", got)
+	}
 
 	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
 	if got := readFileStr(t, filepath.Join(mountPath, "README.md")); !strings.Contains(got, "Test Repo") {
