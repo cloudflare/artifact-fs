@@ -457,8 +457,18 @@ func TestE2EVerifiedSource(t *testing.T) {
 	}
 	skipIfNoFUSE(t)
 
-	remoteURL := createLocalTestRepo(t)
-	remoteDir := strings.TrimPrefix(remoteURL, "file://")
+	repoRoot := t.TempDir()
+	remoteDir := filepath.Join(repoRoot, "verified.git")
+	seedWork := filepath.Join(repoRoot, "seed")
+	run(t, "", "git", "init", "--bare", remoteDir)
+	run(t, "", "git", "clone", remoteDir, seedWork)
+	run(t, seedWork, "git", "checkout", "-b", "main")
+	writeTestFile(t, seedWork, "README.md", "# Test Repo\n")
+	run(t, seedWork, "git", "add", "README.md")
+	run(t, seedWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "initial")
+	run(t, seedWork, "git", "push", "origin", "main")
+	run(t, remoteDir, "git", "config", "uploadpack.allowFilter", "true")
+	remoteURL := "file://" + remoteDir
 	requiredCommit := strings.TrimSpace(run(t, "", "git", "--git-dir", remoteDir, "rev-parse", "refs/heads/main"))
 	updateWork := filepath.Join(t.TempDir(), "update-work")
 	run(t, "", "git", "clone", remoteURL, updateWork)
