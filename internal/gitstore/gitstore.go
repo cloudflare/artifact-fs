@@ -603,13 +603,14 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 	var lastErr *GitOperationError
 	operationStarted := time.Now()
 	safeRepoName := auth.RedactLogString(repoName)
+	logger := s.logger.With("operation", operation, "repo", safeRepoName)
 	logInterrupted := func(operationErr *GitOperationError, contextErr error) {
 		operationErr.contextErr = contextErr
-		args := []any{"operation", operation, "repo", safeRepoName, "attempts", operationErr.Attempts, "duration_ms", time.Since(operationStarted).Milliseconds(), "timed_out", errors.Is(contextErr, context.DeadlineExceeded), "canceled", errors.Is(contextErr, context.Canceled), "error", auth.RedactLogString(operationErr.Error())}
+		args := []any{"attempts", operationErr.Attempts, "duration_ms", time.Since(operationStarted).Milliseconds(), "timed_out", errors.Is(contextErr, context.DeadlineExceeded), "canceled", errors.Is(contextErr, context.Canceled), "error", auth.RedactLogString(operationErr.Error())}
 		if errors.Is(contextErr, context.Canceled) {
-			s.logger.Info(logGitOperationInterrupted, args...)
+			logger.InfoContext(ctx, logGitOperationInterrupted, args...)
 		} else {
-			s.logger.Warn(logGitOperationInterrupted, args...)
+			logger.WarnContext(ctx, logGitOperationInterrupted, args...)
 		}
 	}
 	for n := 0; ; n++ {
@@ -625,7 +626,7 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 		err := attempt()
 		if err == nil {
 			if n > 0 {
-				s.logger.Info(logGitOperationRecovered, "operation", operation, "repo", safeRepoName, "attempts", n+1, "duration_ms", time.Since(operationStarted).Milliseconds())
+				logger.InfoContext(ctx, logGitOperationRecovered, "attempts", n+1, "duration_ms", time.Since(operationStarted).Milliseconds())
 			}
 			return nil
 		}
@@ -657,9 +658,7 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 		} else {
 			safeError = auth.RedactLogString(operationErr.Error())
 		}
-		s.logger.Warn(logGitOperationAttemptFailed,
-			"operation", operation,
-			"repo", safeRepoName,
+		logger.WarnContext(ctx, logGitOperationAttemptFailed,
 			"attempt", n+1,
 			"max_attempts", len(delays)+1,
 			"retryable", retryable,
@@ -676,7 +675,7 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 			return operationErr
 		}
 		delay := equalJitter(delays[n])
-		s.logger.Info(logGitOperationRetrying, "operation", operation, "repo", safeRepoName, "attempt", n+1, "next_attempt", n+2, "backoff", delay.String())
+		logger.InfoContext(ctx, logGitOperationRetrying, "attempt", n+1, "next_attempt", n+2, "backoff_ms", delay.Milliseconds())
 		if waitErr := waitForGitRetry(ctx, delay); waitErr != nil {
 			logInterrupted(operationErr, waitErr)
 			return operationErr
@@ -911,31 +910,94 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return fmt.Errorf("remote ref %s missing after fetch: %w", target.remoteRef, err)
 	}
 	oid = strings.TrimSpace(oid)
+	oldOID, err := currentOrEmptyTreeOID(ctx, repo.GitDir)
+	if err != nil {
+		return err
+	}
 	if target.branch == "" {
-		if _, err := runGit(ctx, repo.GitDir, "update-ref", "--no-deref", "HEAD", oid); err != nil {
+		if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 			return err
 		}
-		return s.ReadTreeHEAD(ctx, repo)
+		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
+		if err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		updateArgs := []string{"update-ref", "--no-deref", "HEAD", oid}
+		if strings.Trim(oldHeadOID, "0") != "" {
+			updateArgs = append(updateArgs, oldHeadOID)
+		}
+		if _, err := runGit(ctx, repo.GitDir, updateArgs...); err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		return nil
 	}
 	refName := "refs/heads/" + target.branch
+	var oldBranchOID string
 	if repo.PreparedGitDir {
-		oldOID, err := s.preparedBranchExpectedOID(ctx, repo, target.branch, oid)
-		if err != nil {
-			return err
-		}
-		if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldOID); err != nil {
-			return err
-		}
-	} else if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid); err != nil {
+		oldBranchOID, err = s.preparedBranchExpectedOID(ctx, repo, target.branch, oid)
+	} else {
+		oldBranchOID, err = refOIDOrZero(ctx, repo.GitDir, refName)
+	}
+	if err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", "refs/heads/"+target.branch); err != nil {
+	if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
+		return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
+		refErr := restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid)
+		indexErr := rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		return errors.Join(indexErr, refErr)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
-		s.logger.Warn("set upstream failed", "repo", repo.Name, "error", err)
+		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
 	}
-	return s.ReadTreeHEAD(ctx, repo)
+	return nil
+}
+
+func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
+	oid, err := runGit(ctx, gitDir, "rev-parse", "--verify", refName+"^{commit}")
+	if err == nil {
+		return strings.TrimSpace(oid), nil
+	}
+	return zeroOIDForGitDir(ctx, gitDir)
+}
+
+func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
+		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
+	}
+	return cause
+}
+
+func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
+	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
+		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
+	}
+	return nil
+}
+
+func currentOrEmptyTreeOID(ctx context.Context, gitDir string) (string, error) {
+	oid, headErr := runGit(ctx, gitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if headErr == nil {
+		return strings.TrimSpace(oid), nil
+	}
+	if _, err := runGit(ctx, gitDir, "symbolic-ref", "-q", "HEAD"); err != nil {
+		return "", headErr
+	}
+	oid, err := runGit(ctx, gitDir, "hash-object", "-t", "tree", "-w", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(oid), nil
+}
+
+func readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
+	_, err := runGit(ctx, gitDir, "read-tree", "-m", oldOID, newOID)
+	return err
 }
 
 func (s *Store) preparedBranchExpectedOID(ctx context.Context, repo model.RepoConfig, branch string, oid string) (string, error) {
@@ -1688,6 +1750,15 @@ func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid 
 func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 	_, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD")
 	return err
+}
+
+// EnsureIndexInitialized creates a missing index without replacing staged work.
+func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfig) error {
+	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return err
+	}
+	return readTreeTransition(ctx, repo.GitDir, strings.TrimSpace(oid), strings.TrimSpace(oid))
 }
 
 func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {

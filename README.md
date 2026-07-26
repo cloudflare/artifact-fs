@@ -102,14 +102,14 @@ Use `--hydration-concurrency` to control the number of parallel blob-fetch worke
 
 ## Logging
 
-ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout, while caller cancellation stops the active Git command and retry backoff without persisting a cancellation as a preparation failure.
+ArtifactFS emits newline-delimited JSON to stderr. Preparation logs include the mode, source, attempt, phase, state, duration, and deadline. Clone and fetch operations retry known transient transport failures up to three total attempts. Preparation has a 30-minute timeout. Caller cancellation stops the active Git command and retry backoff; synchronous preparation records a redacted `prepare canceled` status, while daemon shutdown leaves async preparation queued for restart.
 
 Async existing-clone preparation reports remote configuration, fetch, and branch update as separate `configure_remote`, `fetch`, and `update_branch` phases.
 
 Successful `add-repo`:
 
 ```json
-{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"main","fetch_ref":"main","deadline_set":true,"timeout_ms":1799999}
+{"time":"2026-07-16T12:00:00Z","level":"INFO","msg":"repo preparation started","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"validate","state":"started","duration_ms":0,"branch":"refs/heads/main","fetch_ref":"main","deadline_set":true,"timeout_ms":1799999}
 {"time":"2026-07-16T12:00:04Z","level":"INFO","msg":"repo preparation completed","repo":"workers-sdk","mode":"sync","source":"fresh_clone","attempt":1,"phase":"complete","state":"completed","duration_ms":4217,"deadline_set":true,"timeout_ms":1799999,"head_oid":"d4c61587...","head_ref":"main","snapshot_generation":1}
 ```
 
@@ -117,7 +117,7 @@ Transient network failure followed by recovery:
 
 ```json
 {"time":"2026-07-16T12:01:00Z","level":"WARN","msg":"git operation attempt failed","operation":"clone","repo":"workers-sdk","attempt":1,"max_attempts":3,"retryable":true,"duration_ms":842,"timed_out":false,"canceled":false,"error":"HTTP 503: unexpected disconnect"}
-{"time":"2026-07-16T12:01:00Z","level":"INFO","msg":"retrying transient git operation failure","operation":"clone","repo":"workers-sdk","attempt":1,"next_attempt":2,"backoff":"214ms"}
+{"time":"2026-07-16T12:01:00Z","level":"INFO","msg":"retrying transient git operation failure","operation":"clone","repo":"workers-sdk","attempt":1,"next_attempt":2,"backoff_ms":214}
 {"time":"2026-07-16T12:01:02Z","level":"INFO","msg":"git operation recovered","operation":"clone","repo":"workers-sdk","attempts":2,"duration_ms":2087}
 ```
 

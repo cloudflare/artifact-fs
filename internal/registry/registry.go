@@ -136,11 +136,30 @@ func (s *Store) UpdateRefresh(ctx context.Context, repoID model.RepoID, interval
 
 func (s *Store) UpdatePrepareState(ctx context.Context, repoID model.RepoID, state string, prepareErr string) error {
 	_, err := s.db.ExecContext(ctx, `
-	UPDATE repos
-	SET prepare_state=?, prepare_error=?, updated_at_ns=?
-	WHERE repo_id=?
+		UPDATE repos
+		SET prepare_state=?, prepare_error=?, updated_at_ns=?
+		WHERE repo_id=?
 	`, state, prepareErr, time.Now().UnixNano(), string(repoID))
 	return err
+}
+
+func (s *Store) BeginPrepare(ctx context.Context, cfg model.RepoConfig, state string, configVersion string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE repos
+		SET prepare_state=?, prepare_error='', config_version=?, updated_at_ns=?
+		WHERE repo_id=? AND config_version=?
+	`, state, configVersion, time.Now().UnixNano(), string(cfg.ID), cfg.ConfigVersion)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrRepoChanged
+	}
+	return nil
 }
 
 func (s *Store) UpdatePrepareStateForConfig(ctx context.Context, cfg model.RepoConfig, state string, prepareErr string) error {

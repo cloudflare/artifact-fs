@@ -111,6 +111,33 @@ func TestPrepareStateUpdateRejectsOlderConfigVersion(t *testing.T) {
 	}
 }
 
+func TestBeginPrepareChangesVersionWithCompareAndSwap(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", Branch: "main", ConfigVersion: "version-1"}
+	if err := store.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginPrepare(ctx, cfg, model.PrepareStateSyncPreparing, "version-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginPrepare(ctx, cfg, model.PrepareStateSyncPreparing, "version-3"); err != ErrRepoChanged {
+		t.Fatalf("stale begin error = %v, want ErrRepoChanged", err)
+	}
+	got, err := store.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigVersion != "version-2" || got.PrepareState != model.PrepareStateSyncPreparing || got.PrepareError != "" {
+		t.Fatalf("prepared config = %+v", got)
+	}
+}
+
 func TestSubsecondRefreshRoundTripsWithoutChangingPrepareState(t *testing.T) {
 	ctx := context.Background()
 	store, err := New(ctx, filepath.Join(t.TempDir(), "repos.sqlite"))

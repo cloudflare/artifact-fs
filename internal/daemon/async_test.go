@@ -15,6 +15,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"github.com/cloudflare/artifact-fs/internal/registry"
 	"github.com/cloudflare/artifact-fs/internal/snapshot"
 )
 
@@ -95,6 +96,143 @@ func TestAddRepoSyncReregistrationUpdatesExistingCloneBranch(t *testing.T) {
 	}
 	if gotOID != wantOID {
 		t.Fatalf("prepared HEAD = %s, want feature HEAD %s", gotOID, wantOID)
+	}
+}
+
+func TestSyncRegistrationIsNotMountedWhilePreparing(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(tmp, "git-started")
+	release := filepath.Join(tmp, "git-release")
+	gitScript := "#!/bin/sh\n: > \"$AFS_GIT_STARTED\"\nwhile [ ! -f \"$AFS_GIT_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' 'clone failed' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_GIT_STARTED", started)
+	t.Setenv("AFS_GIT_RELEASE", release)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.AddRepo(ctx, model.RepoConfig{Name: "repo", RemoteURL: "https://example.com/org/repo.git", Branch: "main", Enabled: true})
+	}()
+	waitFor(t, time.Second, func() bool {
+		_, err := os.Stat(started)
+		return err == nil
+	})
+	cfg, err := svc.registry.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PrepareState != model.PrepareStateSyncPreparing {
+		t.Fatalf("PrepareState = %q, want sync-preparing", cfg.PrepareState)
+	}
+	status, err := svc.Status(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != model.PrepareStatePreparing {
+		t.Fatalf("status state = %q, want preparing", status.State)
+	}
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	_, running := svc.running[cfg.ID]
+	svc.mu.Unlock()
+	if running {
+		t.Fatal("sync-preparing repository was mounted")
+	}
+	if err := os.WriteFile(release, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err == nil {
+		t.Fatal("expected preparation failure")
+	}
+}
+
+func TestSupersededPrepareDoesNotMutateExistingClone(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	runCmd(t, "git", "init", "--initial-branch", "main", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", repo, "add", "README.md")
+	runCmd(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "main")
+	runCmd(t, "git", "-C", repo, "remote", "add", "origin", "https://original.example/repo.git")
+
+	root := filepath.Join(tmp, "artifact-fs")
+	svc, err := New(ctx, root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		Name:          "repo",
+		RemoteURL:     "https://stale.example/repo.git",
+		Branch:        "refs/heads/main",
+		FetchRef:      "main",
+		GitDir:        filepath.Join(repo, ".git"),
+		Enabled:       true,
+		ConfigVersion: "version-1",
+	}
+	svc.fillPaths(&cfg)
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- svc.withRepoPrepareLock(ctx, cfg.Name, func() error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	<-lockHeld
+
+	prepareErr := make(chan error, 1)
+	go func() {
+		prepareErr <- svc.Prepare(ctx, cfg.Name)
+	}()
+	waitFor(t, time.Second, func() bool {
+		current, err := svc.registry.GetRepo(ctx, cfg.Name)
+		return err == nil && current.PrepareState == model.PrepareStateSyncPreparing && current.ConfigVersion != cfg.ConfigVersion
+	})
+	if err := svc.AddRepoWithOptions(ctx, model.RepoConfig{
+		Name:      cfg.Name,
+		RemoteURL: "https://new.example/repo.git",
+		Branch:    "main",
+		GitDir:    cfg.GitDir,
+		Enabled:   true,
+	}, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseLock)
+	if err := <-lockDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-prepareErr; !errors.Is(err, registry.ErrRepoChanged) {
+		t.Fatalf("Prepare error = %v, want ErrRepoChanged", err)
+	}
+	remote := strings.TrimSpace(runCmdOutput(t, "git", "-C", repo, "remote", "get-url", "origin"))
+	if remote != "https://original.example/repo.git" {
+		t.Fatalf("origin = %q, want original remote", remote)
 	}
 }
 
@@ -592,7 +730,7 @@ func TestAddRepoSyncTimeoutIsLoggedAndPersisted(t *testing.T) {
 	}
 }
 
-func TestAddRepoSyncCancellationIsLoggedWithoutPersistingFailure(t *testing.T) {
+func TestAddRepoSyncCancellationIsLoggedAndPersisted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "bin")
@@ -630,8 +768,8 @@ func TestAddRepoSyncCancellationIsLoggedWithoutPersistingFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.PrepareError != "" || got.PrepareState != "" {
-		t.Fatalf("canceled prepare state/error = %q/%q, want empty", got.PrepareState, got.PrepareError)
+	if got.PrepareError != "prepare canceled" || got.PrepareState != "" {
+		t.Fatalf("canceled prepare state/error = %q/%q, want synchronous/prepare canceled", got.PrepareState, got.PrepareError)
 	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logRepoPreparationCanceled+`"`) ||
 		!strings.Contains(logOutput, `"state":"`+prepareLogStateCanceled+`"`) ||
@@ -640,7 +778,7 @@ func TestAddRepoSyncCancellationIsLoggedWithoutPersistingFailure(t *testing.T) {
 	}
 }
 
-func TestAddRepoSyncBuildTreeCancellationDoesNotPersistFailure(t *testing.T) {
+func TestAddRepoSyncBuildTreeCancellationIsPersisted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
@@ -688,8 +826,8 @@ func TestAddRepoSyncBuildTreeCancellationDoesNotPersistFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.PrepareError != "" {
-		t.Fatalf("PrepareError = %q, want empty after cancellation", got.PrepareError)
+	if got.PrepareError != "prepare canceled" {
+		t.Fatalf("PrepareError = %q, want prepare canceled", got.PrepareError)
 	}
 	if logOutput := logs.String(); !strings.Contains(logOutput, `"phase":"`+preparePhaseBuildTree+`"`) ||
 		!strings.Contains(logOutput, `"state":"`+prepareLogStateCanceled+`"`) {
@@ -816,7 +954,7 @@ func TestAddRepoSyncFailureDoesNotOverwriteNewerConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Branch != "main" || got.PrepareState != model.PrepareStatePreparing || got.PrepareError != "" {
+	if got.Branch != "refs/heads/main" || got.PrepareState != model.PrepareStatePreparing || got.PrepareError != "" {
 		t.Fatalf("newer config was overwritten: branch/state/error = %q/%q/%q", got.Branch, got.PrepareState, got.PrepareError)
 	}
 }

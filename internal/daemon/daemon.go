@@ -318,7 +318,7 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		}
 		s.mu.Unlock()
 		if running && runningConfigVersion != repo.ConfigVersion {
-			s.logger.Info(logRepoConfigChanged, "repo", auth.RedactLogString(repo.Name))
+			s.logger.InfoContext(ctx, logRepoConfigChanged, "repo", auth.RedactLogString(repo.Name))
 			if err := s.unmount(repo.ID); err != nil {
 				s.logger.Error("repo prepare remount unmount failed", "repo", repo.Name, "error", err)
 				continue
@@ -332,6 +332,9 @@ func (s *Service) syncRepos(ctx context.Context) error {
 			s.retryRuntimeMount(rt)
 			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
 			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
+			continue
+		}
+		if repo.PrepareState == model.PrepareStateSyncPreparing {
 			continue
 		}
 		if shouldMountAsync(repo) {
@@ -535,8 +538,12 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 		}
 		cfg.PrepareState = model.PrepareStatePreparing
 		cfg.PrepareError = ""
-	} else if auth.HasInlineCredentials(cfg.RemoteURL) {
-		cfg.RemoteURL = ""
+	} else {
+		cfg.PrepareState = model.PrepareStateSyncPreparing
+		cfg.PrepareError = ""
+		if auth.HasInlineCredentials(cfg.RemoteURL) {
+			cfg.RemoteURL = ""
+		}
 	}
 	registeredCfg := cfg
 	if err := s.withRepoConfigLock(ctx, cfg.Name, func() error {
@@ -555,7 +562,7 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	prepareContextErr := prepareCtx.Err()
 	cancel()
 	if err == nil {
-		return nil
+		return s.persistSyncPrepareSuccess(ctx, registeredCfg)
 	}
 	if prepareContextErr != nil && !errors.Is(err, prepareContextErr) {
 		err = errors.Join(err, prepareContextErr)
@@ -564,12 +571,11 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 }
 
 func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoConfig, registeredCfg model.RepoConfig, prepareErr error) error {
-	if errors.Is(prepareErr, context.Canceled) {
-		return prepareErr
-	}
 	stateErr := prepareErr
 	if errors.Is(prepareErr, context.DeadlineExceeded) {
 		stateErr = errors.New("prepare timed out")
+	} else if errors.Is(prepareErr, context.Canceled) {
+		stateErr = errors.New("prepare canceled")
 	}
 	stateCtx, stateCancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
 	defer stateCancel()
@@ -577,10 +583,20 @@ func (s *Service) persistSyncPrepareFailure(ctx context.Context, cfg model.RepoC
 		if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
 			return prepareErr
 		}
-		s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparationFailurePhase(prepareErr), "target_state", "", "error", auth.RedactLogString(stateWriteErr.Error()))
 		return errors.Join(prepareErr, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
 	}
 	return prepareErr
+}
+
+func (s *Service) persistSyncPrepareSuccess(ctx context.Context, cfg model.RepoConfig) error {
+	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prepareStateWriteTimeout)
+	defer cancel()
+	if err := s.registry.UpdatePrepareStateForConfig(stateCtx, cfg, "", ""); err != nil {
+		s.logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparePhaseComplete, "target_state", "", "error", auth.RedactLogString(err.Error()))
+		return err
+	}
+	return nil
 }
 
 func (s *Service) RemoveRepo(ctx context.Context, name string) error {
@@ -592,6 +608,13 @@ func (s *Service) RemoveRepo(ctx context.Context, name string) error {
 		return err
 	}
 	return s.withRepoConfigLock(ctx, cfg.Name, func() error {
+		latest, err := s.registry.GetRepo(ctx, name)
+		if err != nil {
+			return err
+		}
+		if latest.ConfigVersion != cfg.ConfigVersion {
+			return registry.ErrRepoChanged
+		}
 		return s.registry.RemoveRepo(ctx, name)
 	})
 }
@@ -677,7 +700,7 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.PrepareState == model.PrepareStatePreparing {
+	if cfg.PrepareState == model.PrepareStatePreparing || cfg.PrepareState == model.PrepareStateSyncPreparing {
 		return fusefs.ErrRepoNotReady
 	}
 	if cfg.PrepareState == model.PrepareStateFailed {
@@ -706,7 +729,22 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if !isAsyncRepo(cfg) {
+	async := isAsyncRepo(cfg)
+	if async && cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
+		return nil
+	}
+	nextVersion := rand.Text()
+	nextState := model.PrepareStateSyncPreparing
+	if async {
+		nextState = model.PrepareStatePreparing
+	}
+	if err := s.registry.BeginPrepare(ctx, cfg, nextState, nextVersion); err != nil {
+		return err
+	}
+	cfg.ConfigVersion = nextVersion
+	cfg.PrepareState = nextState
+	cfg.PrepareError = ""
+	if !async {
 		prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
 		err := s.prepareRepo(prepareCtx, cfg)
 		prepareContextErr := prepareCtx.Err()
@@ -717,29 +755,11 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 			}
 			return s.persistSyncPrepareFailure(ctx, cfg, cfg, err)
 		}
-		if cfg.PrepareError == "" {
-			return nil
-		}
-		if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, "", ""); err != nil {
-			s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparePhaseComplete, "target_state", "", "error", auth.RedactLogString(err.Error()))
-			return err
-		}
-		return nil
+		return s.persistSyncPrepareSuccess(ctx, cfg)
 	}
-	if cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
-		return nil
-	}
-	cfg.PrepareState = model.PrepareStatePreparing
-	cfg.PrepareError = ""
 	if strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
-	if err := s.registry.UpdatePrepareStateForConfig(ctx, cfg, model.PrepareStatePreparing, ""); err != nil {
-		s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeAsync, "phase", preparePhasePersistPreparing, "target_state", model.PrepareStatePreparing, "error", auth.RedactLogString(err.Error()))
-		return err
-	}
-	cfg.PrepareState = model.PrepareStatePreparing
-	cfg.PrepareError = ""
 	if s.resetRunningPrepareState(cfg) {
 		s.startPrepareWorker(ctx, cfg)
 	}
@@ -796,14 +816,15 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr
 		deadlineSet = true
 		timeoutMS = max(time.Until(deadline).Milliseconds(), 0)
 	}
-	s.logger.Info(logRepoPreparationStarted, "repo", safeRepo, "mode", prepareModeSync, "source", source, "attempt", 1, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
+	logger := s.logger.With("repo", safeRepo, "mode", prepareModeSync, "attempt", 1)
+	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
 
 	var headOID, headRef string
 	var gen int64
 	defer func() {
 		durationMS := time.Since(started).Milliseconds()
 		if retErr == nil {
-			s.logger.Info(logRepoPreparationCompleted, "repo", safeRepo, "mode", prepareModeSync, "source", source, "attempt", 1, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
+			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
 			return
 		}
 		phase := preparationFailurePhase(retErr)
@@ -813,14 +834,30 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) (retErr
 		if canceled && !timedOut {
 			state = prepareLogStateCanceled
 		}
-		args := []any{"repo", safeRepo, "mode", prepareModeSync, "source", source, "attempt", 1, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
+		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
 		if canceled && !timedOut {
-			s.logger.Info(logRepoPreparationCanceled, args...)
+			logger.InfoContext(ctx, logRepoPreparationCanceled, args...)
 			return
 		}
-		s.logger.Error(logRepoPreparationFailed, args...)
+		logger.ErrorContext(ctx, logRepoPreparationFailed, args...)
 	}()
 	return s.withRepoPrepareLock(ctx, cfg.Name, func() error {
+		current, err := s.configVersionIsCurrent(ctx, cfg)
+		if err != nil {
+			return withPreparationPhase(preparePhaseValidate, err)
+		}
+		if !current {
+			return withPreparationPhase(preparePhaseValidate, fmt.Errorf("prepare superseded by newer repo config: %w", registry.ErrRepoChanged))
+		}
+		existingClone = false
+		if _, err := os.Stat(cfg.GitDir); err == nil {
+			existingClone = true
+			source = prepareSourceExistingClone
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return withPreparationPhase(preparePhaseValidate, err)
+		} else if cfg.RequiredCommit == "" {
+			source = prepareSourceFreshClone
+		}
 		if existingClone && strings.TrimSpace(cfg.RemoteURL) != "" {
 			if err := s.git.ConfigureRemoteWithCredentials(ctx, cfg); err != nil {
 				return withPreparationPhase(preparePhaseConfigureRemote, err)
@@ -931,17 +968,35 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	var headOID, headRef string
 	var gen int64
 	err := s.withRepoPrepareLock(ctx, cfg.Name, func() error {
-		var err error
+		latest, err := s.registry.GetRepo(ctx, cfg.Name)
+		if err != nil {
+			return err
+		}
+		if latest.ConfigVersion != cfg.ConfigVersion {
+			return registry.ErrRepoChanged
+		}
+		cfg = latest
+		if cfg.PrepareState == model.PrepareStateSyncPreparing {
+			return fusefs.ErrRepoNotReady
+		}
+		if cfg.PrepareState == "" && cfg.PrepareError != "" {
+			return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
+		}
 		snap, headOID, headRef, gen, err = s.ensurePreparedRepo(ctx, cfg, true)
-		return err
+		if err != nil {
+			return err
+		}
+		if cfg.RequiredCommit == "" {
+			if err := s.git.EnsureIndexInitialized(ctx, cfg); err != nil {
+				snap.Close()
+				snap = nil
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
-	}
-	if cfg.PrepareState == "" && cfg.PrepareError != "" {
-		if stateErr := s.registry.UpdatePrepareStateForConfig(ctx, cfg, "", ""); stateErr != nil {
-			s.logger.Error(logRepoPrepareStatusWriteErr, "repo", auth.RedactLogString(cfg.Name), "mode", prepareModeSync, "phase", preparePhaseComplete, "target_state", "", "error", auth.RedactLogString(stateErr.Error()))
-		}
 	}
 	ov, err := overlay.New(ctx, cfg)
 	if err != nil {
@@ -955,13 +1010,6 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		ov.Close()
 		snap.Close()
 		return err
-	}
-	if cfg.RequiredCommit == "" {
-		if err := s.git.ReadTreeHEAD(ctx, cfg); err != nil {
-			ov.Close()
-			snap.Close()
-			return err
-		}
 	}
 	h := hydrator.New(s.git)
 
@@ -1187,14 +1235,15 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 		deadlineSet = true
 		timeoutMS = max(time.Until(deadline).Milliseconds(), 0)
 	}
-	s.logger.Info(logRepoPreparationStarted, "repo", safeRepo, "mode", prepareModeAsync, "source", source, "attempt", attempt, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
+	logger := s.logger.With("repo", safeRepo, "mode", prepareModeAsync, "attempt", attempt)
+	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
 
 	var headOID, headRef string
 	var gen int64
 	defer func() {
 		durationMS := time.Since(started).Milliseconds()
 		if retErr == nil {
-			s.logger.Info(logRepoPreparationCompleted, "repo", safeRepo, "mode", prepareModeAsync, "source", source, "attempt", attempt, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
+			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
 			return
 		}
 		timedOut := errors.Is(retErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
@@ -1203,12 +1252,12 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 		if canceled && !timedOut {
 			state = prepareLogStateCanceled
 		}
-		args := []any{"repo", safeRepo, "mode", prepareModeAsync, "source", source, "attempt", attempt, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
+		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
 		if canceled && !timedOut {
-			s.logger.Info(logRepoPreparationCanceled, args...)
+			logger.InfoContext(ctx, logRepoPreparationCanceled, args...)
 			return
 		}
-		s.logger.Error(logRepoPreparationFailed, args...)
+		logger.ErrorContext(ctx, logRepoPreparationFailed, args...)
 	}()
 
 	fail := func(err error) error {
@@ -1225,7 +1274,7 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 			if errors.Is(stateWriteErr, registry.ErrRepoChanged) {
 				return err
 			}
-			s.logger.Error(logRepoPrepareStatusWriteErr, "repo", safeRepo, "mode", prepareModeAsync, "attempt", attempt, "phase", phase, "target_state", model.PrepareStateFailed, "error", auth.RedactLogString(stateWriteErr.Error()))
+			logger.ErrorContext(stateCtx, logRepoPrepareStatusWriteErr, "phase", phase, "target_state", model.PrepareStateFailed, "error", auth.RedactLogString(stateWriteErr.Error()))
 			return errors.Join(err, fmt.Errorf("persist failed prepare state: %w", stateWriteErr))
 		}
 		return err
@@ -1233,6 +1282,13 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 	lockAcquired := false
 	retErr = s.withRepoPrepareLock(ctx, cfg.Name, func() error {
 		lockAcquired = true
+		current, err := s.configVersionIsCurrent(ctx, cfg)
+		if err != nil {
+			return fail(err)
+		}
+		if !current {
+			return fmt.Errorf("prepare superseded by newer repo config: %w", registry.ErrRepoChanged)
+		}
 		var preparedSource model.PreparedSource
 		prepareExistingClone := func() error {
 			phase = preparePhaseValidate
@@ -1253,7 +1309,6 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 
 		if cfg.RequiredCommit != "" {
 			phase = preparePhaseClone
-			var err error
 			preparedSource, err = s.git.PrepareSource(ctx, cfg, model.SourceRequirement{
 				Ref:            cfg.Branch,
 				RequiredCommit: cfg.RequiredCommit,
@@ -1305,7 +1360,6 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 				}
 			}
 			phase = preparePhaseResolveHEAD
-			var err error
 			headOID, headRef, err = s.git.ResolveHEAD(ctx, cfg)
 			if err != nil {
 				return fail(err)
@@ -1776,7 +1830,9 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 	// One-shot CLI process: reconstruct state from persisted stores and
 	// OS-level mount check since we don't share memory with the daemon.
 	st := model.RepoRuntimeState{RepoID: cfg.ID, State: repoStateUnmounted, LastFetchResult: "never", PrepareError: cfg.PrepareError}
-	if isPendingOrFailedPrepareState(cfg.PrepareState) {
+	if cfg.PrepareState == model.PrepareStateSyncPreparing {
+		st.State = model.PrepareStatePreparing
+	} else if isPendingOrFailedPrepareState(cfg.PrepareState) {
 		st.State = cfg.PrepareState
 	} else if isMounted(cfg.MountPath) {
 		st.State = repoStateMounted
@@ -2259,7 +2315,15 @@ func ParseRefresh(v string) (time.Duration, error) {
 }
 
 func isAsyncRepo(cfg model.RepoConfig) bool {
-	return cfg.PreparedGitDir || strings.TrimSpace(cfg.PrepareState) != ""
+	if cfg.PreparedGitDir {
+		return true
+	}
+	switch strings.TrimSpace(cfg.PrepareState) {
+	case model.PrepareStatePreparing, model.PrepareStateReady, model.PrepareStateFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldMountAsync(cfg model.RepoConfig) bool {

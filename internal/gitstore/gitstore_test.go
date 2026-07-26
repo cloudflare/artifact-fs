@@ -350,6 +350,131 @@ func TestReadTreeHEAD(t *testing.T) {
 	}
 }
 
+func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	staged := runOutput(t, "git", "-C", repo, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "tracked.txt") {
+		t.Fatalf("staged entries = %q, want tracked.txt", staged)
+	}
+	debug := runOutput(t, "git", "-C", repo, "ls-files", "--debug", "intent.txt")
+	if !strings.Contains(debug, "flags: 20004000") {
+		t.Fatalf("intent-to-add entry was not preserved:\n%s", debug)
+	}
+}
+
+func TestPrepareFetchedBranchPreservesStagedEntries(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	run(t, "git", "-C", repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "feature.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "feature")
+	featureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", featureOID)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
+
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature"); err != nil {
+		t.Fatal(err)
+	}
+	staged := runOutput(t, "git", "-C", repo, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "tracked.txt") {
+		t.Fatalf("staged entries = %q, want tracked.txt", staged)
+	}
+	debug := runOutput(t, "git", "-C", repo, "ls-files", "--debug", "intent.txt")
+	if !strings.Contains(debug, "flags: 20004000") {
+		t.Fatalf("intent-to-add entry was not preserved:\n%s", debug)
+	}
+}
+
+func TestPrepareFetchedBranchConflictDoesNotMoveHEAD(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	baseOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+
+	run(t, "git", "-C", repo, "checkout", "-b", "future")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("remote\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "remote")
+	futureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "branch", "-D", "future")
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", futureOID)
+
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature")
+	if err == nil {
+		t.Fatal("expected staged conflict")
+	}
+	if head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD")); head != baseOID {
+		t.Fatalf("HEAD = %s, want %s", head, baseOID)
+	}
+	if ref := strings.TrimSpace(runOutput(t, "git", "-C", repo, "symbolic-ref", "--short", "HEAD")); ref != "main" {
+		t.Fatalf("HEAD ref = %q, want main", ref)
+	}
+	if staged := runOutput(t, "git", "-C", repo, "show", ":tracked.txt"); staged != "staged\n" {
+		t.Fatalf("staged content = %q, want staged", staged)
+	}
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/feature").Run(); err == nil {
+		t.Fatal("feature branch was created despite index conflict")
+	}
+}
+
 func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
