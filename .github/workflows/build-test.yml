@@ -33,3 +33,29 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  fuse-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+          if [ ! -e /dev/fuse ]; then
+            sudo modprobe fuse
+          fi
+          test -c /dev/fuse
+          sudo chmod 666 /dev/fuse
+
+      - name: Verified-source FUSE end-to-end test
+        env:
+          AFS_RUN_E2E_TESTS: "1"
+        run: go test -count=1 -run '^TestE2EVerifiedSource$' -v .

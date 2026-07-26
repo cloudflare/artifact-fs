@@ -14,42 +14,67 @@ var ErrBlobTooLarge = errors.New("blob too large")
 
 type RepoID string
 
+// SourceRequirement describes the remote revision ArtifactFS must acquire.
+type SourceRequirement struct {
+	Ref            string
+	RequiredCommit string
+	Depth          int
+}
+
+// PreparedSource records the exact source selected during acquisition.
+type PreparedSource struct {
+	Ref      string
+	Commit   string
+	Verified bool
+	Acquired bool // This call installed a new remote acquisition rather than reusing its receipt.
+}
+
 type RepoConfig struct {
-	ID                RepoID
-	Name              string
-	MountRoot         string
-	MountPath         string
-	RemoteURL         string
-	RemoteURLRedacted string
-	Branch            string
-	RefreshInterval   time.Duration
-	GitDir            string
-	OverlayDir        string
-	BlobCacheDir      string
-	MetaDBPath        string
-	OverlayDBPath     string
-	Enabled           bool
-	PreparedGitDir    bool
-	FetchRef          string
-	PrepareState      string
-	PrepareError      string
+	ID                    RepoID
+	Name                  string
+	MountRoot             string
+	MountPath             string
+	RemoteURL             string
+	RemoteURLRedacted     string
+	Branch                string
+	RefreshInterval       time.Duration
+	GitDir                string
+	OverlayDir            string
+	BlobCacheDir          string
+	MetaDBPath            string
+	OverlayDBPath         string
+	Enabled               bool
+	PreparedGitDir        bool
+	FetchRef              string
+	PrepareState          string
+	PrepareError          string
+	RequiredCommit        string
+	HistoryDepth          int
+	RemoteRefreshDisabled bool
+	AcquiredRef           string
+	AcquiredCommit        string
+	AcquiredAt            time.Time
 }
 
 type RepoRuntimeState struct {
-	RepoID             RepoID
-	CurrentHEADOID     string
-	CurrentHEADRef     string
-	SnapshotGeneration int64
-	LastFetchAt        time.Time
-	LastFetchResult    string
-	AheadCount         int
-	BehindCount        int
-	Diverged           bool
-	HydratedBlobCount  int64
-	HydratedBlobBytes  int64
-	DirtyOverlay       bool
-	State              string
-	PrepareError       string
+	RepoID                RepoID
+	CurrentHEADOID        string
+	CurrentHEADRef        string
+	SnapshotGeneration    int64
+	LastFetchAt           time.Time
+	LastFetchResult       string
+	AheadCount            int
+	BehindCount           int
+	Diverged              bool
+	HydratedBlobCount     int64
+	HydratedBlobBytes     int64
+	DirtyOverlay          bool
+	State                 string
+	PrepareError          string
+	SourceRef             string
+	RequiredCommit        string
+	Acquisition           string
+	RemoteRefreshDisabled bool
 }
 
 const (
@@ -158,6 +183,7 @@ type Registry interface {
 type GitStore interface {
 	CloneBlobless(ctx context.Context, cfg RepoConfig) error
 	CloneBloblessNonInteractive(ctx context.Context, cfg RepoConfig) error
+	PrepareSource(ctx context.Context, cfg RepoConfig, requirement SourceRequirement) (PreparedSource, error)
 	Fetch(ctx context.Context, repo RepoConfig) error
 	FetchRefNonInteractive(ctx context.Context, repo RepoConfig, ref string) error
 	ResolveHEAD(ctx context.Context, repo RepoConfig) (oid string, ref string, err error)

@@ -61,8 +61,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Flags: []ucli.Flag{
 				ucli.StringFlag{Name: "name", Usage: "repo name (required)"},
 				ucli.StringFlag{Name: "remote", Usage: "remote URL (required)"},
-				ucli.StringFlag{Name: "branch", Value: "main", Usage: "branch to track"},
-				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "refresh interval"},
+				ucli.StringFlag{Name: "branch", Usage: "deprecated alias for --ref refs/heads/<branch>"},
+				ucli.StringFlag{Name: "ref", Value: "refs/heads/main", Usage: "canonical source ref"},
+				ucli.StringFlag{Name: "require-commit", Usage: "require the source ref to resolve to this exact commit"},
+				ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
+				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
@@ -72,6 +75,18 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Action: withService(ctx, root, stderr, func(c *ucli.Context, svc *daemon.Service) error {
 				name := strings.TrimSpace(c.String("name"))
 				remote := strings.TrimSpace(c.String("remote"))
+				branch := strings.TrimSpace(c.String("branch"))
+				ref := strings.TrimSpace(c.String("ref"))
+				if branch != "" {
+					if c.IsSet("ref") {
+						return fmt.Errorf("--ref and --branch cannot be used together")
+					}
+					ref = "refs/heads/" + strings.TrimPrefix(branch, "refs/heads/")
+				}
+				requiredCommit := strings.TrimSpace(c.String("require-commit"))
+				if requiredCommit != "" && !c.IsSet("ref") && !c.IsSet("branch") {
+					return fmt.Errorf("--require-commit requires an explicit --ref")
+				}
 				async := c.Bool("async")
 				preparedGitDir := c.Bool("prepared-gitdir")
 				if preparedGitDir && !async {
@@ -86,21 +101,25 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if remote == "" && !preparedGitDir {
 					return fmt.Errorf("--remote is required")
 				}
-				d, err := daemon.ParseRefresh(c.String("refresh"))
+				refreshValue := strings.TrimSpace(c.String("refresh"))
+				d, err := daemon.ParseRefresh(refreshValue)
 				if err != nil {
 					return err
 				}
 				cfg := model.RepoConfig{
-					Name:            name,
-					ID:              model.RepoID(name),
-					RemoteURL:       remote,
-					Branch:          c.String("branch"),
-					RefreshInterval: d,
-					MountRoot:       c.String("mount-root"),
-					GitDir:          c.String("git-dir"),
-					PreparedGitDir:  preparedGitDir,
-					FetchRef:        c.String("fetch-ref"),
-					Enabled:         true,
+					Name:                  name,
+					ID:                    model.RepoID(name),
+					RemoteURL:             remote,
+					Branch:                ref,
+					RefreshInterval:       d,
+					RequiredCommit:        requiredCommit,
+					HistoryDepth:          c.Int("depth"),
+					RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
+					MountRoot:             c.String("mount-root"),
+					GitDir:                c.String("git-dir"),
+					PreparedGitDir:        preparedGitDir,
+					FetchRef:              c.String("fetch-ref"),
+					Enabled:               true,
 				}
 				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {
 					return err
@@ -151,7 +170,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				for _, r := range repos {
-					fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", r.Name, r.Branch, r.MountPath, r.RemoteURLRedacted)
+					displayRef := r.Branch
+					if branch, ok := strings.CutPrefix(displayRef, "refs/heads/"); ok {
+						displayRef = branch
+					}
+					fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", r.Name, displayRef, r.MountPath, r.RemoteURLRedacted)
 				}
 				return nil
 			}),
@@ -200,10 +223,15 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				if err != nil {
 					return err
 				}
-				if err := svc.SetRefresh(ctx, name, d); err != nil {
+				disabled := strings.EqualFold(interval, "never")
+				if err := svc.SetRefresh(ctx, name, d, disabled); err != nil {
 					return err
 				}
-				fmt.Fprintf(stdout, "updated refresh %s %s\n", name, d)
+				if disabled {
+					fmt.Fprintf(stdout, "updated refresh %s never\n", name)
+				} else {
+					fmt.Fprintf(stdout, "updated refresh %s %s\n", name, d)
+				}
 				return nil
 			}),
 		},
@@ -259,8 +287,20 @@ func nameCommand(name, usage string, ctx context.Context, root string, stderr io
 }
 
 func formatStatusLine(st model.RepoRuntimeState) string {
-	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
-		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef,
+	requiredCommit := st.RequiredCommit
+	if requiredCommit == "" {
+		requiredCommit = "none"
+	}
+	acquisition := st.Acquisition
+	if acquisition == "" {
+		acquisition = "not_required"
+	}
+	remoteRefresh := "enabled"
+	if st.RemoteRefreshDisabled {
+		remoteRefresh = "disabled"
+	}
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID, remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatPrepareError(st.PrepareError),

@@ -18,23 +18,26 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	defer store.Close()
 
 	cfg := model.RepoConfig{
-		ID:                "repo",
-		Name:              "repo",
-		MountRoot:         "/mnt",
-		MountPath:         "/mnt/repo",
-		RemoteURL:         "https://github.com/example/repo.git",
-		RemoteURLRedacted: "https://github.com/example/repo.git",
-		Branch:            "master",
-		RefreshInterval:   time.Minute,
-		GitDir:            "/git/repo",
-		OverlayDir:        "/overlay/repo",
-		BlobCacheDir:      "/cache/repo",
-		MetaDBPath:        "/meta/repo.sqlite",
-		OverlayDBPath:     "/overlay/repo/meta.sqlite",
-		Enabled:           true,
-		PreparedGitDir:    true,
-		FetchRef:          "master",
-		PrepareState:      model.PrepareStatePreparing,
+		ID:                    "repo",
+		Name:                  "repo",
+		MountRoot:             "/mnt",
+		MountPath:             "/mnt/repo",
+		RemoteURL:             "https://github.com/example/repo.git",
+		RemoteURLRedacted:     "https://github.com/example/repo.git",
+		Branch:                "master",
+		RefreshInterval:       time.Minute,
+		GitDir:                "/git/repo",
+		OverlayDir:            "/overlay/repo",
+		BlobCacheDir:          "/cache/repo",
+		MetaDBPath:            "/meta/repo.sqlite",
+		OverlayDBPath:         "/overlay/repo/meta.sqlite",
+		Enabled:               true,
+		PreparedGitDir:        true,
+		FetchRef:              "master",
+		PrepareState:          model.PrepareStatePreparing,
+		RequiredCommit:        "0123456789012345678901234567890123456789",
+		HistoryDepth:          1,
+		RemoteRefreshDisabled: true,
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -59,6 +62,19 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	if got.PrepareError != "clone failed" {
 		t.Fatalf("PrepareError = %q, want clone failed", got.PrepareError)
 	}
+	if got.RequiredCommit != cfg.RequiredCommit || got.HistoryDepth != 1 || !got.RemoteRefreshDisabled {
+		t.Fatalf("source policy = %+v", got)
+	}
+	if err := store.RecordAcquisition(ctx, cfg, model.PreparedSource{Ref: cfg.Branch, Commit: cfg.RequiredCommit, Verified: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.GetRepo(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AcquiredRef != cfg.Branch || got.AcquiredCommit != cfg.RequiredCommit || got.AcquiredAt.IsZero() {
+		t.Fatalf("acquisition receipt = %+v", got)
+	}
 }
 
 func TestSubsecondRefreshRoundTripsWithoutChangingPrepareState(t *testing.T) {
@@ -72,7 +88,7 @@ func TestSubsecondRefreshRoundTripsWithoutChangingPrepareState(t *testing.T) {
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateRefresh(ctx, cfg.ID, 250*time.Millisecond); err != nil {
+	if err := store.UpdateRefresh(ctx, cfg.ID, 250*time.Millisecond, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.GetRepo(ctx, cfg.Name)

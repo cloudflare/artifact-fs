@@ -23,8 +23,14 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 
 	got := formatStatusLine(st)
 	for _, want := range []string{
+		" head=abc123 ",
+		" ref=main ",
 		"last_fetch=never",
 		"result=never",
+		"required_commit=none",
+		"acquisition=not_required",
+		"base_commit=abc123",
+		"remote_refresh=enabled",
 		"prepare_error=none",
 		"hydrated_blobs=3",
 		"hydrated_bytes=42",
@@ -80,7 +86,10 @@ func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 		"add-repo",
 		"--name", "repo",
 		"--remote", "https://github.com/example/repo.git",
-		"--branch", "main",
+		"--ref", "refs/heads/main",
+		"--require-commit", "0123456789012345678901234567890123456789",
+		"--depth", "1",
+		"--refresh", "never",
 		"--async",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -88,6 +97,16 @@ func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 	}
 	if got := stdout.String(); got != "queued repo\n" {
 		t.Fatalf("stdout = %q, want queued repo", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run(context.Background(), []string{"list-repos"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.HasPrefix(got, "repo\tmain\t") {
+		t.Fatalf("list-repos output = %q, want legacy short branch column", got)
 	}
 }
 
@@ -116,6 +135,26 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			name: "async_rejects_inline_credentials",
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://token@example.com/org/repo.git"},
 			want: "async repositories must use ambient credentials",
+		},
+		{
+			name: "required_commit_requires_explicit_ref",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--require-commit", "0123456789012345678901234567890123456789"},
+			want: "--require-commit requires an explicit --ref",
+		},
+		{
+			name: "rejects_invalid_required_commit",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--require-commit", "not-an-oid"},
+			want: "--require-commit must be a full",
+		},
+		{
+			name: "rejects_negative_depth",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--depth", "-1"},
+			want: "--depth must not be negative",
+		},
+		{
+			name: "ref_conflicts_with_branch",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--branch", "main"},
+			want: "--ref and --branch cannot be used together",
 		},
 	}
 	for _, tt := range tests {

@@ -65,6 +65,7 @@ func createLocalTestRepo(t *testing.T) string {
 	run(t, workDir, "git", "commit", "-m", "add packages directory")
 
 	run(t, workDir, "git", "push", "origin", "main")
+	run(t, bareDir, "git", "config", "uploadpack.allowFilter", "true")
 
 	return "file://" + bareDir
 }
@@ -447,6 +448,227 @@ func TestE2E(t *testing.T) {
 	case <-errCh:
 	case <-time.After(10 * time.Second):
 		t.Log("daemon did not exit within 10s")
+	}
+}
+
+func TestE2EVerifiedSource(t *testing.T) {
+	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
+		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
+	}
+	skipIfNoFUSE(t)
+
+	repoRoot := t.TempDir()
+	remoteDir := filepath.Join(repoRoot, "verified.git")
+	seedWork := filepath.Join(repoRoot, "seed")
+	run(t, "", "git", "init", "--bare", remoteDir)
+	run(t, "", "git", "clone", remoteDir, seedWork)
+	run(t, seedWork, "git", "checkout", "-b", "main")
+	writeTestFile(t, seedWork, "README.md", "# Test Repo\n")
+	run(t, seedWork, "git", "add", "README.md")
+	run(t, seedWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "initial")
+	run(t, seedWork, "git", "push", "origin", "main")
+	run(t, remoteDir, "git", "config", "uploadpack.allowFilter", "true")
+	remoteURL := "file://" + remoteDir
+	requiredCommit := strings.TrimSpace(run(t, "", "git", "--git-dir", remoteDir, "rev-parse", "refs/heads/main"))
+	updateWork := filepath.Join(t.TempDir(), "update-work")
+	run(t, "", "git", "clone", remoteURL, updateWork)
+	run(t, updateWork, "git", "checkout", "main")
+
+	root := t.TempDir()
+	mountDir := t.TempDir()
+	mountPath := filepath.Join(mountDir, repoName)
+	cfg := model.RepoConfig{
+		Name:                  repoName,
+		ID:                    model.RepoID(repoName),
+		RemoteURL:             remoteURL,
+		RemoteURLRedacted:     auth.RedactRemoteURL(remoteURL),
+		Branch:                "refs/heads/main",
+		RequiredCommit:        requiredCommit,
+		HistoryDepth:          1,
+		RefreshInterval:       100 * time.Millisecond,
+		RemoteRefreshDisabled: true,
+		MountRoot:             mountDir,
+		Enabled:               true,
+	}
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstSvc, err := daemon.New(firstCtx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSvc.SetMountRoot(mountDir)
+	if err := firstSvc.AddRepo(firstCtx, cfg); err != nil {
+		firstCancel()
+		_ = firstSvc.Close()
+		t.Fatalf("add verified repo: %v", err)
+	}
+
+	gitDir := filepath.Join(root, "repos", repoName, "git")
+	blobCacheDir := filepath.Join(root, "cache", "blobs", repoName)
+	if got := strings.Fields(run(t, "", "git", "--git-dir", gitDir, "ls-files")); !slices.Equal(got, []string{"README.md"}) {
+		t.Fatalf("verified Git index before mount = %v, want [README.md]", got)
+	}
+	readmeOID := strings.TrimSpace(run(t, "", "git", "--git-dir", gitDir, "rev-parse", "HEAD:README.md"))
+	readmeCachePath := filepath.Join(blobCacheDir, readmeOID)
+	if _, err := os.Stat(readmeCachePath); !os.IsNotExist(err) {
+		firstCancel()
+		_ = firstSvc.Close()
+		t.Fatalf("verified acquisition hydrated README before mount read: %v", err)
+	}
+
+	firstErrCh := make(chan error, 1)
+	go func() { firstErrCh <- firstSvc.Start(firstCtx) }()
+	if !waitForMount(t, mountPath, 60*time.Second) {
+		firstCancel()
+		_ = firstSvc.Close()
+		t.Fatal("verified-source FUSE mount did not appear within timeout")
+	}
+	firstStopped := false
+	defer func() {
+		if !firstStopped {
+			stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
+		}
+	}()
+	if got, want := readFileStr(t, filepath.Join(mountPath, ".git")), "gitdir: "+gitDir+"\n"; got != want {
+		t.Fatalf("mounted .git = %q, want %q", got, want)
+	}
+	if got := strings.Fields(gitCmd(t, mountPath, "ls-files")); !slices.Equal(got, []string{"README.md"}) {
+		t.Fatalf("verified Git index through mount = %v, want [README.md]", got)
+	}
+
+	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+	if got := readFileStr(t, filepath.Join(mountPath, "README.md")); !strings.Contains(got, "Test Repo") {
+		t.Fatalf("README.md = %q", got)
+	}
+	if _, err := os.Stat(readmeCachePath); err != nil {
+		t.Fatalf("mounted read did not hydrate README: %v", err)
+	}
+	status, err := firstSvc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.HydratedBlobCount == 0 {
+		t.Fatalf("mounted status did not report hydrated README: %+v", status)
+	}
+
+	overlayReadme := "# local verified overlay\n"
+	if err := os.WriteFile(filepath.Join(mountPath, "README.md"), []byte(overlayReadme), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mountPath, "local-only.txt"), []byte("overlay\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	status, err = firstSvc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.DirtyOverlay {
+		t.Fatalf("mounted status did not report dirty overlay: %+v", status)
+	}
+	assertGitStatus(t, mountPath, map[string]string{
+		"README.md":      " M",
+		"local-only.txt": "??",
+	})
+	gitCmd(t, mountPath, "add", "README.md", "local-only.txt")
+	assertGitStatus(t, mountPath, map[string]string{
+		"README.md":      "M ",
+		"local-only.txt": "A ",
+	})
+
+	run(t, updateWork, "git", "fetch", "origin", "main")
+	run(t, updateWork, "git", "checkout", "-B", "main", "origin/main")
+	writeTestFile(t, updateWork, "REMOTE-ONLY.md", "new remote content\n")
+	run(t, updateWork, "git", "add", "REMOTE-ONLY.md")
+	run(t, updateWork, "git", "-c", "user.name=E2E Test", "-c", "user.email=e2e@test", "commit", "-m", "advance remote")
+	run(t, updateWork, "git", "push", "origin", "main")
+	time.Sleep(time.Second)
+	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+	if _, err := os.Stat(filepath.Join(mountPath, "REMOTE-ONLY.md")); !os.IsNotExist(err) {
+		t.Fatalf("disabled refresh exposed remote-only file: %v", err)
+	}
+	remoteTracking := exec.Command("git", "--git-dir", gitDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/main")
+	if err := remoteTracking.Run(); err == nil {
+		t.Fatal("disabled refresh fetched refs/remotes/origin/main")
+	}
+
+	alternateCommit := strings.TrimSpace(gitCmd(t, mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "local head change",
+	))
+	gitCmd(t, mountPath, "update-ref", "--no-deref", "HEAD", alternateCommit)
+	time.Sleep(time.Second)
+	assertVerifiedSourceStatus(t, firstSvc, requiredCommit)
+
+	stopE2EDaemon(t, firstSvc, firstCancel, firstErrCh, mountPath)
+	firstStopped = true
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondSvc, err := daemon.New(secondCtx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSvc.SetMountRoot(mountDir)
+	secondErrCh := make(chan error, 1)
+	go func() { secondErrCh <- secondSvc.Start(secondCtx) }()
+	if !waitForMount(t, mountPath, 60*time.Second) {
+		secondCancel()
+		_ = secondSvc.Close()
+		t.Fatal("verified-source FUSE mount did not reappear after restart")
+	}
+	defer stopE2EDaemon(t, secondSvc, secondCancel, secondErrCh, mountPath)
+
+	assertVerifiedSourceStatus(t, secondSvc, requiredCommit)
+	if head := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD")); head != requiredCommit {
+		t.Fatalf("HEAD after restart = %q, want required commit %q", head, requiredCommit)
+	}
+	if got := readFileStr(t, filepath.Join(mountPath, "README.md")); got != overlayReadme {
+		t.Fatalf("README overlay after restart = %q, want %q", got, overlayReadme)
+	}
+	if got := readFileStr(t, filepath.Join(mountPath, "local-only.txt")); got != "overlay\n" {
+		t.Fatalf("local overlay after restart = %q", got)
+	}
+	assertGitStatus(t, mountPath, map[string]string{
+		"README.md":      "M ",
+		"local-only.txt": "A ",
+	})
+}
+
+func assertVerifiedSourceStatus(t *testing.T, svc *daemon.Service, requiredCommit string) {
+	t.Helper()
+	status, err := svc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "mounted" ||
+		status.SourceRef != "refs/heads/main" ||
+		status.RequiredCommit != requiredCommit ||
+		status.CurrentHEADOID != requiredCommit ||
+		status.CurrentHEADRef != "refs/heads/main" ||
+		status.Acquisition != "verified" ||
+		!status.RemoteRefreshDisabled ||
+		status.LastFetchResult != "never" {
+		t.Fatalf("verified source status = %+v", status)
+	}
+}
+
+func stopE2EDaemon(t *testing.T, svc *daemon.Service, cancel context.CancelFunc, errCh <-chan error, mountPath string) {
+	t.Helper()
+	cancel()
+	if err := svc.Close(); err != nil {
+		t.Errorf("close daemon: %v", err)
+	}
+	select {
+	case <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Error("daemon did not exit within 10s")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for isMounted(mountPath) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if isMounted(mountPath) {
+		t.Errorf("mount remained active at %s", mountPath)
 	}
 }
 
