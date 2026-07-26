@@ -363,7 +363,10 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if observed != requirement.RequiredCommit {
 			return fmt.Errorf("source changed: %s resolved to %s, required %s", requirement.Ref, observed, requirement.RequiredCommit)
 		}
-		return prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit, true)
+		if err := prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit, true); err != nil {
+			return err
+		}
+		return nil
 	}
 	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
 		if candidateGitDir != "" {
@@ -1481,6 +1484,19 @@ func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 }
 
 func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
+	if repo.RequiredCommit != "" && strings.TrimSpace(repo.MountPath) != "" {
+		if _, err := os.Stat(repo.MountPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		// Verified acquisitions use a standalone Git directory. Pin it only
+		// after FUSE mounts so index refreshes cannot infer the caller's cwd.
+		if _, err := runGit(ctx, repo.GitDir, "config", "core.worktree", repo.MountPath); err != nil {
+			return err
+		}
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err

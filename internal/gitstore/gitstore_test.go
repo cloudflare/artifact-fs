@@ -595,26 +595,46 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		Branch:         "refs/heads/main",
 		RequiredCommit: tip,
 		HistoryDepth:   1,
+		MountPath:      filepath.Join(tmp, "mounted"),
 	}
 	requirement := model.SourceRequirement{Ref: cfg.Branch, RequiredCommit: tip, Depth: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	prepared, err := New(nil).PrepareSource(ctx, cfg, requirement)
+	store := New(nil)
+	prepared, err := store.PrepareSource(ctx, cfg, requirement)
 	if err != nil {
 		t.Fatalf("PrepareSource: %v", err)
 	}
 	if !prepared.Verified || !prepared.Acquired || prepared.Ref != cfg.Branch || prepared.Commit != tip {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
-	mountedWorktree := filepath.Join(tmp, "mounted")
+	mountedWorktree := cfg.MountPath
 	if err := os.MkdirAll(mountedWorktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(mountedWorktree, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
+		t.Fatalf("ConfigureStatusOptimization: %v", err)
+	}
 	if inside := strings.TrimSpace(runOutput(t, "git", "-C", mountedWorktree, "rev-parse", "--is-inside-work-tree")); inside != "true" {
 		t.Fatalf("mounted Git directory reported is-inside-work-tree = %q, want true", inside)
+	}
+	configuredWorktree, err := runGit(ctx, gitDir, "config", "--path", "core.worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedWorktree, err := filepath.EvalSymlinks(configuredWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWorktree, err := filepath.EvalSymlinks(mountedWorktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedWorktree != wantWorktree {
+		t.Fatalf("core.worktree = %q, want %q", resolvedWorktree, wantWorktree)
 	}
 
 	count, err := runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
