@@ -37,6 +37,11 @@ type GitOperation string
 const (
 	GitOperationClone GitOperation = "clone"
 	GitOperationFetch GitOperation = "fetch"
+
+	logGitOperationAttemptFailed = "git operation attempt failed"
+	logGitOperationRetrying      = "retrying transient git operation failure"
+	logGitOperationRecovered     = "git operation recovered"
+	logGitOperationInterrupted   = "git operation interrupted during retry backoff"
 )
 
 // GitOperationError describes a failed Git operation without exposing
@@ -100,6 +105,14 @@ type gitCommandError struct {
 	retryable  bool // Classified before cause is redacted.
 }
 
+type redactedCause struct {
+	message string
+	cause   error
+}
+
+func (e *redactedCause) Error() string { return e.message }
+func (e *redactedCause) Unwrap() error { return e.cause }
+
 func (e *gitCommandError) Error() string {
 	if e == nil {
 		return "git command failed"
@@ -144,6 +157,70 @@ type fetchBlobResult struct {
 }
 
 const maxReadBlobBytes int64 = 1<<31 - 1
+
+const (
+	maxGitErrorBytes       = 16 << 10
+	gitErrorScanOverlap    = 128
+	gitErrorTruncatedLabel = "[git stderr truncated]"
+)
+
+type boundedGitError struct {
+	buf          bytes.Buffer
+	limit        int
+	truncated    bool
+	scanTail     string
+	sawPermanent bool
+	sawTransient bool
+}
+
+func (b *boundedGitError) Write(p []byte) (int, error) {
+	n := len(p)
+	scan := strings.ToLower(b.scanTail + string(p))
+	b.sawPermanent = b.sawPermanent || containsGitSymptom(scan, permanentGitFailureSymptoms)
+	b.sawTransient = b.sawTransient || containsGitSymptom(scan, transientGitFailureSymptoms)
+	if len(scan) > gitErrorScanOverlap {
+		b.scanTail = scan[len(scan)-gitErrorScanOverlap:]
+	} else {
+		b.scanTail = scan
+	}
+	remaining := max(b.limit-b.buf.Len(), 0)
+	if len(p) > remaining {
+		b.truncated = true
+		p = p[:remaining]
+	}
+	if len(p) > 0 {
+		_, _ = b.buf.Write(p)
+	}
+	return n, nil
+}
+
+func (b *boundedGitError) String() string {
+	if !b.truncated {
+		return b.buf.String()
+	}
+	return strings.TrimRight(b.buf.String(), "\r\n") + "\n" + gitErrorTruncatedLabel
+}
+
+func (b *boundedGitError) Retryable() bool {
+	return !b.sawPermanent && b.sawTransient
+}
+
+func redactTruncatedCredentialPrefix(message string, credentials []string) string {
+	suffix := "\n" + gitErrorTruncatedLabel
+	body, truncated := strings.CutSuffix(message, suffix)
+	if !truncated {
+		return message
+	}
+	for _, credential := range credentials {
+		for prefixLen := len(credential) - 1; prefixLen > 0; prefixLen-- {
+			if strings.HasSuffix(body, credential[:prefixLen]) {
+				body = body[:len(body)-prefixLen] + "REDACTED"
+				break
+			}
+		}
+	}
+	return body + suffix
+}
 
 const fetchedFullRefRemoteTrackingRef = "refs/remotes/artifact-fs/fetch-ref"
 const verifiedSourceTrackingRef = "refs/remotes/artifact-fs/source"
@@ -260,7 +337,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		}
 		return err
 	}
-	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
+	if err := s.retryGitOperationForRemotes(ctx, GitOperationClone, cfg.Name, []string{cfg.RemoteURL}, attempt); err != nil {
 		return err
 	}
 	defer os.RemoveAll(target)
@@ -512,24 +589,58 @@ func (s *Store) invalidateBatchPool(gitDir string) {
 }
 
 func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, repoName string, attempt func() error) error {
+	return s.retryGitOperationForRemotes(ctx, operation, repoName, nil, attempt)
+}
+
+func (s *Store) retryGitOperationForRemotes(ctx context.Context, operation GitOperation, repoName string, remotes []string, attempt func() error) error {
+	return s.retryGitOperationForRemoteLookup(ctx, operation, repoName, func() ([]string, bool) {
+		return remotes, true
+	}, attempt)
+}
+
+func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation GitOperation, repoName string, remotesForLogging func() ([]string, bool), attempt func() error) error {
 	delays := s.gitRetryDelays
 	var lastErr *GitOperationError
+	operationStarted := time.Now()
+	safeRepoName := auth.RedactLogString(repoName)
+	logger := s.logger.With("operation", operation, "repo", safeRepoName)
+	logInterrupted := func(operationErr *GitOperationError, contextErr error) {
+		operationErr.contextErr = contextErr
+		args := []any{"attempts", operationErr.Attempts, "duration_ms", time.Since(operationStarted).Milliseconds(), "timed_out", errors.Is(contextErr, context.DeadlineExceeded), "canceled", errors.Is(contextErr, context.Canceled), "error", auth.RedactLogString(operationErr.Error())}
+		if errors.Is(contextErr, context.Canceled) {
+			logger.InfoContext(ctx, logGitOperationInterrupted, args...)
+		} else {
+			logger.WarnContext(ctx, logGitOperationInterrupted, args...)
+		}
+	}
 	for n := 0; ; n++ {
 		if contextErr := ctx.Err(); contextErr != nil {
 			if lastErr != nil {
-				lastErr.contextErr = contextErr
+				logInterrupted(lastErr, contextErr)
 				return lastErr
 			}
 			return &GitOperationError{Operation: operation, Attempts: n, contextErr: contextErr}
 		}
 
+		attemptStarted := time.Now()
 		err := attempt()
 		if err == nil {
+			if n > 0 {
+				logger.InfoContext(ctx, logGitOperationRecovered, "attempts", n+1, "duration_ms", time.Since(operationStarted).Milliseconds())
+			}
 			return nil
 		}
 		cause, contextErr, retryable := gitOperationCauses(err)
 		if contextErr == nil {
 			contextErr = ctx.Err()
+		}
+		if cause != nil {
+			remotes, complete := remotesForLogging()
+			message := "git command failed"
+			if complete {
+				message = auth.RedactLogString(cause.Error(), remotes...)
+			}
+			cause = &redactedCause{message: message, cause: cause}
 		}
 		operationErr := &GitOperationError{
 			Operation:  operation,
@@ -539,19 +650,34 @@ func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, r
 			contextErr: contextErr,
 		}
 		lastErr = operationErr
+		safeError := ""
+		if cause != nil {
+			safeError = auth.RedactLogString(cause.Error())
+		} else if contextErr != nil {
+			safeError = auth.RedactLogString(contextErr.Error())
+		} else {
+			safeError = auth.RedactLogString(operationErr.Error())
+		}
+		logger.WarnContext(ctx, logGitOperationAttemptFailed,
+			"attempt", n+1,
+			"max_attempts", len(delays)+1,
+			"retryable", retryable,
+			"duration_ms", time.Since(attemptStarted).Milliseconds(),
+			"timed_out", errors.Is(contextErr, context.DeadlineExceeded),
+			"canceled", errors.Is(contextErr, context.Canceled),
+			"error", safeError,
+		)
 		if contextErr != nil {
 			return operationErr
 		}
 
-		safeRepoName := auth.RedactString(repoName)
-		s.logger.Warn("git operation attempt failed", "operation", operation, "repo", safeRepoName, "attempt", n+1, "max_attempts", len(delays)+1, "retryable", retryable)
 		if !retryable || n == len(delays) {
 			return operationErr
 		}
 		delay := equalJitter(delays[n])
-		s.logger.Info("retrying transient git operation failure", "operation", operation, "repo", safeRepoName, "attempt", n+1, "backoff", delay.String())
+		logger.InfoContext(ctx, logGitOperationRetrying, "attempt", n+1, "next_attempt", n+2, "backoff_ms", delay.Milliseconds())
 		if waitErr := waitForGitRetry(ctx, delay); waitErr != nil {
-			operationErr.contextErr = waitErr
+			logInterrupted(operationErr, waitErr)
 			return operationErr
 		}
 	}
@@ -591,51 +717,48 @@ func isTransientGitError(err error) bool {
 	return isTransientGitMessage(err.Error())
 }
 
-func isTransientGitMessage(message string) bool {
-	message = strings.ToLower(message)
-	// Generic index-pack summaries can follow local failures that retrying cannot repair.
-	for _, symptom := range []string{
-		"no space left on device",
-		"disk quota exceeded",
-		"permission denied",
-		"read-only file system",
-	} {
-		if strings.Contains(message, symptom) {
-			return false
-		}
-	}
-	for _, symptom := range []string{
-		"http 408", "http/1.0 408", "http/1.1 408", "http/2 408", "returned error: 408",
-		"http 500", "http/1.0 500", "http/1.1 500", "http/2 500", "returned error: 500",
-		"http 502", "http/1.0 502", "http/1.1 502", "http/2 502", "returned error: 502",
-		"http 503", "http/1.0 503", "http/1.1 503", "http/2 503", "returned error: 503",
-		"http 504", "http/1.0 504", "http/1.1 504", "http/2 504", "returned error: 504",
-		"http 522", "http/1.0 522", "http/1.1 522", "http/2 522", "returned error: 522",
-		"http 524", "http/1.0 524", "http/1.1 524", "http/2 524", "returned error: 524",
-		"curl 18 ",
-		"curl 55 ",
-		"curl 56 ",
-		"curl 92 ",
-		"unexpected disconnect",
-		"remote end hung up unexpectedly",
-		"remote hung up",
-		"connection reset",
-		"connection timed out",
-		"could not resolve host",
-		"couldn't connect to server",
-		"failed to connect to",
-		"operation timed out",
-		"timeout was reached",
-		"empty reply from server",
-		"transfer closed with",
-		"send failure: broken pipe",
-		"tls connection was non-properly terminated",
-		"was not closed cleanly: cancel",
-		"reset by server",
-		"bytes of body are still expected",
-		"bytes of length header were received",
-		"early eof",
-	} {
+var permanentGitFailureSymptoms = []string{
+	"no space left on device",
+	"disk quota exceeded",
+	"permission denied",
+	"read-only file system",
+}
+
+var transientGitFailureSymptoms = []string{
+	"http 408", "http/1.0 408", "http/1.1 408", "http/2 408", "returned error: 408",
+	"http 500", "http/1.0 500", "http/1.1 500", "http/2 500", "returned error: 500",
+	"http 502", "http/1.0 502", "http/1.1 502", "http/2 502", "returned error: 502",
+	"http 503", "http/1.0 503", "http/1.1 503", "http/2 503", "returned error: 503",
+	"http 504", "http/1.0 504", "http/1.1 504", "http/2 504", "returned error: 504",
+	"http 522", "http/1.0 522", "http/1.1 522", "http/2 522", "returned error: 522",
+	"http 524", "http/1.0 524", "http/1.1 524", "http/2 524", "returned error: 524",
+	"curl 18 ",
+	"curl 55 ",
+	"curl 56 ",
+	"curl 92 ",
+	"unexpected disconnect",
+	"remote end hung up unexpectedly",
+	"remote hung up",
+	"connection reset",
+	"connection timed out",
+	"could not resolve host",
+	"couldn't connect to server",
+	"failed to connect to",
+	"operation timed out",
+	"timeout was reached",
+	"empty reply from server",
+	"transfer closed with",
+	"send failure: broken pipe",
+	"tls connection was non-properly terminated",
+	"was not closed cleanly: cancel",
+	"reset by server",
+	"bytes of body are still expected",
+	"bytes of length header were received",
+	"early eof",
+}
+
+func containsGitSymptom(message string, symptoms []string) bool {
+	for _, symptom := range symptoms {
 		if strings.Contains(message, symptom) {
 			return true
 		}
@@ -643,8 +766,16 @@ func isTransientGitMessage(message string) bool {
 	return false
 }
 
+func isTransientGitMessage(message string) bool {
+	message = strings.ToLower(message)
+	// Generic index-pack summaries can follow local failures that retrying cannot repair.
+	return !containsGitSymptom(message, permanentGitFailureSymptoms) && containsGitSymptom(message, transientGitFailureSymptoms)
+}
+
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
-	return s.retryGitOperation(ctx, GitOperationFetch, repo.Name, func() error {
+	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
+	defer cancelLookup()
+	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
 		args := []string{"fetch", "--no-tags"}
 		if repo.HistoryDepth > 0 {
 			args = append(args, fmt.Sprintf("--depth=%d", repo.HistoryDepth))
@@ -656,6 +787,18 @@ func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
 }
 
 func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfig, ref string) error {
+	return s.fetchRef(ctx, repo, ref, nonInteractiveGitEnv())
+}
+
+func (s *Store) FetchRefWithCredentials(ctx context.Context, repo model.RepoConfig, ref string) error {
+	_, env, err := credentialEnv(repo.RemoteURL)
+	if err != nil {
+		return err
+	}
+	return s.fetchRef(ctx, repo, ref, env)
+}
+
+func (s *Store) fetchRef(ctx context.Context, repo model.RepoConfig, ref string, env []string) error {
 	target, err := fetchRefTarget(repo, ref)
 	if err != nil {
 		return err
@@ -664,29 +807,83 @@ func (s *Store) FetchRefNonInteractive(ctx context.Context, repo model.RepoConfi
 	if target.branch != "" {
 		refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", target.branch, target.branch)
 	}
-	return s.retryGitOperation(ctx, GitOperationFetch, repo.Name, func() error {
-		_, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
+	remotesForLogging, cancelLookup := s.startRemotesForLogging(ctx, repo)
+	defer cancelLookup()
+	return s.retryGitOperationForRemoteLookup(ctx, GitOperationFetch, repo.Name, remotesForLogging, func() error {
+		_, err := runGitWithEnv(ctx, repo.GitDir, env, "fetch", "--filter=blob:none", "--no-tags", "origin", refspec)
 		return err
 	})
+}
+
+func (s *Store) startRemotesForLogging(ctx context.Context, repo model.RepoConfig) (func() ([]string, bool), context.CancelFunc) {
+	type lookupResult struct {
+		remote string
+		err    error
+	}
+	lookupCtx, cancel := context.WithCancel(ctx)
+	result := make(chan lookupResult, 1)
+	go func() {
+		remote, err := runGit(lookupCtx, repo.GitDir, "remote", "get-url", "origin")
+		result <- lookupResult{remote: strings.TrimSpace(remote), err: err}
+	}()
+
+	finished := false
+	known := false
+	actualRemote := ""
+	return func() ([]string, bool) {
+		if !finished {
+			select {
+			case lookup := <-result:
+				finished = true
+				known = lookup.err == nil
+				actualRemote = lookup.remote
+			default:
+			}
+		}
+		remotes := []string{repo.RemoteURL}
+		if known && actualRemote != "" && actualRemote != strings.TrimSpace(repo.RemoteURL) {
+			remotes = append(remotes, actualRemote)
+		}
+		return remotes, known
+	}, cancel
 }
 
 func (s *Store) PrepareExistingCloneNonInteractive(ctx context.Context, repo model.RepoConfig) error {
 	if err := s.ValidateAmbientRemote(repo); err != nil {
 		return err
 	}
-	remoteURL, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
-	if err != nil {
+	if err := s.ConfigureRemoteNonInteractive(ctx, repo); err != nil {
 		return err
-	}
-	if strings.TrimSpace(remoteURL) != strings.TrimSpace(repo.RemoteURL) {
-		if _, err := runGitWithEnv(ctx, repo.GitDir, nonInteractiveGitEnv(), "remote", "set-url", "origin", repo.RemoteURL); err != nil {
-			return err
-		}
 	}
 	if err := s.FetchRefNonInteractive(ctx, repo, repo.FetchRef); err != nil {
 		return err
 	}
 	return s.PrepareFetchedBranch(ctx, repo, repo.FetchRef)
+}
+
+func (s *Store) ConfigureRemoteNonInteractive(ctx context.Context, repo model.RepoConfig) error {
+	return s.configureRemote(ctx, repo, repo.RemoteURL, nonInteractiveGitEnv())
+}
+
+func (s *Store) ConfigureRemoteWithCredentials(ctx context.Context, repo model.RepoConfig) error {
+	safeURL, env, err := credentialEnv(repo.RemoteURL)
+	if err != nil {
+		return err
+	}
+	return s.configureRemote(ctx, repo, safeURL, env)
+}
+
+func (s *Store) configureRemote(ctx context.Context, repo model.RepoConfig, targetRemote string, env []string) error {
+	actualRemote, err := runGit(ctx, repo.GitDir, "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(actualRemote) != strings.TrimSpace(targetRemote) {
+		if _, err := runGitWithEnv(ctx, repo.GitDir, env, "remote", "set-url", "origin", targetRemote); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ValidateAmbientRemote(repo model.RepoConfig) error {
@@ -713,31 +910,94 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 		return fmt.Errorf("remote ref %s missing after fetch: %w", target.remoteRef, err)
 	}
 	oid = strings.TrimSpace(oid)
+	oldOID, err := currentOrEmptyTreeOID(ctx, repo.GitDir)
+	if err != nil {
+		return err
+	}
 	if target.branch == "" {
-		if _, err := runGit(ctx, repo.GitDir, "update-ref", "--no-deref", "HEAD", oid); err != nil {
+		if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 			return err
 		}
-		return s.ReadTreeHEAD(ctx, repo)
+		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
+		if err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		updateArgs := []string{"update-ref", "--no-deref", "HEAD", oid}
+		if strings.Trim(oldHeadOID, "0") != "" {
+			updateArgs = append(updateArgs, oldHeadOID)
+		}
+		if _, err := runGit(ctx, repo.GitDir, updateArgs...); err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		return nil
 	}
 	refName := "refs/heads/" + target.branch
+	var oldBranchOID string
 	if repo.PreparedGitDir {
-		oldOID, err := s.preparedBranchExpectedOID(ctx, repo, target.branch, oid)
-		if err != nil {
-			return err
-		}
-		if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldOID); err != nil {
-			return err
-		}
-	} else if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid); err != nil {
+		oldBranchOID, err = s.preparedBranchExpectedOID(ctx, repo, target.branch, oid)
+	} else {
+		oldBranchOID, err = refOIDOrZero(ctx, repo.GitDir, refName)
+	}
+	if err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", "refs/heads/"+target.branch); err != nil {
+	if err := readTreeTransition(ctx, repo.GitDir, oldOID, oid); err != nil {
 		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
+		return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
+		refErr := restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid)
+		indexErr := rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		return errors.Join(indexErr, refErr)
 	}
 	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+target.branch, target.branch); err != nil {
-		s.logger.Warn("set upstream failed", "repo", repo.Name, "error", err)
+		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
 	}
-	return s.ReadTreeHEAD(ctx, repo)
+	return nil
+}
+
+func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
+	oid, err := runGit(ctx, gitDir, "rev-parse", "--verify", refName+"^{commit}")
+	if err == nil {
+		return strings.TrimSpace(oid), nil
+	}
+	return zeroOIDForGitDir(ctx, gitDir)
+}
+
+func rollbackIndexTransition(ctx context.Context, gitDir string, fromOID string, toOID string, cause error) error {
+	if err := readTreeTransition(ctx, gitDir, fromOID, toOID); err != nil {
+		return errors.Join(cause, fmt.Errorf("restore index after ref update failure: %w", err))
+	}
+	return cause
+}
+
+func restoreRef(ctx context.Context, gitDir string, refName string, oldOID string, newOID string) error {
+	if _, err := runGit(ctx, gitDir, "update-ref", refName, oldOID, newOID); err != nil {
+		return fmt.Errorf("restore ref after HEAD update failure: %w", err)
+	}
+	return nil
+}
+
+func currentOrEmptyTreeOID(ctx context.Context, gitDir string) (string, error) {
+	oid, headErr := runGit(ctx, gitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if headErr == nil {
+		return strings.TrimSpace(oid), nil
+	}
+	if _, err := runGit(ctx, gitDir, "symbolic-ref", "-q", "HEAD"); err != nil {
+		return "", headErr
+	}
+	oid, err := runGit(ctx, gitDir, "hash-object", "-t", "tree", "-w", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(oid), nil
+}
+
+func readTreeTransition(ctx context.Context, gitDir string, oldOID string, newOID string) error {
+	_, err := runGit(ctx, gitDir, "read-tree", "-m", oldOID, newOID)
+	return err
 }
 
 func (s *Store) preparedBranchExpectedOID(ctx context.Context, repo model.RepoConfig, branch string, oid string) (string, error) {
@@ -858,12 +1118,21 @@ func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn fu
 	readErr := readNullDelimited(stdout, fn)
 	waitErr := cmd.Wait()
 	if readErr != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return errors.Join(readErr, contextErr)
+		}
 		return readErr
 	}
 	if waitErr != nil {
 		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
 		if msg == "" {
 			msg = auth.RedactString(waitErr.Error())
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			if strings.EqualFold(msg, "signal: killed") {
+				return contextErr
+			}
+			return errors.Join(errors.New(msg), contextErr)
 		}
 		return errors.New(msg)
 	}
@@ -1483,6 +1752,15 @@ func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 	return err
 }
 
+// EnsureIndexInitialized creates a missing index without replacing staged work.
+func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfig) error {
+	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return err
+	}
+	return readTreeTransition(ctx, repo.GitDir, strings.TrimSpace(oid), strings.TrimSpace(oid))
+}
+
 func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {
 	if repo.RequiredCommit != "" && strings.TrimSpace(repo.MountPath) != "" {
 		if _, err := os.Stat(repo.MountPath); err != nil {
@@ -1611,7 +1889,7 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 	env = append(env, extraEnv...)
 	cmd.Env = env
 	buf := &bytes.Buffer{}
-	errBuf := &bytes.Buffer{}
+	errBuf := &boundedGitError{limit: maxGitErrorBytes}
 	cmd.Stdout = buf
 	cmd.Stderr = errBuf
 	runErr := cmd.Run()
@@ -1622,7 +1900,7 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 	contextErr := ctx.Err()
 
 	rawMessage := strings.TrimSpace(errBuf.String())
-	retryable := isTransientGitMessage(rawMessage)
+	retryable := errBuf.Retryable()
 	msg := rawMessage
 	var credentials []string
 	for _, env := range extraEnv {
@@ -1638,6 +1916,7 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 	for _, credential := range credentials {
 		msg = strings.ReplaceAll(msg, credential, "REDACTED")
 	}
+	msg = redactTruncatedCredentialPrefix(msg, credentials)
 	msg = auth.RedactString(msg)
 	var cause error
 	if msg != "" && !(contextErr != nil && strings.EqualFold(msg, "signal: killed")) {

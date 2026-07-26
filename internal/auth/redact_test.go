@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRedactRemoteURL(t *testing.T) {
 	in := "https://token123@github.com/org/repo.git?token=abc"
@@ -552,6 +555,42 @@ func TestHasInlineCredentials(t *testing.T) {
 				t.Fatalf("HasInlineCredentials(%q) = %v, want %v", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRedactLogStringRemovesRemoteReferences(t *testing.T) {
+	for _, input := range []string{
+		"fatal: repository 'https://github.example.com/private/repo.git' not found",
+		"clone https://user:secret@example.com/org/repo.git failed",
+		"fetch git@example.com:private/repo.git failed",
+	} {
+		got := RedactLogString(input)
+		if !strings.Contains(got, "REDACTED_REMOTE") {
+			t.Fatalf("RedactLogString(%q) = %q, want remote marker", input, got)
+		}
+		for _, secret := range []string{"github.example.com", "private/repo.git", "user", "secret", "example.com", "org/repo.git"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("RedactLogString(%q) leaked %q in %q", input, secret, got)
+			}
+		}
+	}
+	for _, remote := range []string{"/private/customer/repo.git", "github.example.com:private/repo.git"} {
+		got := RedactLogString("fatal: repository "+remote+" not found", remote)
+		if strings.Contains(got, remote) || !strings.Contains(got, "REDACTED_REMOTE") {
+			t.Fatalf("RedactLogString leaked exact remote %q in %q", remote, got)
+		}
+		partial := remote[:len(remote)-4]
+		got = RedactLogString("fatal: repository "+partial+"\n[git stderr truncated]", remote)
+		if strings.Contains(got, partial) || !strings.Contains(got, "REDACTED_REMOTE") {
+			t.Fatalf("RedactLogString leaked partial remote %q in %q", partial, got)
+		}
+	}
+}
+
+func TestRedactLogStringBoundsDiagnostics(t *testing.T) {
+	got := RedactLogString(strings.Repeat("x", maxLogStringBytes*2))
+	if len(got) > maxLogStringBytes+len(logStringTruncatedLabel)+1 || !strings.Contains(got, logStringTruncatedLabel) {
+		t.Fatalf("RedactLogString returned %d bytes without truncation marker", len(got))
 	}
 }
 

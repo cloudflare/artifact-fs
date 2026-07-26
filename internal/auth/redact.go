@@ -4,10 +4,16 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 var tokenLike = regexp.MustCompile(`(?i)(access_token|token|password|passwd|secret|key|authorization|x-token-auth)=([^&\s]+)`)
+
+const (
+	maxLogStringBytes       = 16 << 10
+	logStringTruncatedLabel = "[diagnostic truncated]"
+)
 
 func RedactRemoteURL(raw string) string {
 	if raw == "" {
@@ -334,6 +340,60 @@ func RedactString(s string) string {
 		s = strings.Join(parts, " ")
 	}
 	s = tokenLike.ReplaceAllString(s, `$1=REDACTED`)
+	return s
+}
+
+// RedactLogString removes complete remote references in addition to credentials.
+// Logs need the transport error, not repository locations that may be private.
+func RedactLogString(s string, sensitiveValues ...string) string {
+	values := append([]string(nil), sensitiveValues...)
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	for _, value := range values {
+		if value != "" {
+			s = strings.ReplaceAll(s, value, "REDACTED_REMOTE")
+			s = redactTruncatedSensitivePrefix(s, value)
+		}
+	}
+	s = RedactString(s)
+	if s != "" && (strings.Contains(s, "://") || strings.ContainsAny(s, "@?#")) {
+		parts := strings.Split(s, " ")
+		for i, token := range parts {
+			if !shouldRedactRemoteToken(token) {
+				continue
+			}
+			start := strings.IndexFunc(token, func(r rune) bool {
+				return !strings.ContainsRune("'\"([{<", r)
+			})
+			end := strings.LastIndexFunc(token, func(r rune) bool {
+				return !strings.ContainsRune("'\")]}>,.:", r)
+			})
+			if start < 0 || end < start {
+				continue
+			}
+			core := token[start : end+1]
+			remoteStart := remoteStartIndex(core)
+			parts[i] = token[:start] + core[:remoteStart] + "REDACTED_REMOTE" + token[end+1:]
+		}
+		s = strings.Join(parts, " ")
+	}
+	if len(s) > maxLogStringBytes {
+		s = strings.ToValidUTF8(s[:maxLogStringBytes], "") + "\n" + logStringTruncatedLabel
+	}
+	return s
+}
+
+func redactTruncatedSensitivePrefix(s string, sensitive string) string {
+	body := s
+	suffix := ""
+	if suffixStart := strings.LastIndex(s, "\n["); suffixStart >= 0 && strings.HasSuffix(s, "]") {
+		body = s[:suffixStart]
+		suffix = s[suffixStart:]
+	}
+	for prefixLen := len(sensitive) - 1; prefixLen > 0; prefixLen-- {
+		if strings.HasSuffix(body, sensitive[:prefixLen]) {
+			return body[:len(body)-prefixLen] + "REDACTED_REMOTE" + suffix
+		}
+	}
 	return s
 }
 

@@ -350,6 +350,131 @@ func TestReadTreeHEAD(t *testing.T) {
 	}
 }
 
+func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	staged := runOutput(t, "git", "-C", repo, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "tracked.txt") {
+		t.Fatalf("staged entries = %q, want tracked.txt", staged)
+	}
+	debug := runOutput(t, "git", "-C", repo, "ls-files", "--debug", "intent.txt")
+	if !strings.Contains(debug, "flags: 20004000") {
+		t.Fatalf("intent-to-add entry was not preserved:\n%s", debug)
+	}
+}
+
+func TestPrepareFetchedBranchPreservesStagedEntries(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	run(t, "git", "-C", repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "feature.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "feature")
+	featureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", featureOID)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "add", "-N", "intent.txt")
+
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature"); err != nil {
+		t.Fatal(err)
+	}
+	staged := runOutput(t, "git", "-C", repo, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "tracked.txt") {
+		t.Fatalf("staged entries = %q, want tracked.txt", staged)
+	}
+	debug := runOutput(t, "git", "-C", repo, "ls-files", "--debug", "intent.txt")
+	if !strings.Contains(debug, "flags: 20004000") {
+		t.Fatalf("intent-to-add entry was not preserved:\n%s", debug)
+	}
+}
+
+func TestPrepareFetchedBranchConflictDoesNotMoveHEAD(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	baseOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+
+	run(t, "git", "-C", repo, "checkout", "-b", "future")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("remote\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "remote")
+	futureOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "checkout", "main")
+	run(t, "git", "-C", repo, "branch", "-D", "future")
+	run(t, "git", "-C", repo, "update-ref", "refs/remotes/origin/feature", futureOID)
+
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+
+	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: filepath.Join(repo, ".git")}
+	err := New(nil).PrepareFetchedBranch(context.Background(), cfg, "feature")
+	if err == nil {
+		t.Fatal("expected staged conflict")
+	}
+	if head := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD")); head != baseOID {
+		t.Fatalf("HEAD = %s, want %s", head, baseOID)
+	}
+	if ref := strings.TrimSpace(runOutput(t, "git", "-C", repo, "symbolic-ref", "--short", "HEAD")); ref != "main" {
+		t.Fatalf("HEAD ref = %q, want main", ref)
+	}
+	if staged := runOutput(t, "git", "-C", repo, "show", ":tracked.txt"); staged != "staged\n" {
+		t.Fatalf("staged content = %q, want staged", staged)
+	}
+	if err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/heads/feature").Run(); err == nil {
+		t.Fatal("feature branch was created despite index conflict")
+	}
+}
+
 func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -1180,7 +1305,13 @@ func TestCloneBloblessRetriesTransientTransportErrors(t *testing.T) {
 	if strings.Contains(string(commands), "super-secret") || strings.Contains(string(commands), "user@example.com") {
 		t.Fatalf("credential appeared in git command: %s", commands)
 	}
-	if !strings.Contains(logs.String(), "retryable") || strings.Contains(logs.String(), "super-secret") || strings.Contains(logs.String(), "log-secret") {
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) ||
+		!strings.Contains(logOutput, `"msg":"`+logGitOperationRecovered+`"`) ||
+		!strings.Contains(logOutput, `"error":"error: RPC failed; HTTP 503 curl 22`) ||
+		!strings.Contains(logOutput, `"duration_ms":`) ||
+		!strings.Contains(logOutput, `"next_attempt":2`) ||
+		strings.Contains(logOutput, "super-secret") || strings.Contains(logOutput, "log-secret") {
 		t.Fatalf("clone retry logs were not structured/redacted: %s", logs.String())
 	}
 }
@@ -1242,7 +1373,9 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	err := New(nil).CloneBlobless(ctx, model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	err := store.CloneBlobless(ctx, model.RepoConfig{GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "https://example.com/org/repo.git", Branch: "main"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context deadline exceeded", err)
 	}
@@ -1262,6 +1395,11 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	}
 	if string(count) != "1" {
 		t.Fatalf("clone attempts = %q, want 1", count)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) ||
+		!strings.Contains(logOutput, `"timed_out":true`) ||
+		!strings.Contains(logOutput, `"error":"error: RPC failed; HTTP 500 curl 22`) {
+		t.Fatalf("deadline failure was not logged with its transport cause: %s", logOutput)
 	}
 }
 
@@ -1289,7 +1427,8 @@ func TestRetryGitOperationCancellationRacePreservesBothCauses(t *testing.T) {
 func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testing.T) {
 	ctx := &stagedErrorContext{Context: context.Background(), errAt: 3}
 	transportErr := errors.New("HTTP 500 transport failure")
-	store := New(nil)
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
 	store.gitRetryDelays = []time.Duration{0}
 	attempts := 0
 	err := store.retryGitOperation(ctx, GitOperationClone, "repo", func() error {
@@ -1305,6 +1444,28 @@ func TestRetryGitOperationCancellationBeforeNextAttemptPreservesFailure(t *testi
 	}
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationInterrupted+`"`) || !strings.Contains(logOutput, `"canceled":true`) {
+		t.Fatalf("next-attempt cancellation terminal log incomplete: %s", logOutput)
+	}
+}
+
+func TestRetryGitOperationLogsCancellationDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = []time.Duration{time.Second}
+	err := store.retryGitOperation(ctx, GitOperationFetch, "repo", func() error {
+		time.AfterFunc(20*time.Millisecond, cancel)
+		return errors.New("HTTP 503 transport failure")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want canceled", err)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationInterrupted+`"`) ||
+		!strings.Contains(logOutput, `"canceled":true`) || !strings.Contains(logOutput, `"attempts":1`) {
+		t.Fatalf("backoff cancellation terminal log incomplete: %s", logOutput)
 	}
 }
 
@@ -1339,6 +1500,36 @@ func TestTransientGitErrorRejectsStandaloneLocalIndexPackFailure(t *testing.T) {
 	message := "fatal: unable to write file: Input/output error\nfatal: index-pack failed"
 	if isTransientGitError(errors.New(message)) {
 		t.Fatalf("isTransientGitError(%q) = true, want false", message)
+	}
+}
+
+func TestBoundedGitErrorPreservesClassificationAfterTruncation(t *testing.T) {
+	var stderr boundedGitError
+	stderr.limit = 16
+	_, _ = stderr.Write([]byte(strings.Repeat("x", 32)))
+	_, _ = stderr.Write([]byte(" HTTP 503 Service Unavailable"))
+	if !stderr.Retryable() {
+		t.Fatal("bounded stderr lost transient classification after truncation")
+	}
+	if got := stderr.String(); len(got) > stderr.limit+len(gitErrorTruncatedLabel)+1 || !strings.Contains(got, gitErrorTruncatedLabel) {
+		t.Fatalf("bounded stderr = %q, want capped output with truncation label", got)
+	}
+
+	var permanent boundedGitError
+	permanent.limit = 16
+	_, _ = permanent.Write([]byte("HTTP 503"))
+	_, _ = permanent.Write([]byte(" permission denied"))
+	if permanent.Retryable() {
+		t.Fatal("local permanent failure was classified as retryable")
+	}
+}
+
+func TestRedactTruncatedCredentialPrefix(t *testing.T) {
+	credential := "super-secret-token"
+	message := "fatal: authentication failed: super-secret-tok\n" + gitErrorTruncatedLabel
+	got := redactTruncatedCredentialPrefix(message, []string{credential})
+	if strings.Contains(got, "super-secret") || !strings.Contains(got, "REDACTED") {
+		t.Fatalf("truncated credential prefix leaked in %q", got)
 	}
 }
 
@@ -1433,6 +1624,93 @@ func TestRetryGitOperationBoundedExhaustion(t *testing.T) {
 	}
 }
 
+func TestRetryGitOperationRedactsExactLocalRemote(t *testing.T) {
+	const remote = "/private/customer/repo.git"
+	sentinel := errors.New("sentinel failure")
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = nil
+	err := store.retryGitOperationForRemotes(context.Background(), GitOperationClone, "repo", []string{remote}, func() error {
+		return fmt.Errorf("HTTP 503 cloning %s: %w", remote, sentinel)
+	})
+	if err == nil {
+		t.Fatal("expected clone failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error = %v, want preserved sentinel cause", err)
+	}
+	if strings.Contains(err.Error(), remote) || !strings.Contains(err.Error(), "REDACTED_REMOTE") {
+		t.Fatalf("returned error did not redact remote: %v", err)
+	}
+	if logOutput := logs.String(); strings.Contains(logOutput, remote) || !strings.Contains(logOutput, "REDACTED_REMOTE") {
+		t.Fatalf("local remote was not redacted from retry log: %s", logOutput)
+	}
+}
+
+func TestFetchStartsBeforeRemoteLookupCompletes(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetchStarted := filepath.Join(tmp, "fetch-started")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  'remote get-url origin') exec sleep 10;;\n" +
+		"  'fetch --no-tags origin') : > \"$AFS_FETCH_STARTED\"; printf '%s\\n' 'HTTP 503 transport failure' >&2; exit 1;;\n" +
+		"esac\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_FETCH_STARTED", fetchStarted)
+
+	var logs bytes.Buffer
+	store := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	store.gitRetryDelays = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := store.Fetch(ctx, model.RepoConfig{Name: "repo", GitDir: filepath.Join(tmp, "repo.git"), RemoteURL: "/private/configured/repo.git"})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want immediate transport failure", err)
+	}
+	if _, statErr := os.Stat(fetchStarted); statErr != nil {
+		t.Fatalf("fetch did not start while remote lookup was blocked: %v", statErr)
+	}
+	var operationErr *GitOperationError
+	if !errors.As(err, &operationErr) || operationErr.Attempts != 1 {
+		t.Fatalf("Fetch error = %#v, want one attempted fetch", err)
+	}
+	if logOutput := logs.String(); !strings.Contains(logOutput, `"msg":"`+logGitOperationAttemptFailed+`"`) {
+		t.Fatalf("fetch failure terminal log missing: %s", logOutput)
+	}
+}
+
+func TestRemoteLookupIncludesConfiguredAndActualOrigin(t *testing.T) {
+	tmp := t.TempDir()
+	gitDir := filepath.Join(tmp, "repo.git")
+	run(t, "git", "init", "--bare", gitDir)
+	const configured = "https://example.com/old/repo.git"
+	actual := filepath.Join(tmp, "private", "repo.git")
+	run(t, "git", "--git-dir", gitDir, "remote", "add", "origin", actual)
+	remotesForLogging, cancel := New(nil).startRemotesForLogging(context.Background(), model.RepoConfig{GitDir: gitDir, RemoteURL: configured})
+	defer cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		remotes, complete := remotesForLogging()
+		if complete {
+			if !slices.Contains(remotes, configured) || !slices.Contains(remotes, actual) {
+				t.Fatalf("remotesForLogging = %q, want configured and actual remotes", remotes)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("remote lookup did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestRetryGitOperationPermanentFailures(t *testing.T) {
 	for _, message := range []string{
 		"HTTP 429 Too Many Requests",
@@ -1474,6 +1752,7 @@ func TestFetchRefNonInteractiveRetriesTransientFailures(t *testing.T) {
 	countPath := filepath.Join(tmp, "fetch-count")
 	fakeGit := filepath.Join(bin, "git")
 	script := "#!/bin/sh\n" +
+		"if [ \"$*\" = 'remote get-url origin' ]; then exit 0; fi\n" +
 		"count=0; [ -f \"$AFS_FETCH_COUNT\" ] && count=$(cat \"$AFS_FETCH_COUNT\")\n" +
 		"count=$((count + 1)); printf '%s' \"$count\" > \"$AFS_FETCH_COUNT\"\n" +
 		"if [ \"$count\" -lt 3 ]; then printf '%s\\n' 'HTTP 503 Service Unavailable' >&2; exit 1; fi\n"
@@ -1537,6 +1816,59 @@ func TestPrepareExistingCloneRejectsCredentialedRemoteBeforeSetURL(t *testing.T)
 				t.Fatal("git remote set-url was invoked before rejecting credentialed remote")
 			}
 		})
+	}
+}
+
+func TestExistingCloneCredentialOperationsKeepCredentialsOutOfArguments(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	commands := filepath.Join(tmp, "commands")
+	credentials := filepath.Join(tmp, "credentials")
+	fakeGit := filepath.Join(bin, "git")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$AFS_GIT_COMMANDS\"\n" +
+		"if [ \"$*\" = 'remote get-url origin' ]; then printf '%s\\n' 'https://example.com/old/repo.git'; exit 0; fi\n" +
+		"if [ \"$1\" = 'fetch' ]; then printf '%s:%s\\n' \"$ARTIFACT_FS_GIT_USERNAME\" \"$ARTIFACT_FS_GIT_PASSWORD\" > \"$AFS_GIT_CREDENTIALS\"; fi\n"
+	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AFS_GIT_COMMANDS", commands)
+	t.Setenv("AFS_GIT_CREDENTIALS", credentials)
+
+	store := New(nil)
+	repo := model.RepoConfig{
+		Name:      "repo",
+		GitDir:    filepath.Join(tmp, "repo.git"),
+		RemoteURL: "https://alice:super-secret@example.com/org/repo.git",
+		Branch:    "main",
+	}
+	if err := store.ConfigureRemoteWithCredentials(context.Background(), repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FetchRefWithCredentials(context.Background(), repo, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	commandData, err := os.ReadFile(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(commandData), "alice") || strings.Contains(string(commandData), "super-secret") {
+		t.Fatalf("credentials appeared in git arguments: %s", commandData)
+	}
+	if !strings.Contains(string(commandData), "remote set-url origin https://example.com/org/repo.git") {
+		t.Fatalf("sanitized remote was not configured: %s", commandData)
+	}
+	credentialData, err := os.ReadFile(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(credentialData) != "alice:super-secret\n" {
+		t.Fatalf("credential helper environment = %q", credentialData)
 	}
 }
 
@@ -2215,6 +2547,25 @@ func TestReadNullDelimitedRejectsPartialFinalRecord(t *testing.T) {
 	}
 	if !slices.Equal(records, []string{"first"}) {
 		t.Fatalf("records = %v, want [first]", records)
+	}
+}
+
+func TestStreamTreeRecordsPreservesDeadline(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := streamTreeRecords(ctx, filepath.Join(tmp, "repo.git"), "HEAD", func(string) {})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("streamTreeRecords error = %v, want deadline exceeded", err)
 	}
 }
 

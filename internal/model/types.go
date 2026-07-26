@@ -54,6 +54,7 @@ type RepoConfig struct {
 	AcquiredRef           string
 	AcquiredCommit        string
 	AcquiredAt            time.Time
+	ConfigVersion         string
 }
 
 type RepoRuntimeState struct {
@@ -78,9 +79,10 @@ type RepoRuntimeState struct {
 }
 
 const (
-	PrepareStatePreparing = "preparing"
-	PrepareStateReady     = "ready"
-	PrepareStateFailed    = "failed"
+	PrepareStatePreparing     = "preparing"
+	PrepareStateSyncPreparing = "sync-preparing"
+	PrepareStateReady         = "ready"
+	PrepareStateFailed        = "failed"
 )
 
 // BaseNode represents a tracked entry from the git tree. Inode IDs are assigned
