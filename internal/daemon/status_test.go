@@ -72,6 +72,46 @@ func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 	}
 }
 
+func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
+	root := t.TempDir()
+	gitDir := filepath.Join(root, "git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetchHead := filepath.Join(gitDir, "FETCH_HEAD")
+	if err := os.WriteFile(fetchHead, []byte("acquisition\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	acquiredAt := time.Now()
+	acquisitionFetchAt := acquiredAt.Add(-time.Minute)
+	if err := os.Chtimes(fetchHead, acquisitionFetchAt, acquisitionFetchAt); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{
+		ID:             "verified",
+		GitDir:         gitDir,
+		Branch:         "refs/heads/main",
+		RequiredCommit: strings.Repeat("a", 40),
+		AcquiredRef:    "refs/heads/main",
+		AcquiredCommit: strings.Repeat("a", 40),
+		AcquiredAt:     acquiredAt,
+	}
+	svc := &Service{}
+	st := svc.readPersistedStatus(context.Background(), cfg)
+	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
+		t.Fatalf("acquisition reported as remote refresh: %+v", st)
+	}
+
+	refreshAt := acquiredAt.Add(time.Minute)
+	if err := os.Chtimes(fetchHead, refreshAt, refreshAt); err != nil {
+		t.Fatal(err)
+	}
+	st = svc.readPersistedStatus(context.Background(), cfg)
+	if !st.LastFetchAt.Equal(refreshAt) || st.LastFetchResult != "ok" {
+		t.Fatalf("later remote refresh status = %+v, want %v and ok", st, refreshAt)
+	}
+}
+
 func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()

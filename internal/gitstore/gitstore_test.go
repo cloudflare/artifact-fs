@@ -461,6 +461,47 @@ func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 	}
 }
 
+func TestZeroOIDForGitDirMatchesObjectFormat(t *testing.T) {
+	for _, objectFormat := range []string{"sha1", "sha256"} {
+		t.Run(objectFormat, func(t *testing.T) {
+			repo := filepath.Join(t.TempDir(), "repo")
+			initArgs := []string{"init"}
+			if objectFormat == "sha256" {
+				initArgs = append(initArgs, "--object-format=sha256")
+			}
+			initArgs = append(initArgs, repo)
+			run(t, "git", initArgs...)
+			if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte(objectFormat+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", repo, "add", "README.md")
+			run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", objectFormat)
+
+			gitDir := filepath.Join(repo, ".git")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			zero, err := zeroOIDForGitDir(ctx, gitDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantLength := 40
+			if objectFormat == "sha256" {
+				wantLength = 64
+			}
+			if len(zero) != wantLength || strings.Trim(zero, "0") != "" {
+				t.Fatalf("zero OID = %q, want %d zeros", zero, wantLength)
+			}
+			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runGit(ctx, gitDir, "update-ref", "refs/heads/prepared", head, zero); err != nil {
+				t.Fatalf("create prepared branch with zero OID: %v", err)
+			}
+		})
+	}
+}
+
 func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -533,6 +574,14 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 		run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", fmt.Sprintf("commit %d", i+1))
 	}
 	run(t, "git", "-C", work, "push", "origin", "main")
+	run(t, "git", "-C", work, "checkout", "-b", "side", "HEAD~2")
+	if err := os.WriteFile(filepath.Join(work, "SIDE.md"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", "SIDE.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "side")
+	run(t, "git", "-C", work, "push", "origin", "side")
+	run(t, "git", "-C", work, "checkout", "main")
 	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
 
 	tip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
@@ -554,7 +603,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareSource: %v", err)
 	}
-	if !prepared.Verified || prepared.Ref != cfg.Branch || prepared.Commit != tip {
+	if !prepared.Verified || !prepared.Acquired || prepared.Ref != cfg.Branch || prepared.Commit != tip {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
 
@@ -568,6 +617,48 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(gitDir, "shallow")); err != nil {
 		t.Fatalf("snapshot clone is not shallow: %v", err)
 	}
+	fetchRef, err := runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFetchRef := "+refs/heads/main:" + verifiedSourceTrackingRef
+	if fetchRef != wantFetchRef {
+		t.Fatalf("remote.origin.fetch = %q, want %q", fetchRef, wantFetchRef)
+	}
+	if err := os.WriteFile(filepath.Join(work, "NEW.md"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", "NEW.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "advance main")
+	run(t, "git", "-C", work, "push", "origin", "main")
+	advancedTip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	if err := New(nil).Fetch(ctx, cfg); err != nil {
+		t.Fatalf("verified source refresh: %v", err)
+	}
+	count, err = runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != "1" {
+		t.Fatalf("snapshot history count after refresh = %q, want 1", count)
+	}
+	trackingTip, err := runGit(ctx, gitDir, "rev-parse", verifiedSourceTrackingRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trackingTip != advancedTip {
+		t.Fatalf("tracking ref = %q, want advanced source %q", trackingTip, advancedTip)
+	}
+	trackingCount, err := runGit(ctx, gitDir, "rev-list", "--count", verifiedSourceTrackingRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trackingCount != "1" {
+		t.Fatalf("tracking history count after refresh = %q, want 1", trackingCount)
+	}
+	if _, err := runGit(ctx, gitDir, "show-ref", "--verify", "refs/remotes/origin/side"); err == nil {
+		t.Fatal("verified source refresh fetched an unrelated branch")
+	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "-e", blobOID)
 	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_NO_LAZY_FETCH=1")
 	if err := cmd.Run(); err == nil {
@@ -579,6 +670,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "false")
 	fallbackDir := filepath.Join(tmp, "fallback.git")
 	cfg.GitDir = fallbackDir
+	requirement.RequiredCommit = advancedTip
 	if _, err := New(nil).PrepareSource(ctx, cfg, requirement); err != nil {
 		t.Fatalf("PrepareSource fallback: %v", err)
 	}
@@ -604,6 +696,326 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	}
 	if _, statErr := os.Stat(mismatchDir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("mismatched snapshot left git dir behind: %v", statErr)
+	}
+}
+
+func TestPrepareSourceSupportsSHA256Remote(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	gitDir := filepath.Join(tmp, "snapshot.git")
+
+	run(t, "git", "init", "--bare", "--object-format=sha256", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("sha256\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", "README.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "sha256")
+	run(t, "git", "-C", work, "push", "origin", "main")
+
+	tip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	if len(tip) != 64 {
+		t.Fatalf("SHA-256 commit length = %d, want 64", len(tip))
+	}
+	cfg := model.RepoConfig{
+		ID:        "sha256",
+		Name:      "sha256",
+		GitDir:    gitDir,
+		RemoteURL: "file://" + bare,
+	}
+	requirement := model.SourceRequirement{
+		Ref:            "refs/heads/main",
+		RequiredCommit: tip,
+		Depth:          1,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prepared, err := New(nil).PrepareSource(ctx, cfg, requirement)
+	if err != nil {
+		t.Fatalf("PrepareSource: %v", err)
+	}
+	if prepared.Commit != tip || !prepared.Verified || !prepared.Acquired {
+		t.Fatalf("prepared source = %+v", prepared)
+	}
+	format, err := runGit(ctx, gitDir, "rev-parse", "--show-object-format")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "sha256" {
+		t.Fatalf("object format = %q, want sha256", format)
+	}
+	head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != tip {
+		t.Fatalf("HEAD = %q, want %q", head, tip)
+	}
+}
+
+func TestPrepareSourceReacquiresMissingOrCorruptReceiptGitDir(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+
+	run(t, "git", "init", "--bare", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("verified\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", work, "add", "README.md")
+	run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "verified")
+	run(t, "git", "-C", work, "push", "origin", "main")
+
+	tip := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	requirement := model.SourceRequirement{
+		Ref:            "refs/heads/main",
+		RequiredCommit: tip,
+		Depth:          1,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for _, test := range []struct {
+		name   string
+		damage func(t *testing.T, gitDir string)
+	}{
+		{
+			name: "missing",
+			damage: func(t *testing.T, gitDir string) {
+				t.Helper()
+				if err := os.RemoveAll(gitDir); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt",
+			damage: func(t *testing.T, gitDir string) {
+				t.Helper()
+				if err := os.RemoveAll(gitDir); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(gitDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(gitDir, "not-a-repository"), []byte("corrupt\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "corrupt_index",
+			damage: func(t *testing.T, gitDir string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(gitDir, "index"), []byte("broken\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gitDir := filepath.Join(tmp, test.name+".git")
+			cfg := model.RepoConfig{
+				ID:        model.RepoID(test.name),
+				Name:      test.name,
+				GitDir:    gitDir,
+				RemoteURL: "file://" + bare,
+			}
+			store := New(nil)
+			if _, err := store.PrepareSource(ctx, cfg, requirement); err != nil {
+				t.Fatalf("initial PrepareSource: %v", err)
+			}
+			oldPool, err := store.getPool(gitDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.damage(t, gitDir)
+
+			cfg.AcquiredRef = requirement.Ref
+			cfg.AcquiredCommit = requirement.RequiredCommit
+			prepared, err := store.PrepareSource(ctx, cfg, requirement)
+			if err != nil {
+				t.Fatalf("reacquire PrepareSource: %v", err)
+			}
+			if !prepared.Verified || !prepared.Acquired || prepared.Commit != tip {
+				t.Fatalf("prepared source = %+v", prepared)
+			}
+			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if head != tip {
+				t.Fatalf("HEAD = %q, want %q", head, tip)
+			}
+			newPool, err := store.getPool(gitDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if newPool == oldPool {
+				t.Fatal("reacquisition reused the batch pool from the replaced Git directory")
+			}
+		})
+	}
+}
+
+func TestPrepareSourceReceiptPreservesIndexAndRestoresHEAD(t *testing.T) {
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	gitDir := filepath.Join(tmp, "snapshot.git")
+
+	run(t, "git", "init", "--bare", bare)
+	run(t, "git", "clone", bare, work)
+	run(t, "git", "-C", work, "checkout", "-b", "main")
+	for _, content := range []string{"base\n", "required\n"} {
+		if err := os.WriteFile(filepath.Join(work, "README.md"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, "git", "-C", work, "add", "README.md")
+		run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", strings.TrimSpace(content))
+	}
+	run(t, "git", "-C", work, "push", "origin", "main")
+
+	requiredCommit := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	cfg := model.RepoConfig{
+		ID:        "verified",
+		Name:      "verified",
+		GitDir:    gitDir,
+		RemoteURL: "file://" + bare,
+	}
+	requirement := model.SourceRequirement{
+		Ref:            "refs/heads/main",
+		RequiredCommit: requiredCommit,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	store := New(nil)
+	if _, err := store.PrepareSource(ctx, cfg, requirement); err != nil {
+		t.Fatalf("initial PrepareSource: %v", err)
+	}
+
+	stagedPath := filepath.Join(tmp, "staged-readme")
+	if err := os.WriteFile(stagedPath, []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stagedOID, err := runGit(ctx, gitDir, "hash-object", "-w", stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, gitDir, "update-index", "--add", "--cacheinfo", "100644", stagedOID, "README.md"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", requiredCommit+"^"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.AcquiredRef = requirement.Ref
+	cfg.AcquiredCommit = requirement.RequiredCommit
+	prepared, err := store.PrepareSource(ctx, cfg, requirement)
+	if err != nil {
+		t.Fatalf("receipt PrepareSource: %v", err)
+	}
+	if prepared.Acquired {
+		t.Fatal("receipt reuse unexpectedly performed remote acquisition")
+	}
+	head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != requiredCommit {
+		t.Fatalf("HEAD = %q, want required commit %q", head, requiredCommit)
+	}
+	staged, err := runGit(ctx, gitDir, "diff", "--cached", "--name-only", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged != "README.md" {
+		t.Fatalf("staged paths = %q, want README.md", staged)
+	}
+}
+
+func TestCloneBloblessUsesExactCanonicalTag(t *testing.T) {
+	for _, objectFormat := range []string{"sha1", "sha256"} {
+		t.Run(objectFormat, func(t *testing.T) {
+			tmp := t.TempDir()
+			bare := filepath.Join(tmp, "origin.git")
+			work := filepath.Join(tmp, "work")
+			gitDir := filepath.Join(tmp, "repo.git")
+
+			initArgs := []string{"init", "--bare"}
+			if objectFormat == "sha256" {
+				initArgs = append(initArgs, "--object-format=sha256")
+			}
+			initArgs = append(initArgs, bare)
+			run(t, "git", initArgs...)
+			run(t, "git", "clone", bare, work)
+			run(t, "git", "-C", work, "checkout", "-b", "main")
+			if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("tag\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", work, "add", "README.md")
+			run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "tag target")
+			tagCommit := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+			run(t, "git", "-C", work, "update-ref", "refs/tags/release", tagCommit)
+
+			run(t, "git", "-C", work, "checkout", "-b", "release")
+			if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("branch\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", work, "add", "README.md")
+			run(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "same-named branch")
+			branchCommit := strings.TrimSpace(runOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+			if branchCommit == tagCommit {
+				t.Fatal("branch and tag unexpectedly resolve to the same commit")
+			}
+			run(t, "git", "-C", work, "push", "origin",
+				"refs/heads/main:refs/heads/main",
+				"refs/heads/release:refs/heads/release",
+				"refs/tags/release:refs/tags/release",
+			)
+			run(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+
+			cfg := model.RepoConfig{
+				ID:           "tag",
+				Name:         "tag",
+				GitDir:       gitDir,
+				RemoteURL:    "file://" + bare,
+				Branch:       "refs/tags/release",
+				HistoryDepth: 1,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := New(nil).CloneBlobless(ctx, cfg); err != nil {
+				t.Fatalf("CloneBlobless: %v", err)
+			}
+			head, err := runGit(ctx, gitDir, "rev-parse", "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if head != tagCommit {
+				t.Fatalf("HEAD = %q, want tag commit %q; same-named branch is %q", head, tagCommit, branchCommit)
+			}
+			format, err := runGit(ctx, gitDir, "rev-parse", "--show-object-format")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if format != objectFormat {
+				t.Fatalf("object format = %q, want %q", format, objectFormat)
+			}
+			fetchRef, err := runGit(ctx, gitDir, "config", "--get-all", "remote.origin.fetch")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFetchRef := "+refs/tags/release:" + fetchedFullRefRemoteTrackingRef
+			if fetchRef != wantFetchRef {
+				t.Fatalf("remote.origin.fetch = %q, want %q", fetchRef, wantFetchRef)
+			}
+		})
 	}
 }
 
@@ -644,8 +1056,19 @@ func TestCloneAndFetchRefSkipTags(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cfg := model.RepoConfig{ID: "x", Name: "x", GitDir: gitDir, RemoteURL: "file://" + bare, Branch: "master", FetchRef: "master"}
+	oldPool, err := store.getPool(gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("CloneBloblessNonInteractive: %v", err)
+	}
+	newPool, err := store.getPool(gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPool == oldPool {
+		t.Fatal("clone reused the batch pool from the previously missing Git directory")
 	}
 	if err := store.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
 		t.Fatalf("FetchRefNonInteractive: %v", err)

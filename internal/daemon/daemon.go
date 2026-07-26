@@ -542,7 +542,7 @@ func (s *Service) Prepare(ctx context.Context, name string) error {
 	if !isAsyncRepo(cfg) {
 		return s.prepareRepo(ctx, cfg)
 	}
-	if cfg.PrepareState == model.PrepareStateReady {
+	if cfg.PrepareState == model.PrepareStateReady && cfg.RequiredCommit == "" {
 		return nil
 	}
 	cfg.PrepareState = model.PrepareStatePreparing
@@ -620,7 +620,7 @@ func (s *Service) prepareSource(ctx context.Context, cfg model.RepoConfig) (mode
 }
 
 func (s *Service) recordAcquisition(ctx context.Context, cfg model.RepoConfig, source model.PreparedSource) error {
-	if !source.Verified || (cfg.AcquiredRef == source.Ref && strings.EqualFold(cfg.AcquiredCommit, source.Commit)) {
+	if !source.Verified || (!source.Acquired && cfg.AcquiredRef == source.Ref && strings.EqualFold(cfg.AcquiredCommit, source.Commit)) {
 		return nil
 	}
 	return s.registry.RecordAcquisition(ctx, cfg, source)
@@ -1018,7 +1018,14 @@ func defaultFetchRef(sourceRef string) string {
 }
 
 func sameBranchRef(fetchRef string, branch string) bool {
-	return branchRefName(fetchRef) == branchRefName(branch)
+	return canonicalFetchRef(fetchRef) == canonicalFetchRef(branch)
+}
+
+func canonicalFetchRef(ref string) string {
+	if branch := branchRefName(ref); branch != "" {
+		return "refs/heads/" + branch
+	}
+	return strings.TrimSpace(ref)
 }
 
 func branchRefName(ref string) string {
@@ -1415,8 +1422,12 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 	}
 	// Best-effort last fetch time from FETCH_HEAD mtime.
 	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
-		st.LastFetchAt = fi.ModTime()
-		st.LastFetchResult = "ok"
+		// Verified acquisition itself writes FETCH_HEAD before its receipt.
+		// Only a newer mtime is evidence of a later remote refresh.
+		if cfg.RequiredCommit == "" || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {
+			st.LastFetchAt = fi.ModTime()
+			st.LastFetchResult = "ok"
+		}
 	}
 	applyHydrationStats(&st, cfg.BlobCacheDir)
 	applySourceStatus(&st, cfg)

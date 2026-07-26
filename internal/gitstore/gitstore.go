@@ -146,9 +146,7 @@ type fetchBlobResult struct {
 const maxReadBlobBytes int64 = 1<<31 - 1
 
 const fetchedFullRefRemoteTrackingRef = "refs/remotes/artifact-fs/fetch-ref"
-const acquiredSourceRef = "refs/artifact-fs/acquired"
-
-const zeroOID = "0000000000000000000000000000000000000000"
+const verifiedSourceTrackingRef = "refs/remotes/artifact-fs/source"
 
 type fetchRefInfo struct {
 	sourceRef string
@@ -239,12 +237,23 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 		if err != nil {
 			return fmt.Errorf("mktemp clone dir: %w", err)
 		}
-		args := []string{"clone", "--filter=blob:none"}
-		if cfg.HistoryDepth > 0 {
-			args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
+		sourceRef := strings.TrimSpace(cfg.Branch)
+		branch := sourceRef
+		if after, ok := strings.CutPrefix(sourceRef, "refs/heads/"); ok {
+			branch = after
+		} else if strings.HasPrefix(sourceRef, "refs/") {
+			branch = ""
 		}
-		args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", cloneRefName(cfg.Branch), safeURL, target)
-		_, err = runGitWithEnv(ctx, "", env, args...)
+		if branch != "" {
+			args := []string{"clone", "--filter=blob:none"}
+			if cfg.HistoryDepth > 0 {
+				args = append(args, fmt.Sprintf("--depth=%d", cfg.HistoryDepth))
+			}
+			args = append(args, "--no-checkout", "--single-branch", "--no-tags", "--branch", branch, safeURL, target)
+			_, err = runGitWithEnv(ctx, "", env, args...)
+		} else {
+			err = cloneExactRef(ctx, target, safeURL, env, sourceRef, cfg.HistoryDepth)
+		}
 		if err != nil {
 			_ = os.RemoveAll(target)
 			target = ""
@@ -265,6 +274,7 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 	if err := os.Rename(filepath.Join(target, ".git"), cfg.GitDir); err != nil {
 		return err
 	}
+	s.invalidateBatchPool(cfg.GitDir)
 	return nil
 }
 
@@ -287,10 +297,16 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 
 	prepared := model.PreparedSource{Ref: requirement.Ref, Commit: requirement.RequiredCommit, Verified: true}
 	if cfg.AcquiredRef == requirement.Ref && strings.EqualFold(cfg.AcquiredCommit, requirement.RequiredCommit) {
-		if err := prepareFixedHEAD(ctx, cfg.GitDir, requirement.RequiredCommit); err != nil {
+		available, err := requiredCommitAvailable(ctx, cfg.GitDir, requirement.RequiredCommit)
+		if err != nil {
 			return model.PreparedSource{}, err
 		}
-		return prepared, nil
+		if available {
+			if err := prepareFixedHEAD(ctx, cfg.GitDir, requirement.RequiredCommit, false); err != nil {
+				return model.PreparedSource{}, err
+			}
+			return prepared, nil
+		}
 	}
 
 	parent := filepath.Dir(cfg.GitDir)
@@ -311,21 +327,30 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if err != nil {
 			return fmt.Errorf("mktemp source dir: %w", err)
 		}
-		if _, err := runGitWithEnv(ctx, "", env, "init", "--bare", candidateGitDir); err != nil {
+		initArgs := []string{"init", "--bare"}
+		if len(requirement.RequiredCommit) == 64 {
+			initArgs = append(initArgs, "--object-format=sha256")
+		}
+		initArgs = append(initArgs, candidateGitDir)
+		if _, err := runGitWithEnv(ctx, "", env, initArgs...); err != nil {
 			return err
 		}
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
+			return err
+		}
+		refspec := "+" + requirement.Ref + ":" + verifiedSourceTrackingRef
+		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
 			return err
 		}
 		args := []string{"fetch", "--filter=blob:none", "--no-tags"}
 		if requirement.Depth > 0 {
 			args = append(args, fmt.Sprintf("--depth=%d", requirement.Depth))
 		}
-		args = append(args, "origin", "+"+requirement.Ref+":"+acquiredSourceRef)
+		args = append(args, "origin", refspec)
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, args...); err != nil {
 			return err
 		}
-		observed, err := runGit(ctx, candidateGitDir, "rev-parse", "--verify", acquiredSourceRef+"^{commit}")
+		observed, err := runGit(ctx, candidateGitDir, "rev-parse", "--verify", verifiedSourceTrackingRef+"^{commit}")
 		if err != nil {
 			return fmt.Errorf("source ref %s did not resolve to a commit: %w", requirement.Ref, err)
 		}
@@ -333,7 +358,7 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if observed != requirement.RequiredCommit {
 			return fmt.Errorf("source changed: %s resolved to %s, required %s", requirement.Ref, observed, requirement.RequiredCommit)
 		}
-		return prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit)
+		return prepareFixedHEAD(ctx, candidateGitDir, requirement.RequiredCommit, true)
 	}
 	if err := s.retryGitOperation(ctx, GitOperationClone, cfg.Name, attempt); err != nil {
 		if candidateGitDir != "" {
@@ -346,10 +371,87 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		return model.PreparedSource{}, err
 	}
 	candidateGitDir = ""
+	s.invalidateBatchPool(cfg.GitDir)
+	prepared.Acquired = true
 	return prepared, nil
 }
 
-func prepareFixedHEAD(ctx context.Context, gitDir string, commit string) error {
+func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
+	advertisement, err := runGitWithEnv(ctx, "", env, "ls-remote", safeURL, ref)
+	if err != nil {
+		return err
+	}
+	advertisedOID := ""
+	for line := range strings.SplitSeq(advertisement, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == ref {
+			advertisedOID = strings.ToLower(fields[0])
+			break
+		}
+	}
+	if advertisedOID == "" {
+		return fmt.Errorf("source ref %s was not advertised by the remote", ref)
+	}
+	initArgs := []string{"init"}
+	switch len(advertisedOID) {
+	case 40:
+	case 64:
+		initArgs = append(initArgs, "--object-format=sha256")
+	default:
+		return fmt.Errorf("source ref %s advertised an unsupported object ID", ref)
+	}
+	initArgs = append(initArgs, target)
+	if _, err := runGitWithEnv(ctx, "", env, initArgs...); err != nil {
+		return err
+	}
+	gitDir := filepath.Join(target, ".git")
+	if _, err := runGitWithEnv(ctx, gitDir, env, "remote", "add", "origin", safeURL); err != nil {
+		return err
+	}
+	refspec := "+" + ref + ":" + fetchedFullRefRemoteTrackingRef
+	if _, err := runGitWithEnv(ctx, gitDir, env, "config", "--replace-all", "remote.origin.fetch", refspec); err != nil {
+		return err
+	}
+	fetchArgs := []string{"fetch", "--filter=blob:none", "--no-tags"}
+	if depth > 0 {
+		fetchArgs = append(fetchArgs, fmt.Sprintf("--depth=%d", depth))
+	}
+	fetchArgs = append(fetchArgs, "origin", refspec)
+	if _, err := runGitWithEnv(ctx, gitDir, env, fetchArgs...); err != nil {
+		return err
+	}
+	commit, err := runGit(ctx, gitDir, "rev-parse", "--verify", fetchedFullRefRemoteTrackingRef+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("source ref %s did not resolve to a commit: %w", ref, err)
+	}
+	_, err = runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", strings.TrimSpace(commit))
+	return err
+}
+
+func requiredCommitAvailable(ctx context.Context, gitDir string, commit string) (bool, error) {
+	resolved, err := runGit(ctx, gitDir, "rev-parse", "--verify", commit+"^{commit}")
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(resolved), commit) {
+		return false, nil
+	}
+	index, err := os.Open(filepath.Join(gitDir, "index"))
+	if err != nil {
+		return false, nil
+	}
+	defer index.Close()
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(index, header); err != nil {
+		return false, nil
+	}
+	return string(header) == "DIRC", nil
+}
+
+func prepareFixedHEAD(ctx context.Context, gitDir string, commit string, resetIndex bool) error {
 	resolved, err := runGit(ctx, gitDir, "rev-parse", "--verify", commit+"^{commit}")
 	if err != nil {
 		return fmt.Errorf("required commit %s is unavailable: %w", commit, err)
@@ -359,6 +461,9 @@ func prepareFixedHEAD(ctx context.Context, gitDir string, commit string) error {
 	}
 	if _, err := runGit(ctx, gitDir, "update-ref", "--no-deref", "HEAD", commit); err != nil {
 		return err
+	}
+	if !resetIndex {
+		return nil
 	}
 	_, err = runGit(ctx, gitDir, "read-tree", commit)
 	return err
@@ -388,14 +493,14 @@ func installGitDir(candidate string, destination string) error {
 	return nil
 }
 
-func cloneRefName(ref string) string {
-	if after, ok := strings.CutPrefix(strings.TrimSpace(ref), "refs/heads/"); ok {
-		return after
+func (s *Store) invalidateBatchPool(gitDir string) {
+	s.mu.Lock()
+	pool := s.pools[gitDir]
+	delete(s.pools, gitDir)
+	s.mu.Unlock()
+	if pool != nil {
+		pool.closeAll()
 	}
-	if after, ok := strings.CutPrefix(strings.TrimSpace(ref), "refs/tags/"); ok {
-		return after
-	}
-	return strings.TrimSpace(ref)
 }
 
 func (s *Store) retryGitOperation(ctx context.Context, operation GitOperation, repoName string, attempt func() error) error {
@@ -532,7 +637,12 @@ func isTransientGitMessage(message string) bool {
 
 func (s *Store) Fetch(ctx context.Context, repo model.RepoConfig) error {
 	return s.retryGitOperation(ctx, GitOperationFetch, repo.Name, func() error {
-		_, err := runGit(ctx, repo.GitDir, "fetch", "--no-tags", "origin")
+		args := []string{"fetch", "--no-tags"}
+		if repo.HistoryDepth > 0 {
+			args = append(args, fmt.Sprintf("--depth=%d", repo.HistoryDepth))
+		}
+		args = append(args, "origin")
+		_, err := runGit(ctx, repo.GitDir, args...)
 		return err
 	})
 }
@@ -625,7 +735,7 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 func (s *Store) preparedBranchExpectedOID(ctx context.Context, repo model.RepoConfig, branch string, oid string) (string, error) {
 	current, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
 	if err != nil {
-		return zeroOID, nil
+		return zeroOIDForGitDir(ctx, repo.GitDir)
 	}
 	current = strings.TrimSpace(current)
 	if current == oid {
@@ -635,6 +745,21 @@ func (s *Store) preparedBranchExpectedOID(ctx context.Context, repo model.RepoCo
 		return "", fmt.Errorf("prepared git dir branch %s would be overwritten; refusing non-fast-forward update", branch)
 	}
 	return current, nil
+}
+
+func zeroOIDForGitDir(ctx context.Context, gitDir string) (string, error) {
+	format, err := runGit(ctx, gitDir, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", err
+	}
+	switch strings.TrimSpace(format) {
+	case "sha1":
+		return strings.Repeat("0", 40), nil
+	case "sha256":
+		return strings.Repeat("0", 64), nil
+	default:
+		return "", fmt.Errorf("unsupported Git object format %q", format)
+	}
 }
 
 func (s *Store) ValidatePreparedGitDir(ctx context.Context, repo model.RepoConfig) error {

@@ -74,12 +74,13 @@ Check the state of a mounted repo with `status`:
 
 ```bash
 ./artifact-fs status --name workers-sdk
-# repo=workers-sdk state=mounted source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
+# repo=workers-sdk state=mounted head=d4c61587... ref=main source_ref=refs/heads/main required_commit=none acquisition=not_required base_commit=d4c61587... remote_refresh=enabled ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `state` | `mounted` or `unmounted` |
+| `head` / `ref` | Backward-compatible aliases for the current base commit and Git HEAD ref |
 | `source_ref` | Canonical remote ref selected during acquisition |
 | `required_commit` | Required source commit, or `none` |
 | `acquisition` | Historical acquisition evidence: `not_required`, `pending`, or `verified` |

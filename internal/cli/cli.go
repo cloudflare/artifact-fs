@@ -170,7 +170,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				for _, r := range repos {
-					fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", r.Name, r.Branch, r.MountPath, r.RemoteURLRedacted)
+					displayRef := r.Branch
+					if branch, ok := strings.CutPrefix(displayRef, "refs/heads/"); ok {
+						displayRef = branch
+					}
+					fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", r.Name, displayRef, r.MountPath, r.RemoteURLRedacted)
 				}
 				return nil
 			}),
@@ -295,8 +299,8 @@ func formatStatusLine(st model.RepoRuntimeState) string {
 	if st.RemoteRefreshDisabled {
 		remoteRefresh = "disabled"
 	}
-	return fmt.Sprintf("repo=%s state=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
-		st.RepoID, st.State, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID, remoteRefresh,
+	return fmt.Sprintf("repo=%s state=%s head=%s ref=%s source_ref=%s required_commit=%s acquisition=%s base_commit=%s remote_refresh=%s ahead=%d behind=%d diverged=%t last_fetch=%s result=%s prepare_error=%s hydrated_blobs=%d hydrated_bytes=%d overlay_dirty=%t",
+		st.RepoID, st.State, st.CurrentHEADOID, st.CurrentHEADRef, st.SourceRef, requiredCommit, acquisition, st.CurrentHEADOID, remoteRefresh,
 		st.AheadCount, st.BehindCount, st.Diverged,
 		formatLastFetchAt(st.LastFetchAt), formatLastFetchResult(st.LastFetchResult),
 		formatPrepareError(st.PrepareError),

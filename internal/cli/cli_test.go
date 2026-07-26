@@ -23,6 +23,8 @@ func TestFormatStatusLineUsesNeverForUnsetFetch(t *testing.T) {
 
 	got := formatStatusLine(st)
 	for _, want := range []string{
+		" head=abc123 ",
+		" ref=main ",
 		"last_fetch=never",
 		"result=never",
 		"required_commit=none",
@@ -95,6 +97,16 @@ func TestAddRepoAsyncCLIRegistersWithoutClone(t *testing.T) {
 	}
 	if got := stdout.String(); got != "queued repo\n" {
 		t.Fatalf("stdout = %q, want queued repo", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run(context.Background(), []string{"list-repos"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr.String())
+	}
+	if got := stdout.String(); !strings.HasPrefix(got, "repo\tmain\t") {
+		t.Fatalf("list-repos output = %q, want legacy short branch column", got)
 	}
 }
 

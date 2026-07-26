@@ -26,6 +26,7 @@ type PreparedSource struct {
 	Ref      string
 	Commit   string
 	Verified bool
+	Acquired bool // This call installed a new remote acquisition rather than reusing its receipt.
 }
 
 type RepoConfig struct {

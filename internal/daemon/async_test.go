@@ -147,6 +147,24 @@ func TestAddRepoPreparedGitDirValidation(t *testing.T) {
 	}
 }
 
+func TestSameBranchRefPreservesNonBranchNamespaces(t *testing.T) {
+	for _, test := range []struct {
+		fetchRef  string
+		sourceRef string
+		want      bool
+	}{
+		{fetchRef: "main", sourceRef: "refs/heads/main", want: true},
+		{fetchRef: "origin/main", sourceRef: "refs/heads/main", want: true},
+		{fetchRef: "refs/tags/release", sourceRef: "refs/tags/release", want: true},
+		{fetchRef: "refs/tags/release", sourceRef: "refs/tags/other", want: false},
+		{fetchRef: "refs/pull/1/head", sourceRef: "refs/pull/2/head", want: false},
+	} {
+		if got := sameBranchRef(test.fetchRef, test.sourceRef); got != test.want {
+			t.Fatalf("sameBranchRef(%q, %q) = %t, want %t", test.fetchRef, test.sourceRef, got, test.want)
+		}
+	}
+}
+
 func TestSyncReposSkipsResetWhilePrepareWorkerInFlight(t *testing.T) {
 	ctx := context.Background()
 	svc, err := New(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -705,6 +723,91 @@ func TestRunPrepareDoesNotMarkSupersededConfigFailed(t *testing.T) {
 	}
 }
 
+func TestPrepareRequeuesReadyVerifiedSourceForRecovery(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+
+	runCmd(t, "git", "init", "--bare", bare)
+	runCmd(t, "git", "clone", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("verified\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", work, "add", "README.md")
+	runCmd(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "verified")
+	runCmd(t, "git", "-C", work, "push", "origin", "main")
+	runCmd(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+	requiredCommit := strings.TrimSpace(runCmdOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{
+		Name:            "verified",
+		ID:              "verified",
+		RemoteURL:       "file://" + bare,
+		Branch:          "refs/heads/main",
+		RequiredCommit:  requiredCommit,
+		HistoryDepth:    1,
+		RefreshInterval: time.Minute,
+		Enabled:         true,
+	}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.runPrepare(ctx, cfg); err != nil {
+		t.Fatalf("initial runPrepare: %v", err)
+	}
+	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PrepareState != model.PrepareStateReady || cfg.AcquiredCommit != requiredCommit {
+		t.Fatalf("initial prepared config = %+v", cfg)
+	}
+	initialAcquiredAt := cfg.AcquiredAt
+	if err := os.RemoveAll(cfg.GitDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Prepare(ctx, cfg.Name); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	cfg, err = svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PrepareState != model.PrepareStatePreparing {
+		t.Fatalf("PrepareState = %q, want preparing", cfg.PrepareState)
+	}
+	if err := svc.runPrepare(ctx, cfg); err != nil {
+		t.Fatalf("recovery runPrepare: %v", err)
+	}
+	recovered, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.AcquiredAt.After(initialAcquiredAt) {
+		t.Fatalf("recovery acquisition time = %v, want after %v", recovered.AcquiredAt, initialAcquiredAt)
+	}
+	st := svc.readPersistedStatus(ctx, recovered)
+	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
+		t.Fatalf("recovery acquisition reported as remote refresh: %+v", st)
+	}
+	head := strings.TrimSpace(runCmdOutput(t, "git", "--git-dir", cfg.GitDir, "rev-parse", "HEAD"))
+	if head != requiredCommit {
+		t.Fatalf("recovered HEAD = %q, want %q", head, requiredCommit)
+	}
+}
+
 func createPreparedGitDir(t *testing.T, tmp string) string {
 	t.Helper()
 	bare := filepath.Join(tmp, "origin.git")
@@ -752,9 +855,15 @@ func waitFor(t *testing.T, timeout time.Duration, ready func() bool) {
 
 func runCmd(t *testing.T, name string, args ...string) {
 	t.Helper()
+	_ = runCmdOutput(t, name, args...)
+}
+
+func runCmdOutput(t *testing.T, name string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, string(out))
 	}
+	return string(out)
 }
