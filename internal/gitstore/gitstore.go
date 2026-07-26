@@ -335,6 +335,11 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if _, err := runGitWithEnv(ctx, "", env, initArgs...); err != nil {
 			return err
 		}
+		// The Git directory is exposed through the mount's .git file, so Git
+		// must treat callers in the mounted directory as worktree operations.
+		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "config", "core.bare", "false"); err != nil {
+			return err
+		}
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
 			return err
 		}

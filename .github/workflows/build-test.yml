@@ -55,7 +55,7 @@ jobs:
           test -c /dev/fuse
           sudo chmod 666 /dev/fuse
 
-      - name: FUSE end-to-end tests
+      - name: Verified-source FUSE end-to-end test
         env:
           AFS_RUN_E2E_TESTS: "1"
-        run: go test -run TestE2E -v .
+        run: go test -count=1 -run '^TestE2EVerifiedSource$' -v .

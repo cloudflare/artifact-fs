@@ -606,6 +606,16 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if !prepared.Verified || !prepared.Acquired || prepared.Ref != cfg.Branch || prepared.Commit != tip {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
+	mountedWorktree := filepath.Join(tmp, "mounted")
+	if err := os.MkdirAll(mountedWorktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mountedWorktree, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if inside := strings.TrimSpace(runOutput(t, "git", "-C", mountedWorktree, "rev-parse", "--is-inside-work-tree")); inside != "true" {
+		t.Fatalf("mounted Git directory reported is-inside-work-tree = %q, want true", inside)
+	}
 
 	count, err := runGit(ctx, gitDir, "rev-list", "--count", "HEAD")
 	if err != nil {
