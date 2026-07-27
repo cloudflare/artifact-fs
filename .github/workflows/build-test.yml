@@ -4,6 +4,9 @@ on:
   push:
     branches: ["**"]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -59,3 +62,34 @@ jobs:
         env:
           AFS_RUN_E2E_TESTS: "1"
         run: go test -count=1 -run '^(TestE2EVerifiedSource|TestE2EGit.*)$' -v .
+
+  container-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: examples/cloudflare-sandbox-sdk/package-lock.json
+
+      - name: Check example documentation
+        run: |
+          test "$(wc -l < examples/README.md)" -lt 50
+          test "$(wc -l < examples/cloudflare-sandbox-sdk/README.md)" -lt 50
+
+      - name: Build generic container
+        run: docker build --file examples/Dockerfile .
+
+      - name: Check Cloudflare Sandbox example
+        working-directory: examples/cloudflare-sandbox-sdk
+        run: |
+          npm ci
+          npm run typecheck
+          package_version="$(node -p "require('./package.json').devDependencies['@cloudflare/sandbox']")"
+          image_version="$(sed -n 's#^FROM docker.io/cloudflare/sandbox:\([^ ]*\)$#\1#p' Dockerfile)"
+          test "$package_version" = "$image_version"
+          npx wrangler deploy --dry-run --outdir /tmp/artifact-fs-sandbox-dry-run

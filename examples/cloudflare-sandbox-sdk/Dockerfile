@@ -2,7 +2,7 @@
 
 # Build ArtifactFS from this repository, then add it to the stock Sandbox image.
 # Keep the base image's default startup flow intact so the Sandbox SDK still works.
-FROM golang:1.24 AS artifact-fs-build
+FROM golang:1.25-bookworm AS artifact-fs-build
 
 ARG ARTIFACT_FS_EXTRA_CA_PEM=""
 
@@ -17,12 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /artifact-fs ./cmd/artifact-fs
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /artifact-fs ./cmd/artifact-fs
 
-FROM docker.io/cloudflare/sandbox:0.8.1
+FROM docker.io/cloudflare/sandbox:0.12.4
 
 ARG ARTIFACT_FS_EXTRA_CA_PEM=""
 
@@ -32,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     git \
     openssh-client \
+    util-linux \
   && if [ -n "$ARTIFACT_FS_EXTRA_CA_PEM" ]; then \
        printf '%s\n' "$ARTIFACT_FS_EXTRA_CA_PEM" >/usr/local/share/ca-certificates/artifact-fs-extra-ca.crt; \
        update-ca-certificates; \
@@ -39,9 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=artifact-fs-build /artifact-fs /usr/local/bin/artifact-fs
-COPY examples/cloudflare-sandbox-sdk/container_src/mount-artifact-fs-repo.sh /usr/local/bin/mount-artifact-fs-repo
-
-RUN chmod +x /usr/local/bin/artifact-fs /usr/local/bin/mount-artifact-fs-repo
+COPY --chmod=0755 examples/cloudflare-sandbox-sdk/container_src/mount-artifact-fs-repo.sh /usr/local/bin/mount-artifact-fs-repo
 
 # Public repo that works out of the box. The Worker can override these per request.
 ENV MOUNT_GIT_REMOTE=https://github.com/cloudflare/sandbox-sdk.git

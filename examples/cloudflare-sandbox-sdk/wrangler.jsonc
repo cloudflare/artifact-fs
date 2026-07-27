@@ -2,10 +2,17 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "artifact-fs-sandbox-example",
   "main": "src/index.ts",
-  "compatibility_date": "2026-03-30",
+  "compatibility_date": "2026-07-27",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
   },
   "containers": [
     {
@@ -13,7 +20,7 @@
       "image": "./Dockerfile",
       "image_build_context": "../../",
       "instance_type": "basic",
-      "max_instances": 1
+      "max_instances": 10
     }
   ],
   "durable_objects": {

@@ -8,11 +8,25 @@ set -euo pipefail
 : "${ARTIFACT_FS_MOUNT_METADATA_FILE:=/workspace/.artifact-fs-mount}"
 : "${ARTIFACT_FS_DAEMON_LOG:=/tmp/artifact-fs-daemon.log}"
 : "${ARTIFACT_FS_DAEMON_PID_FILE:=/tmp/artifact-fs-daemon.pid}"
+: "${ARTIFACT_FS_MOUNT_LOCK_FILE:=/tmp/artifact-fs-mount.lock}"
+
+readonly MOUNT_CONFLICT_EXIT_CODE=42
+
+exec 9>"$ARTIFACT_FS_MOUNT_LOCK_FILE"
+if ! flock -w 120 9; then
+  echo "artifact-fs: timed out waiting for another mount operation" >&2
+  exit 1
+fi
 
 validate_remote() {
   local remote="$1"
 
-  if [[ "$remote" != https://* && "$remote" != ssh://* && ! "$remote" =~ ^[^@:[:space:]]+@[^:[:space:]]+:.+$ ]]; then
+  if [ "${#remote}" -gt 2048 ] || [[ "$remote" =~ [[:cntrl:][:space:]] ]]; then
+    echo "artifact-fs: MOUNT_GIT_REMOTE contains invalid characters or is too long" >&2
+    exit 1
+  fi
+
+  if [[ "$remote" != https://* && "$remote" != ssh://* && ! "$remote" =~ ^[^@:[:space:]]+@[^:[:space:]]+:[^[:space:]?#]+$ ]]; then
     echo "artifact-fs: MOUNT_GIT_REMOTE must be an HTTPS or SSH remote" >&2
     exit 1
   fi
@@ -49,7 +63,7 @@ infer_repo_name() {
     name="${remote##*:}"
   fi
 
-  if [ -z "$name" ] || [ "$name" = "$remote" ]; then
+  if [ -z "$name" ] || [ "$name" = "$remote" ] || [ "${#name}" -gt 100 ] || [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || [ "$name" = "." ] || [ "$name" = ".." ]; then
     echo "artifact-fs: could not infer repo name from ${remote}" >&2
     exit 1
   fi
@@ -75,12 +89,14 @@ load_existing_metadata() {
 }
 
 write_metadata() {
-  cat >"$ARTIFACT_FS_MOUNT_METADATA_FILE" <<EOF
+  local metadata_tmp="${ARTIFACT_FS_MOUNT_METADATA_FILE}.tmp.$$"
+  cat >"$metadata_tmp" <<EOF
 MOUNTED_REMOTE=$MOUNT_GIT_REMOTE
 MOUNTED_BRANCH=$MOUNT_GIT_BRANCH
 MOUNTED_REPO_NAME=$REPO_NAME
 MOUNTED_MOUNT_PATH=$MOUNT_PATH
 EOF
+  mv "$metadata_tmp" "$ARTIFACT_FS_MOUNT_METADATA_FILE"
 }
 
 ensure_mount_matches_request() {
@@ -91,12 +107,12 @@ ensure_mount_matches_request() {
   if [ "$MOUNTED_REMOTE" != "$MOUNT_GIT_REMOTE" ] || [ "$MOUNTED_BRANCH" != "$MOUNT_GIT_BRANCH" ]; then
     echo "artifact-fs: sandbox already initialized for ${MOUNTED_REMOTE} on branch ${MOUNTED_BRANCH}" >&2
     echo "artifact-fs: use a different sandboxId for a different repo or branch" >&2
-    exit 1
+    exit "$MOUNT_CONFLICT_EXIT_CODE"
   fi
 
   if [ "${MOUNTED_REPO_NAME:-}" != "$REPO_NAME" ] || [ "${MOUNTED_MOUNT_PATH:-}" != "$MOUNT_PATH" ]; then
     echo "artifact-fs: stored mount metadata does not match the requested repo layout" >&2
-    exit 1
+    exit "$MOUNT_CONFLICT_EXIT_CODE"
   fi
 }
 
@@ -147,6 +163,10 @@ if [ ! -e /dev/fuse ]; then
 fi
 
 validate_remote "$MOUNT_GIT_REMOTE"
+if ! git check-ref-format --branch "$MOUNT_GIT_BRANCH" >/dev/null 2>&1; then
+  echo "artifact-fs: MOUNT_GIT_BRANCH must be a valid Git branch name" >&2
+  exit 1
+fi
 
 REPO_NAME=$(infer_repo_name "$MOUNT_GIT_REMOTE")
 MOUNT_PATH="${MOUNT_ROOT}/${REPO_NAME}"

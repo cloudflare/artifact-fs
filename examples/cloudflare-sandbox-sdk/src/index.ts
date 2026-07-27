@@ -2,9 +2,8 @@ import { getSandbox } from '@cloudflare/sandbox';
 
 export { Sandbox } from '@cloudflare/sandbox';
 
-type Env = {
-  Sandbox: DurableObjectNamespace<import('@cloudflare/sandbox').Sandbox>;
-  SANDBOX_API_TOKEN?: string;
+type Env = WorkerBindings & {
+  readonly SANDBOX_API_TOKEN?: string;
 };
 
 type MountRequest = {
@@ -35,6 +34,8 @@ const DEFAULT_MOUNT_ROOT = '/workspace/mnt';
 const DEFAULT_ARTIFACT_FS_ROOT = '/tmp/artifact-fs';
 const DEFAULT_METADATA_FILE = '/workspace/.artifact-fs-mount';
 const MOUNT_SCRIPT = '/usr/local/bin/mount-artifact-fs-repo';
+const MAX_REQUEST_BODY_BYTES = 16 * 1024;
+const MOUNT_CONFLICT_EXIT_CODE = 42;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -60,12 +61,14 @@ export default {
 
 async function handleMount(request: Request, env: Env): Promise<Response> {
   try {
-    authorizeRequest(request, env);
+    await authorizeRequest(request, env);
     const body = await parseMountRequest(request);
     const config = buildMountConfig(body.sandboxId, body.remote, body.branch);
     const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
+      enableDefaultSession: false,
       normalizeId: true,
-      sleepAfter: '15m'
+      sleepAfter: '15m',
+      transport: 'rpc'
     });
 
     const existingMetadata = await readMountMetadata(sandbox);
@@ -76,16 +79,43 @@ async function handleMount(request: Request, env: Env): Promise<Response> {
 
     // Run the bootstrap script with per-request env so one Worker can mount
     // different remotes in different sandboxes without rebuilding the image.
-    const bootstrap = await runChecked(
-      sandbox,
-      MOUNT_SCRIPT,
-      'ArtifactFS bootstrap failed',
-      {
+    let bootstrap;
+    try {
+      bootstrap = await sandbox.exec(MOUNT_SCRIPT, {
         cwd: '/workspace',
         env: config.env,
         timeout: 120_000
+      });
+    } catch (error) {
+      // An exec timeout does not guarantee the bootstrap process stopped.
+      try {
+        await sandbox.destroy();
+      } catch (destroyError) {
+        logError('sandbox cleanup failed', destroyError, request);
       }
-    );
+      throw error;
+    }
+
+    if (!bootstrap.success) {
+      if (bootstrap.exitCode === MOUNT_CONFLICT_EXIT_CODE) {
+        throw new UserError(
+          'Sandbox is already initialized for a different repo or branch',
+          409
+        );
+      }
+
+      const commandError = new SandboxCommandError(
+        'ArtifactFS bootstrap failed',
+        MOUNT_SCRIPT,
+        bootstrap.exitCode
+      );
+      try {
+        await sandbox.destroy();
+      } catch (destroyError) {
+        logError('sandbox cleanup failed', destroyError, request);
+      }
+      throw commandError;
+    }
 
     const repo = await collectMountedRepoState(
       sandbox,
@@ -103,13 +133,13 @@ async function handleMount(request: Request, env: Env): Promise<Response> {
       ...repo
     });
   } catch (error) {
-    return errorResponse(error);
+    return errorResponse(error, request);
   }
 }
 
 async function handleStatus(request: Request, env: Env): Promise<Response> {
   try {
-    authorizeRequest(request, env);
+    await authorizeRequest(request, env);
     const url = new URL(request.url);
     const sandboxId = url.searchParams.get('sandboxId');
     if (!sandboxId) {
@@ -125,14 +155,19 @@ async function handleStatus(request: Request, env: Env): Promise<Response> {
       url.searchParams.get('branch')
     );
     const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
+      enableDefaultSession: false,
       normalizeId: true,
-      sleepAfter: '15m'
+      sleepAfter: '15m',
+      transport: 'rpc'
     });
 
     const metadata = await readMountMetadata(sandbox);
     if (!metadata) {
       return Response.json(
-        { error: 'No mounted repo metadata found for this sandbox' },
+        {
+          error:
+            'No active mount found. The sandbox may have slept; POST /mount again to recreate it.'
+        },
         { status: 404 }
       );
     }
@@ -162,7 +197,7 @@ async function handleStatus(request: Request, env: Env): Promise<Response> {
       ...repo
     });
   } catch (error) {
-    return errorResponse(error);
+    return errorResponse(error, request);
   }
 }
 
@@ -170,8 +205,11 @@ async function parseMountRequest(request: Request): Promise<MountRequest> {
   let body: unknown;
 
   try {
-    body = await request.json();
-  } catch {
+    body = JSON.parse(await readRequestBody(request));
+  } catch (error) {
+    if (error instanceof UserError) {
+      throw error;
+    }
     throw new UserError('Request body must be valid JSON', 400);
   }
 
@@ -185,17 +223,53 @@ async function parseMountRequest(request: Request): Promise<MountRequest> {
   validateOptionalString('branch', branch);
 
   return {
-    sandboxId: sandboxId as string | undefined,
-    remote: remote as string | undefined,
-    branch: branch as string | undefined
+    sandboxId,
+    remote,
+    branch
   };
+}
+
+async function readRequestBody(request: Request): Promise<string> {
+  if (!request.body) {
+    return '';
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_REQUEST_BODY_BYTES) {
+        await reader.cancel();
+        throw new UserError('Request body is too large', 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
 }
 
 function buildMountConfig(
   sandboxIdInput?: string | null,
   remoteInput?: string | null,
   branchInput?: string | null
-) : MountConfig {
+): MountConfig {
   const remote = normalizeRemote(remoteInput ?? DEFAULT_REMOTE);
   const branch = (branchInput ?? DEFAULT_BRANCH).trim() || DEFAULT_BRANCH;
   validateBranch(branch);
@@ -226,18 +300,36 @@ function buildStatusConfig(
   remoteInput?: string | null,
   branchInput?: string | null
 ) {
+  const branch = branchInput?.trim() || undefined;
+  if (branch) {
+    validateBranch(branch);
+  }
+
   return {
     sandboxId: normalizeRequestedSandboxId(sandboxIdInput),
     remote: remoteInput ? normalizeRemote(remoteInput) : undefined,
-    branch: branchInput?.trim() || undefined
+    branch
   };
 }
 
 function normalizeRemote(value: string): string {
   const remote = value.trim();
-  if (remote.startsWith('https://')) {
-    const parsed = new URL(remote);
-    if (parsed.username || parsed.password) {
+  if (remote.length > 2048 || /[\u0000-\u0020\u007f]/.test(remote)) {
+    throw new UserError('remote contains invalid characters or is too long', 400);
+  }
+
+  if (remote.startsWith('https://') || remote.startsWith('ssh://')) {
+    let parsed: URL;
+    try {
+      parsed = new URL(remote);
+    } catch {
+      throw new UserError('remote must be a valid Git URL', 400);
+    }
+
+    if (
+      (parsed.protocol === 'https:' && (parsed.username || parsed.password)) ||
+      (parsed.protocol === 'ssh:' && parsed.password)
+    ) {
       throw new UserError(
         'remote must not include credentials; use credential helpers or SSH auth instead',
         400
@@ -258,30 +350,7 @@ function normalizeRemote(value: string): string {
     return remote;
   }
 
-  if (remote.startsWith('ssh://')) {
-    const parsed = new URL(remote);
-    if (parsed.password) {
-      throw new UserError(
-        'remote must not include credentials; use SSH keys or credential helpers instead',
-        400
-      );
-    }
-
-    if (parsed.search || parsed.hash) {
-      throw new UserError(
-        'remote must not include query parameters or fragments',
-        400
-      );
-    }
-
-    if (!parsed.pathname || parsed.pathname === '/') {
-      throw new UserError('remote must include a repository path', 400);
-    }
-
-    return remote;
-  }
-
-  if (/^[^@:\s]+@[^:\s]+:.+/.test(remote)) {
+  if (/^[^@:\s]+@[^:\s]+:[^\s?#]+$/.test(remote)) {
     return remote;
   }
 
@@ -293,8 +362,17 @@ function inferRepoName(remote: string): string {
   const lastSeparator = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf(':'));
   const repoName = trimmed.slice(lastSeparator + 1);
 
-  if (!repoName) {
-    throw new UserError('remote must include a repository name', 400);
+  if (
+    !repoName ||
+    repoName.length > 100 ||
+    !/^[a-zA-Z0-9._-]+$/.test(repoName) ||
+    repoName === '.' ||
+    repoName === '..'
+  ) {
+    throw new UserError(
+      'repository name must use 1-100 letters, numbers, dots, hyphens, or underscores',
+      400
+    );
   }
 
   return repoName;
@@ -384,15 +462,13 @@ async function collectMountedRepoState(
 async function readMountMetadata(
   sandbox: ReturnType<typeof getSandbox>
 ): Promise<StoredMountMetadata | null> {
-  try {
-    const file = await sandbox.readFile(DEFAULT_METADATA_FILE);
-    return parseMetadataFile(file.content);
-  } catch (error) {
-    if (error instanceof UserError) {
-      throw error;
-    }
+  const metadata = await sandbox.exists(DEFAULT_METADATA_FILE);
+  if (!metadata.exists) {
     return null;
   }
+
+  const file = await sandbox.readFile(DEFAULT_METADATA_FILE);
+  return parseMetadataFile(file.content);
 }
 
 function compareMountMetadata(
@@ -448,13 +524,16 @@ function parseMetadataFile(content: string): StoredMountMetadata {
   const mountPath = values.get('MOUNTED_MOUNT_PATH');
 
   if (!remote || !branch || !repoName || !mountPath) {
-    throw new UserError('Mount metadata is missing required fields', 500);
+    throw new Error('Mount metadata is missing required fields');
   }
 
   return { remote, branch, repoName, mountPath };
 }
 
-function validateOptionalString(name: string, value: unknown): void {
+function validateOptionalString(
+  name: string,
+  value: unknown
+): asserts value is string | undefined {
   if (value !== undefined && typeof value !== 'string') {
     throw new UserError(`${name} must be a string`, 400);
   }
@@ -507,46 +586,77 @@ async function runChecked(
 ) {
   const result = await sandbox.exec(command, options);
   if (!result.success) {
-    throw new Response(
-      JSON.stringify({
-        error: message,
-        command,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exitCode: result.exitCode
-      }),
-      {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      }
-    );
+    throw new SandboxCommandError(message, command, result.exitCode);
   }
   return result;
 }
 
-function errorResponse(error: unknown): Response {
+function errorResponse(error: unknown, request: Request): Response {
   if (error instanceof UserError) {
-    return Response.json({ error: error.message }, { status: error.status });
+    const headers =
+      error.status === 401 ? { 'WWW-Authenticate': 'Bearer' } : undefined;
+    return Response.json(
+      { error: error.message },
+      { status: error.status, headers }
+    );
   }
 
-  if (error instanceof Response) {
-    return error;
-  }
-
-  const message = error instanceof Error ? error.message : 'Unknown error';
-  return Response.json({ error: message }, { status: 500 });
+  logError('request failed', error, request);
+  return Response.json({ error: 'Internal server error' }, { status: 500 });
 }
 
-function authorizeRequest(request: Request, env: Env): void {
+function logError(message: string, error: unknown, request: Request): void {
+  const details =
+    error instanceof SandboxCommandError
+      ? {
+          error: error.message,
+          command: error.command,
+          exitCode: error.exitCode
+        }
+      : {
+          error: error instanceof Error ? error.message : String(error)
+        };
+
+  console.error(
+    JSON.stringify({
+      message,
+      method: request.method,
+      path: new URL(request.url).pathname,
+      ...details
+    })
+  );
+}
+
+async function authorizeRequest(request: Request, env: Env): Promise<void> {
   const configuredToken = env.SANDBOX_API_TOKEN ?? '';
   if (!configuredToken) {
-    throw new UserError('SANDBOX_API_TOKEN is not configured', 500);
+    throw new Error('SANDBOX_API_TOKEN is not configured');
   }
 
   const header = (request.headers.get('authorization') ?? '').trim();
-  const [scheme, token] = header.split(/\s+/, 2);
-  if (scheme?.toLowerCase() !== 'bearer' || token !== configuredToken) {
+  const match = /^Bearer ([^\s]+)$/i.exec(header);
+  const tokenMatches = await timingSafeEqual(match?.[1] ?? '', configuredToken);
+  if (!match || !tokenMatches) {
     throw new UserError('Unauthorized', 401);
+  }
+}
+
+async function timingSafeEqual(left: string, right: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [leftHash, rightHash] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(left)),
+    crypto.subtle.digest('SHA-256', encoder.encode(right))
+  ]);
+  return crypto.subtle.timingSafeEqual(leftHash, rightHash);
+}
+
+class SandboxCommandError extends Error {
+  constructor(
+    message: string,
+    readonly command: string,
+    readonly exitCode: number
+  ) {
+    super(message);
   }
 }
 

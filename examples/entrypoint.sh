@@ -22,10 +22,38 @@ artifact-fs add-repo \
 echo "artifact-fs: starting daemon (mount at ${MOUNT_ROOT}/${REPO_NAME})"
 artifact-fs daemon --root "${MOUNT_ROOT}" &
 DAEMON_PID=$!
+COMMAND_PID=
+
+cleanup() {
+  trap - EXIT INT TERM
+  if [ -n "${COMMAND_PID}" ] && kill -0 "${COMMAND_PID}" 2>/dev/null; then
+    kill "${COMMAND_PID}" 2>/dev/null || true
+  fi
+  if kill -0 "${DAEMON_PID}" 2>/dev/null; then
+    kill "${DAEMON_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${COMMAND_PID}" ]; then
+    wait "${COMMAND_PID}" 2>/dev/null || true
+  fi
+  wait "${DAEMON_PID}" 2>/dev/null || true
+}
+
+forward_signal() {
+  local signal="$1"
+  local exit_code="$2"
+  if [ -n "${COMMAND_PID}" ] && kill -0 "${COMMAND_PID}" 2>/dev/null; then
+    kill -"${signal}" "${COMMAND_PID}" 2>/dev/null || true
+  fi
+  exit "${exit_code}"
+}
+
+trap cleanup EXIT
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
 
 # Wait for the FUSE mount, checking that the daemon is still alive.
 MOUNT_PATH="${MOUNT_ROOT}/${REPO_NAME}"
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
   if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
     echo "artifact-fs: daemon exited unexpectedly" >&2
     wait "${DAEMON_PID}" || true
@@ -45,15 +73,11 @@ fi
 echo "artifact-fs: mounted at ${MOUNT_PATH}"
 ls "${MOUNT_PATH}"
 
-# Run the user command, then clean up the daemon.
 if [ $# -gt 0 ]; then
   cd "${MOUNT_PATH}"
-  "$@"
-  EXIT_CODE=$?
-  kill "${DAEMON_PID}" 2>/dev/null || true
-  wait "${DAEMON_PID}" 2>/dev/null || true
-  exit ${EXIT_CODE}
+  "$@" &
+  COMMAND_PID=$!
+  wait "${COMMAND_PID}"
 else
-  # No command -- keep the container alive with the daemon.
   wait "${DAEMON_PID}"
 fi
