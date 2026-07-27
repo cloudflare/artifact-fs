@@ -1642,7 +1642,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	commitTime := int64(0)
 	if ts, timestampErr := s.git.CommitTimestamp(ctx, cfg, oid); timestampErr == nil {
 		commitTime = ts
-	} else {
+	} else if ctx.Err() == nil {
 		s.logger.Warn("commit timestamp unavailable", "repo", cfg.Name, "error", timestampErr)
 	}
 	err = rt.resolver.Transition(func() error {
@@ -1654,6 +1654,9 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		return nil
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		s.logger.Warn("overlay reconcile failed", "repo", cfg.Name, "error", err)
 		s.scheduleHEADRetry(rt)
 		return
@@ -1667,7 +1670,6 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
-	s.configureStatusOptimization(ctx, cfg)
 }
 
 func (s *Service) scheduleHEADRetry(rt *repoRuntime) {

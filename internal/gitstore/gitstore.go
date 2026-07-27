@@ -1829,80 +1829,8 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 	if _, err := runGit(ctx, repo.GitDir, "config", "fsmonitor.allowRemote", "true"); err != nil {
 		return err
 	}
-	workTreeEnv := gitWorkTreeEnv(repo.MountPath)
-	for attempt := 0; ; attempt++ {
-		_, err := runGitWithEnv(ctx, repo.GitDir, workTreeEnv, "update-index", "--fsmonitor")
-		if err == nil {
-			err = markIndexFSMonitorValid(ctx, repo.GitDir, repo.MountPath)
-		}
-		if err == nil {
-			return nil
-		}
-		if !isIndexLockContention(err) || attempt == 39 {
-			return err
-		}
-		if err := waitForGitRetry(ctx, 50*time.Millisecond); err != nil {
-			return err
-		}
-	}
-}
-
-func isIndexLockContention(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "index.lock") &&
-		(strings.Contains(message, "file exists") || strings.Contains(message, "another git process"))
-}
-
-func gitWorkTreeEnv(workTree string) []string {
-	if strings.TrimSpace(workTree) == "" {
-		return nil
-	}
-	return []string{"GIT_WORK_TREE=" + workTree}
-}
-
-func markIndexFSMonitorValid(ctx context.Context, gitDir, workTree string) error {
-	env := append(os.Environ(), "GIT_DIR="+gitDir)
-	env = append(env, gitWorkTreeEnv(workTree)...)
-	ls := exec.CommandContext(ctx, "git", "ls-files", "-z")
-	ls.Env = env
-	stdout, err := ls.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	lsErr := &bytes.Buffer{}
-	ls.Stderr = lsErr
-	update := exec.CommandContext(ctx, "git", "update-index", "--fsmonitor-valid", "-z", "--stdin")
-	update.Env = env
-	update.Stdin = stdout
-	updateErr := &bytes.Buffer{}
-	update.Stderr = updateErr
-	if err := ls.Start(); err != nil {
-		return err
-	}
-	if err := update.Start(); err != nil {
-		_ = ls.Process.Kill()
-		_ = ls.Wait()
-		return err
-	}
-	upErr := update.Wait()
-	lsWaitErr := ls.Wait()
-	if lsWaitErr != nil {
-		msg := auth.RedactString(strings.TrimSpace(lsErr.String()))
-		if msg == "" {
-			msg = auth.RedactString(lsWaitErr.Error())
-		}
-		return errors.New(msg)
-	}
-	if upErr != nil {
-		msg := auth.RedactString(strings.TrimSpace(updateErr.String()))
-		if msg == "" {
-			msg = auth.RedactString(upErr.Error())
-		}
-		return errors.New(msg)
-	}
+	// Git adds the fsmonitor extension on the next porcelain index read. The
+	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
 }
 

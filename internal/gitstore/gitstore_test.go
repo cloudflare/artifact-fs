@@ -105,7 +105,7 @@ func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	t.Fatal("gitlink missing from tree")
 }
 
-func TestConfigureStatusOptimizationRetriesIndexLock(t *testing.T) {
+func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
 	run(t, "git", "init", repo)
@@ -120,30 +120,6 @@ func TestConfigureStatusOptimizationRetriesIndexLock(t *testing.T) {
 	if err := os.WriteFile(indexLock, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	released := make(chan error, 1)
-	go func() {
-		hookPath := filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			if _, err := os.Stat(hookPath); err == nil {
-				script := "#!/bin/sh\nprintf 'artifact-fs-test\\0'\n"
-				if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
-					released <- err
-					return
-				}
-				released <- os.Remove(indexLock)
-				return
-			} else if !errors.Is(err, os.ErrNotExist) {
-				released <- err
-				return
-			}
-			if time.Now().After(deadline) {
-				released <- errors.New("timed out waiting for fsmonitor hook")
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -151,11 +127,14 @@ func TestConfigureStatusOptimizationRetriesIndexLock(t *testing.T) {
 	if err := New(nil).ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
 		t.Fatalf("ConfigureStatusOptimization: %v", err)
 	}
-	if err := <-released; err != nil {
-		t.Fatalf("release index lock: %v", err)
+	if _, err := os.Stat(indexLock); err != nil {
+		t.Fatalf("daemon changed caller-owned index lock: %v", err)
 	}
 	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
 		t.Fatalf("disable test fsmonitor hook: %v", err)
+	}
+	if err := os.Remove(indexLock); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -171,68 +150,6 @@ func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	_ = exec.Command("sh", hookPath).Run()
 	if _, err := os.Stat(pwned); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("generated hook allowed shell command substitution; stat err = %v", err)
-	}
-}
-
-func TestMarkIndexFSMonitorValidUsesWorkTree(t *testing.T) {
-	tmp := t.TempDir()
-	binDir := filepath.Join(tmp, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	recordPath := filepath.Join(tmp, "env.log")
-	stdinPath := filepath.Join(tmp, "stdin.bin")
-	expectedStdinPath := filepath.Join(tmp, "expected-stdin.bin")
-	if err := os.WriteFile(expectedStdinPath, []byte("README.md\x00"), 0o644); err != nil {
-		t.Fatalf("write expected stdin: %v", err)
-	}
-	fakeGit := filepath.Join(binDir, "git")
-	fakeGitScript := "#!/bin/sh\n" +
-		"if [ \"$GIT_DIR\" != \"$AFS_TEST_GIT_DIR\" ]; then printf 'bad GIT_DIR: %s\\n' \"$GIT_DIR\" >&2; exit 2; fi\n" +
-		"if [ \"$GIT_WORK_TREE\" != \"$AFS_TEST_WORK_TREE\" ]; then printf 'bad GIT_WORK_TREE: %s\\n' \"$GIT_WORK_TREE\" >&2; exit 2; fi\n" +
-		"case \"$1\" in\n" +
-		"  ls-files)\n" +
-		"    if [ \"$#\" -ne 2 ] || [ \"$2\" != \"-z\" ]; then printf 'bad ls-files args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
-		"    printf 'README.md\\0'\n" +
-		"    printf 'ls-files\\n' >>\"$AFS_TEST_RECORD\"\n" +
-		"    exit 0\n" +
-		"    ;;\n" +
-		"  update-index)\n" +
-		"    if [ \"$#\" -ne 4 ] || [ \"$2\" != \"--fsmonitor-valid\" ] || [ \"$3\" != \"-z\" ] || [ \"$4\" != \"--stdin\" ]; then printf 'bad update-index args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
-		"    cat >\"$AFS_TEST_STDIN\"\n" +
-		"    if ! cmp -s \"$AFS_TEST_STDIN\" \"$AFS_TEST_EXPECTED_STDIN\"; then printf 'bad update-index stdin\\n' >&2; exit 2; fi\n" +
-		"    printf 'update-index\\n' >>\"$AFS_TEST_RECORD\"\n" +
-		"    exit 0\n" +
-		"    ;;\n" +
-		"esac\n" +
-		"printf 'unexpected git command: %s\\n' \"$*\" >&2\n" +
-		"exit 2\n"
-	if err := os.WriteFile(fakeGit, []byte(fakeGitScript), 0o755); err != nil {
-		t.Fatalf("write fake git: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("AFS_TEST_RECORD", recordPath)
-	t.Setenv("AFS_TEST_STDIN", stdinPath)
-	t.Setenv("AFS_TEST_EXPECTED_STDIN", expectedStdinPath)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	gitDir := filepath.Join(tmp, "git")
-	workTree := filepath.Join(tmp, "worktree")
-	t.Setenv("AFS_TEST_GIT_DIR", gitDir)
-	t.Setenv("AFS_TEST_WORK_TREE", workTree)
-	if err := markIndexFSMonitorValid(ctx, gitDir, workTree); err != nil {
-		t.Fatalf("markIndexFSMonitorValid: %v", err)
-	}
-	recorded, err := os.ReadFile(recordPath)
-	if err != nil {
-		t.Fatalf("read env log: %v", err)
-	}
-	got := strings.Fields(string(recorded))
-	slices.Sort(got)
-	want := []string{"ls-files", "update-index"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("recorded commands = %#v, want %#v", got, want)
 	}
 }
 
