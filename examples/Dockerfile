@@ -1,30 +1,14 @@
 # syntax=docker/dockerfile:1
 
-# Builds artifact-fs and starts a FUSE-mounted git repo inside the container.
-# The container needs --cap-add SYS_ADMIN --device /dev/fuse to use FUSE.
-#
-# Build:
-#   docker build -t artifact-fs-example -f examples/Dockerfile .
-#
-# Run (public repo):
-#   docker run --rm --cap-add SYS_ADMIN --device /dev/fuse artifact-fs-example
-#
-# Run (private repo):
-#   docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
-#     -e REPO_REMOTE_URL=https://<token>@github.com/org/private-repo.git \
-#     artifact-fs-example
-#
-# On hosts with AppArmor (Ubuntu), add: --security-opt apparmor:unconfined
-
-# ---- build stage ----
-FROM golang:1.24 AS build
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /artifact-fs ./cmd/artifact-fs
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /artifact-fs ./cmd/artifact-fs
 
-# ---- runtime stage ----
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,7 +23,6 @@ ENV REPO_NAME=repo
 ENV ARTIFACT_FS_ROOT=/var/lib/artifact-fs
 ENV MOUNT_ROOT=/mnt
 
-COPY examples/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY --chmod=0755 examples/entrypoint.sh /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

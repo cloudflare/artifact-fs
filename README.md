@@ -199,28 +199,7 @@ The remote must advertise Git partial-clone filtering for file contents to hydra
 
 ## Sandboxes and Containers
 
-[`examples/Dockerfile`](examples/Dockerfile) builds artifact-fs and starts a FUSE-mounted repo inside a container. The container requires `--cap-add SYS_ADMIN --device /dev/fuse` for FUSE access.
-
-```bash
-# Build the image
-docker build -t artifact-fs-example -f examples/Dockerfile .
-
-# Run with the default repo (cloudflare/workers-sdk)
-docker run --rm --cap-add SYS_ADMIN --device /dev/fuse artifact-fs-example
-
-# Run with a private repo
-docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
-  -e REPO_REMOTE_URL=https://<token>@github.com/org/private-repo.git \
-  artifact-fs-example
-
-# Run a command inside the mounted repo
-docker run --rm --cap-add SYS_ADMIN --device /dev/fuse \
-  artifact-fs-example git log --oneline -5
-```
-
-The entrypoint registers the repo, starts the daemon, waits for the mount, then either runs the provided command or keeps the container alive.
-
-On hosts with AppArmor enabled (Ubuntu default), add `--security-opt apparmor:unconfined` to the `docker run` flags.
+See the [generic container example](examples/README.md) for Docker-compatible runtimes or the [Cloudflare Sandbox SDK example](examples/cloudflare-sandbox-sdk/README.md) for Workers and Containers.
 
 ## Architecture
 

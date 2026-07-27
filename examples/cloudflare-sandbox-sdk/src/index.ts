@@ -64,8 +64,10 @@ async function handleMount(request: Request, env: Env): Promise<Response> {
     const body = await parseMountRequest(request);
     const config = buildMountConfig(body.sandboxId, body.remote, body.branch);
     const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
+      enableDefaultSession: false,
       normalizeId: true,
-      sleepAfter: '15m'
+      sleepAfter: '15m',
+      transport: 'rpc'
     });
 
     const existingMetadata = await readMountMetadata(sandbox);
@@ -76,16 +78,23 @@ async function handleMount(request: Request, env: Env): Promise<Response> {
 
     // Run the bootstrap script with per-request env so one Worker can mount
     // different remotes in different sandboxes without rebuilding the image.
-    const bootstrap = await runChecked(
-      sandbox,
-      MOUNT_SCRIPT,
-      'ArtifactFS bootstrap failed',
-      {
-        cwd: '/workspace',
-        env: config.env,
-        timeout: 120_000
-      }
-    );
+    let bootstrap;
+    try {
+      bootstrap = await runChecked(
+        sandbox,
+        MOUNT_SCRIPT,
+        'ArtifactFS bootstrap failed',
+        {
+          cwd: '/workspace',
+          env: config.env,
+          timeout: 120_000
+        }
+      );
+    } catch (error) {
+      // An exec timeout does not guarantee the bootstrap process stopped.
+      await sandbox.destroy().catch(() => undefined);
+      throw error;
+    }
 
     const repo = await collectMountedRepoState(
       sandbox,
@@ -125,14 +134,19 @@ async function handleStatus(request: Request, env: Env): Promise<Response> {
       url.searchParams.get('branch')
     );
     const sandbox = getSandbox(env.Sandbox, config.sandboxId, {
+      enableDefaultSession: false,
       normalizeId: true,
-      sleepAfter: '15m'
+      sleepAfter: '15m',
+      transport: 'rpc'
     });
 
     const metadata = await readMountMetadata(sandbox);
     if (!metadata) {
       return Response.json(
-        { error: 'No mounted repo metadata found for this sandbox' },
+        {
+          error:
+            'No active mount found. The sandbox may have slept; POST /mount again to recreate it.'
+        },
         { status: 404 }
       );
     }
