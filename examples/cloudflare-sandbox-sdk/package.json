@@ -8,7 +8,9 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "npm run types:check && tsc --noEmit",
+    "types": "wrangler types --include-runtime=false --env-interface=WorkerBindings",
+    "types:check": "npm run types -- --check"
   },
   "devDependencies": {
     "@cloudflare/sandbox": "0.12.4",

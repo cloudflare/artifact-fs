@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     git \
     openssh-client \
+    util-linux \
   && if [ -n "$ARTIFACT_FS_EXTRA_CA_PEM" ]; then \
        printf '%s\n' "$ARTIFACT_FS_EXTRA_CA_PEM" >/usr/local/share/ca-certificates/artifact-fs-extra-ca.crt; \
        update-ca-certificates; \
