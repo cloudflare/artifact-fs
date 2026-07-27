@@ -87,6 +87,6 @@ jobs:
           npm ci
           npm run typecheck
           package_version="$(node -p "require('./package.json').devDependencies['@cloudflare/sandbox']")"
-          image_version="$(sed -n 's#^FROM docker.io/cloudflare/sandbox:\\([^ ]*\\)$#\\1#p' Dockerfile)"
+          image_version="$(sed -n 's#^FROM docker.io/cloudflare/sandbox:\([^ ]*\)$#\1#p' Dockerfile)"
           test "$package_version" = "$image_version"
           npx wrangler deploy --dry-run --outdir /tmp/artifact-fs-sandbox-dry-run
