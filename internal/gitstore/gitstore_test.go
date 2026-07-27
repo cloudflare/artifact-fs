@@ -70,6 +70,41 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	}
 }
 
+func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	gitlinkOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",vendor/dependency")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "add gitlink")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	headOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	nodes, err := store.BuildTreeIndex(context.Background(), cfg, headOID)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	for _, node := range nodes {
+		if node.Path != "vendor/dependency" {
+			continue
+		}
+		if node.Type != "dir" || node.Mode != 0o160000 || node.ObjectOID != gitlinkOID {
+			t.Fatalf("gitlink node = %#v", node)
+		}
+		if node.SizeState != "known" || node.SizeBytes != 0 {
+			t.Fatalf("gitlink size = %q/%d, want known/0", node.SizeState, node.SizeBytes)
+		}
+		return
+	}
+	t.Fatal("gitlink missing from tree")
+}
+
 func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -779,6 +814,11 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	wantFetchRef := "+refs/heads/main:" + verifiedSourceTrackingRef
 	if fetchRef != wantFetchRef {
 		t.Fatalf("remote.origin.fetch = %q, want %q", fetchRef, wantFetchRef)
+	}
+	// The generated hook targets os.Executable, which is the test runner here.
+	// Disable it before fetch so newer Git versions do not recurse into tests.
+	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		t.Fatalf("disable test fsmonitor hook: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(work, "NEW.md"), []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)

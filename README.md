@@ -297,7 +297,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 ## Supported git operations
 
-Work in progress. The table below reflects operations tested against [cloudflare/workers-sdk](https://github.com/cloudflare/workers-sdk) mounted via macFUSE.
+Work in progress. The table reflects operations exercised by the FUSE E2E suite; some were also tested against [cloudflare/workers-sdk](https://github.com/cloudflare/workers-sdk) mounted via macFUSE.
 
 ### Filesystem operations
 
@@ -332,8 +332,11 @@ Work in progress. The table below reflects operations tested against [cloudflare
 | `git diff` | Supported | Shows correct unified diff for modified files |
 | `git add` | Supported | Stages modified files |
 | `git reset --hard` | Supported | Restores content, modes, and staged creates |
+| `git clean -fd` | Supported | Removes untracked files and directory trees |
 | `git commit` | Supported | Reconciles content, executable-bit, symlink, rename, and delete changes |
 | `git checkout` | Supported | Re-indexes tree, reconciles overlay, refreshes git index |
+| `git merge --no-ff` | Supported | Publishes merge commits and reconciles the merged worktree |
+| `git rebase` | Supported | Reconciles rewritten commits and branch state |
 | `git fetch` | Supported | Background refresh loop fetches periodically |
 | `git pull --ff-only` | Supported | Publishes the fast-forwarded snapshot and reconciles the overlay |
 
@@ -341,6 +344,7 @@ Work in progress. The table below reflects operations tested against [cloudflare
 
 | Issue | Impact |
 |-------|--------|
+| Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
 | `git status` takes ~7s on large repos (5800+ entries) | Performance -- full tree walk through FUSE |
 | `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 

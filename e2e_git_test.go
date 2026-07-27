@@ -132,6 +132,13 @@ func TestE2EGitCleanState(t *testing.T) {
 	assertGitStatus(t, repo.mountPath, map[string]string{})
 	gitCmdQuiet(t, repo.mountPath, "diff", "--quiet")
 	gitCmdQuiet(t, repo.mountPath, "diff", "--cached", "--quiet")
+	info, err := os.Stat(filepath.Join(repo.mountPath, "vendor", "dependency"))
+	if err != nil {
+		t.Fatalf("stat gitlink placeholder: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("gitlink placeholder mode = %s, want directory", info.Mode())
+	}
 }
 
 func TestE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T) {
@@ -299,6 +306,68 @@ func TestE2EGitCheckoutRestorePath(t *testing.T) {
 	if got := readFileStr(t, readmePath); got != readmeOrig {
 		t.Fatalf("README.md after checkout -- = %q, want original content", got)
 	}
+}
+
+func TestE2EGitMergeAndRebase(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	gitCmd(t, repo.mountPath, "checkout", "-b", "feature")
+	writeTestFile(t, repo.mountPath, "FEATURE.md", "feature\n")
+	gitCmd(t, repo.mountPath, "add", "FEATURE.md")
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "add feature",
+	)
+	featureHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	waitForBranchAndStatus(t, repo.mountPath, "feature", map[string]string{})
+
+	gitCmd(t, repo.mountPath, "checkout", "main")
+	writeTestFile(t, repo.mountPath, "MAIN.md", "main\n")
+	gitCmd(t, repo.mountPath, "add", "MAIN.md")
+	preMainCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "advance main",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, preMainCommitHEAD, map[string]string{})
+	preMergeHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"merge", "--no-ff", "-m", "merge feature", "feature",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, preMergeHEAD, map[string]string{})
+	if parents := strings.Fields(gitCmd(t, repo.mountPath, "show", "-s", "--format=%P", "HEAD")); len(parents) != 2 {
+		t.Fatalf("merge parents = %v, want 2", parents)
+	}
+	assertPathExists(t, filepath.Join(repo.mountPath, "FEATURE.md"))
+	assertPathExists(t, filepath.Join(repo.mountPath, "MAIN.md"))
+
+	gitCmd(t, repo.mountPath, "checkout", "feature")
+	writeTestFile(t, repo.mountPath, "FEATURE-2.md", "feature two\n")
+	gitCmd(t, repo.mountPath, "add", "FEATURE-2.md")
+	preFeatureCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "extend feature",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, preFeatureCommitHEAD, map[string]string{})
+	preRebaseHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	if preRebaseHEAD == featureHEAD {
+		t.Fatal("feature branch did not advance before rebase")
+	}
+	gitCmd(t, repo.mountPath, "rebase", "main")
+	waitForHeadAndStatus(t, repo.mountPath, preRebaseHEAD, map[string]string{})
+	if rebasedHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD")); rebasedHEAD == preRebaseHEAD {
+		t.Fatal("rebase did not rewrite the feature commit")
+	}
+	gitCmdQuiet(t, repo.mountPath, "merge-base", "--is-ancestor", "main", "HEAD")
+	assertPathExists(t, filepath.Join(repo.mountPath, "FEATURE.md"))
+	assertPathExists(t, filepath.Join(repo.mountPath, "FEATURE-2.md"))
+	assertPathExists(t, filepath.Join(repo.mountPath, "MAIN.md"))
 }
 
 func TestE2EGitCommitModifyTrackedFile(t *testing.T) {
@@ -508,7 +577,7 @@ func TestE2EGitCommitSymlink(t *testing.T) {
 	}
 }
 
-func TestE2EGitResetHardAndStash(t *testing.T) {
+func TestE2EGitResetHardCleanAndStash(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 
 	readmePath := filepath.Join(repo.mountPath, "README.md")
@@ -537,6 +606,15 @@ func TestE2EGitResetHardAndStash(t *testing.T) {
 	if st.Mode().Perm() != 0o644 {
 		t.Fatalf("README.md mode after reset --hard = %#o, want 0644", st.Mode().Perm())
 	}
+
+	untrackedDir := filepath.Join(repo.mountPath, "untracked-dir")
+	if err := os.MkdirAll(untrackedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, untrackedDir, "nested.txt", "remove me\n")
+	gitCmd(t, repo.mountPath, "clean", "-fd")
+	assertPathMissing(t, untrackedDir)
+	assertGitStatus(t, repo.mountPath, map[string]string{})
 
 	if err := os.WriteFile(readmePath, []byte(original+"stash me\n"), 0o644); err != nil {
 		t.Fatal(err)

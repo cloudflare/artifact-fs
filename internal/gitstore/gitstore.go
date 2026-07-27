@@ -1073,7 +1073,7 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
 		n, typ, ok := parseTreeRecord(repo.ID, line)
 		if !ok {
-			if typ != "commit" && parseErr == nil {
+			if parseErr == nil {
 				parseErr = fmt.Errorf("invalid ls-tree record %q", line)
 			}
 			return
@@ -1179,7 +1179,20 @@ func parseTreeRecord(repoID model.RepoID, line string) (model.BaseNode, string, 
 	}
 	mode := uint32(mode64)
 	if typ == "commit" {
-		return model.BaseNode{}, typ, false
+		if mode != 0o160000 {
+			return model.BaseNode{}, typ, false
+		}
+		// A gitlink needs a directory placeholder or Git reports the tracked
+		// submodule as deleted. ArtifactFS does not initialize its contents.
+		return model.BaseNode{
+			RepoID:    repoID,
+			Path:      parts[1],
+			Type:      "dir",
+			Mode:      mode,
+			ObjectOID: oid,
+			SizeState: "known",
+			SizeBytes: 0,
+		}, typ, true
 	}
 	return model.BaseNode{
 		RepoID:    repoID,
