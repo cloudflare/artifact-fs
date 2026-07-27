@@ -344,6 +344,9 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 
 	targetGitDir := filepath.Join(target, ".git")
 
+	if err := configureArtifactWorktree(ctx, targetGitDir); err != nil {
+		return err
+	}
 	// Populate the index so git status works inside the mount.
 	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
 		return err
@@ -417,6 +420,9 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "config", "core.bare", "false"); err != nil {
 			return err
 		}
+		if err := configureArtifactWorktree(ctx, candidateGitDir); err != nil {
+			return err
+		}
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
 			return err
 		}
@@ -459,6 +465,22 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 	s.invalidateBatchPool(cfg.GitDir)
 	prepared.Acquired = true
 	return prepared, nil
+}
+
+func configureArtifactWorktree(ctx context.Context, gitDir string) error {
+	// Git's clone-time probes inspect the state filesystem, not the later FUSE
+	// mount. Record the semantics ArtifactFS actually exposes.
+	settings := [][2]string{
+		{"core.filemode", "true"},
+		{"core.ignorecase", "false"},
+		{"core.symlinks", "true"},
+	}
+	for _, setting := range settings {
+		if _, err := runGit(ctx, gitDir, "config", "--local", setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
@@ -1073,7 +1095,7 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	if err := streamTreeRecords(ctx, repo.GitDir, headOID, func(line string) {
 		n, typ, ok := parseTreeRecord(repo.ID, line)
 		if !ok {
-			if typ != "commit" && parseErr == nil {
+			if parseErr == nil {
 				parseErr = fmt.Errorf("invalid ls-tree record %q", line)
 			}
 			return
@@ -1179,7 +1201,20 @@ func parseTreeRecord(repoID model.RepoID, line string) (model.BaseNode, string, 
 	}
 	mode := uint32(mode64)
 	if typ == "commit" {
-		return model.BaseNode{}, typ, false
+		if mode != 0o160000 {
+			return model.BaseNode{}, typ, false
+		}
+		// A gitlink needs a directory placeholder or Git reports the tracked
+		// submodule as deleted. ArtifactFS does not initialize its contents.
+		return model.BaseNode{
+			RepoID:    repoID,
+			Path:      parts[1],
+			Type:      "dir",
+			Mode:      mode,
+			ObjectOID: oid,
+			SizeState: "known",
+			SizeBytes: 0,
+		}, typ, true
 	}
 	return model.BaseNode{
 		RepoID:    repoID,
@@ -1794,60 +1829,8 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 	if _, err := runGit(ctx, repo.GitDir, "config", "fsmonitor.allowRemote", "true"); err != nil {
 		return err
 	}
-	workTreeEnv := gitWorkTreeEnv(repo.MountPath)
-	if _, err := runGitWithEnv(ctx, repo.GitDir, workTreeEnv, "update-index", "--fsmonitor"); err != nil {
-		return err
-	}
-	return markIndexFSMonitorValid(ctx, repo.GitDir, repo.MountPath)
-}
-
-func gitWorkTreeEnv(workTree string) []string {
-	if strings.TrimSpace(workTree) == "" {
-		return nil
-	}
-	return []string{"GIT_WORK_TREE=" + workTree}
-}
-
-func markIndexFSMonitorValid(ctx context.Context, gitDir, workTree string) error {
-	env := append(os.Environ(), "GIT_DIR="+gitDir)
-	env = append(env, gitWorkTreeEnv(workTree)...)
-	ls := exec.CommandContext(ctx, "git", "ls-files", "-z")
-	ls.Env = env
-	stdout, err := ls.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	lsErr := &bytes.Buffer{}
-	ls.Stderr = lsErr
-	update := exec.CommandContext(ctx, "git", "update-index", "--fsmonitor-valid", "-z", "--stdin")
-	update.Env = env
-	update.Stdin = stdout
-	updateErr := &bytes.Buffer{}
-	update.Stderr = updateErr
-	if err := ls.Start(); err != nil {
-		return err
-	}
-	if err := update.Start(); err != nil {
-		_ = ls.Process.Kill()
-		_ = ls.Wait()
-		return err
-	}
-	upErr := update.Wait()
-	lsWaitErr := ls.Wait()
-	if lsWaitErr != nil {
-		msg := auth.RedactString(strings.TrimSpace(lsErr.String()))
-		if msg == "" {
-			msg = auth.RedactString(lsWaitErr.Error())
-		}
-		return errors.New(msg)
-	}
-	if upErr != nil {
-		msg := auth.RedactString(strings.TrimSpace(updateErr.String()))
-		if msg == "" {
-			msg = auth.RedactString(upErr.Error())
-		}
-		return errors.New(msg)
-	}
+	// Git adds the fsmonitor extension on the next porcelain index read. The
+	// daemon must not write the shared index behind a concurrent Git process.
 	return nil
 }
 

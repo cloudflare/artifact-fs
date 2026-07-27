@@ -297,7 +297,7 @@ ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that regis
 
 ## Supported git operations
 
-Work in progress. The table below reflects operations tested against [cloudflare/workers-sdk](https://github.com/cloudflare/workers-sdk) mounted via macFUSE.
+Work in progress. The table reflects operations exercised by the FUSE E2E suite; some were also tested against [cloudflare/workers-sdk](https://github.com/cloudflare/workers-sdk) mounted via macFUSE.
 
 ### Filesystem operations
 
@@ -313,6 +313,9 @@ Work in progress. The table below reflects operations tested against [cloudflare
 | Delete file (`rm`) | Supported | Whiteout recorded in overlay |
 | `rmdir` | Supported | Checks directory is empty first |
 | Truncate | Supported | Hydrates blob before truncating |
+| `chmod` | Supported | Preserves executable-bit changes across commits |
+| Create symlink (`ln -s`) | Supported | Stores the target in the writable overlay |
+| Rename symlink | Supported | Preserves the target and reconciles after commit |
 | Symlink read (`readlink`) | Supported | Symlink target read from blob content |
 
 ### Git operations
@@ -324,19 +327,26 @@ Work in progress. The table below reflects operations tested against [cloudflare
 | `git rev-parse HEAD` | Supported | |
 | `git show` | Supported | |
 | `git remote -v` | Supported | Credentials stripped from output |
-| `git stash list` | Supported | |
+| `git stash` | Supported | Includes push/pop with untracked files |
 | `git status` | Supported | ~7s on 5800-entry repo |
 | `git diff` | Supported | Shows correct unified diff for modified files |
 | `git add` | Supported | Stages modified files |
-| `git reset` | Supported | ~6.5s index refresh |
-| `git commit` | Supported | Watcher detects HEAD change; overlay reconciles stale entries |
+| `git reset --hard` | Supported | Restores content, modes, and staged creates |
+| `git clean -fd` | Supported | Removes untracked files and directory trees |
+| `git commit` | Supported | Reconciles content, executable-bit, symlink, rename, and delete changes |
 | `git checkout` | Supported | Re-indexes tree, reconciles overlay, refreshes git index |
+| `git merge --no-ff` | Supported | Publishes merge commits and reconciles the merged worktree |
+| `git rebase` | Supported | Reconciles rewritten commits and branch state |
 | `git fetch` | Supported | Background refresh loop fetches periodically |
+| `git pull --ff-only` | Supported | Publishes the fast-forwarded snapshot and reconciles the overlay |
+| `git push` | Supported | Uses the configured upstream and ambient credentials |
 
 ### Known limitations
 
 | Issue | Impact |
 |-------|--------|
+| Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
+| Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
 | `git status` takes ~7s on large repos (5800+ entries) | Performance -- full tree walk through FUSE |
 | `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 
@@ -367,7 +377,7 @@ AFS_RUN_E2E_TESTS=1 \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AFS_RUN_E2E_TESTS` | `0` | Set to `1` to enable end-to-end tests |
-| `AFS_E2E_REPO` | local bare repo | Git remote URL for e2e tests. When unset, a local bare repo is created automatically. Set to an HTTPS URL to test against a real remote (accepts authenticated URLs). |
+| `AFS_E2E_REPO` | local bare repo | Git remote URL for e2e tests. Use an ambient Git credential helper for authenticated HTTPS remotes. |
 | `ARTIFACT_FS_ROOT` | `~/.local/share/artifact-fs` (macOS) or `/var/lib/artifact-fs` (Linux) | Runtime data root for the daemon and CLI |
 
 ## Contributing

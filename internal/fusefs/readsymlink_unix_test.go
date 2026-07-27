@@ -55,7 +55,7 @@ func TestReadSymlinkRejectsKnownOversizedBlobBeforeHydration(t *testing.T) {
 				Mode:      0o120000,
 				ObjectOID: "blob",
 				SizeState: "known",
-				SizeBytes: int64(maxSymlinkTargetBytes + 1),
+				SizeBytes: int64(model.MaxSymlinkTargetBytes + 1),
 			},
 		}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}},

@@ -60,7 +60,7 @@ func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, p
 		f.entries = map[string]model.OverlayEntry{}
 	}
 	now := time.Now().UnixNano()
-	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, Mode: base.Mode, MtimeUnixNs: now, CtimeUnixNs: now, SourceOID: base.ObjectOID}
+	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindModify, Mode: base.Mode, MtimeUnixNs: now, CtimeUnixNs: now, SourceOID: base.ObjectOID, SourceMode: base.Mode}
 	f.entries[e.Path] = e
 	return e, nil
 }
@@ -69,6 +69,14 @@ func (f *fakeOverlay) EnsureCopyOnWriteFrom(ctx context.Context, repo model.Repo
 }
 func (f *fakeOverlay) CreateFile(_ context.Context, _ string, _ uint32) (model.OverlayEntry, error) {
 	return model.OverlayEntry{}, nil
+}
+func (f *fakeOverlay) CreateSymlink(_ context.Context, path string, target string) (model.OverlayEntry, error) {
+	if f.entries == nil {
+		f.entries = map[string]model.OverlayEntry{}
+	}
+	e := model.OverlayEntry{Path: model.CleanPath(path), Kind: model.OverlayKindSymlink, Mode: 0o120000, SizeBytes: int64(len(target)), TargetPath: target}
+	f.entries[e.Path] = e
+	return e, nil
 }
 func (f *fakeOverlay) WriteFile(_ context.Context, _ string, _ int64, data []byte) (int, error) {
 	f.writes++
@@ -87,13 +95,16 @@ func (f *fakeOverlay) Rename(_ context.Context, oldPath, newPath string) error {
 	f.entries[newPath] = e
 	return nil
 }
-func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, newPath string, sourceOID string) error {
+func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error {
 	if err := f.Rename(context.Background(), oldPath, newPath); err != nil {
 		return err
 	}
 	e := f.entries[model.CleanPath(newPath)]
-	e.Kind = model.OverlayKindModify
+	if e.Kind != model.OverlayKindSymlink {
+		e.Kind = model.OverlayKindModify
+	}
 	e.SourceOID = sourceOID
+	e.SourceMode = sourceMode
 	f.entries[model.CleanPath(newPath)] = e
 	return nil
 }
@@ -109,6 +120,12 @@ func (f *fakeOverlay) SetMtime(_ context.Context, path string, t time.Time) erro
 	e := f.entries[model.CleanPath(path)]
 	e.MtimeUnixNs = t.UnixNano()
 	e.CtimeUnixNs = time.Now().UnixNano()
+	f.entries[model.CleanPath(path)] = e
+	return nil
+}
+func (f *fakeOverlay) SetMode(_ context.Context, path string, mode uint32) error {
+	e := f.entries[model.CleanPath(path)]
+	e.Mode = e.Mode&^0o777 | mode&0o777
 	f.entries[model.CleanPath(path)] = e
 	return nil
 }

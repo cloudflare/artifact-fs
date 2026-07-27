@@ -99,6 +99,10 @@ type BaseNode struct {
 
 type OverlayKind string
 
+// MaxSymlinkTargetBytes matches the largest target supported by the FUSE
+// adapters and common Linux PATH_MAX behavior.
+const MaxSymlinkTargetBytes = 4096
+
 const (
 	OverlayKindCreate  OverlayKind = "create"
 	OverlayKindModify  OverlayKind = "modify"
@@ -118,6 +122,7 @@ type OverlayEntry struct {
 	MtimeUnixNs int64
 	CtimeUnixNs int64
 	SourceOID   string
+	SourceMode  uint32
 	TargetPath  string
 }
 
@@ -212,13 +217,15 @@ type OverlayStore interface {
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	EnsureCopyOnWriteFrom(ctx context.Context, repo RepoConfig, path string, base BaseNode, src *os.File) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
+	CreateSymlink(ctx context.Context, path string, target string) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)
 	SyncFile(ctx context.Context, path string) error
 	Truncate(ctx context.Context, path string, size int64) error
 	Remove(ctx context.Context, path string) error
 	Rename(ctx context.Context, oldPath, newPath string) error
-	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error
+	RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
+	SetMode(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
 	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
 	ReconcileChecked(ctx context.Context, baseLookup func(path string) (BaseNode, bool, error)) error

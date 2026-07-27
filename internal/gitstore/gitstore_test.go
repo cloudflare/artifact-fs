@@ -70,6 +70,74 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	}
 }
 
+func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	gitlinkOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	run(t, "git", "-C", repo, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",vendor/dependency")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "add gitlink")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	headOID := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	nodes, err := store.BuildTreeIndex(context.Background(), cfg, headOID)
+	if err != nil {
+		t.Fatalf("BuildTreeIndex: %v", err)
+	}
+	for _, node := range nodes {
+		if node.Path != "vendor/dependency" {
+			continue
+		}
+		if node.Type != "dir" || node.Mode != 0o160000 || node.ObjectOID != gitlinkOID {
+			t.Fatalf("gitlink node = %#v", node)
+		}
+		if node.SizeState != "known" || node.SizeBytes != 0 {
+			t.Fatalf("gitlink size = %q/%d, want known/0", node.SizeState, node.SizeBytes)
+		}
+		return
+	}
+	t.Fatal("gitlink missing from tree")
+}
+
+func TestConfigureStatusOptimizationDoesNotWriteIndex(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	gitDir := filepath.Join(repo, ".git")
+	indexLock := filepath.Join(gitDir, "index.lock")
+	if err := os.WriteFile(indexLock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}
+	if err := New(nil).ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
+		t.Fatalf("ConfigureStatusOptimization: %v", err)
+	}
+	if _, err := os.Stat(indexLock); err != nil {
+		t.Fatalf("daemon changed caller-owned index lock: %v", err)
+	}
+	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		t.Fatalf("disable test fsmonitor hook: %v", err)
+	}
+	if err := os.Remove(indexLock); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -82,68 +150,6 @@ func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	_ = exec.Command("sh", hookPath).Run()
 	if _, err := os.Stat(pwned); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("generated hook allowed shell command substitution; stat err = %v", err)
-	}
-}
-
-func TestMarkIndexFSMonitorValidUsesWorkTree(t *testing.T) {
-	tmp := t.TempDir()
-	binDir := filepath.Join(tmp, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	recordPath := filepath.Join(tmp, "env.log")
-	stdinPath := filepath.Join(tmp, "stdin.bin")
-	expectedStdinPath := filepath.Join(tmp, "expected-stdin.bin")
-	if err := os.WriteFile(expectedStdinPath, []byte("README.md\x00"), 0o644); err != nil {
-		t.Fatalf("write expected stdin: %v", err)
-	}
-	fakeGit := filepath.Join(binDir, "git")
-	fakeGitScript := "#!/bin/sh\n" +
-		"if [ \"$GIT_DIR\" != \"$AFS_TEST_GIT_DIR\" ]; then printf 'bad GIT_DIR: %s\\n' \"$GIT_DIR\" >&2; exit 2; fi\n" +
-		"if [ \"$GIT_WORK_TREE\" != \"$AFS_TEST_WORK_TREE\" ]; then printf 'bad GIT_WORK_TREE: %s\\n' \"$GIT_WORK_TREE\" >&2; exit 2; fi\n" +
-		"case \"$1\" in\n" +
-		"  ls-files)\n" +
-		"    if [ \"$#\" -ne 2 ] || [ \"$2\" != \"-z\" ]; then printf 'bad ls-files args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
-		"    printf 'README.md\\0'\n" +
-		"    printf 'ls-files\\n' >>\"$AFS_TEST_RECORD\"\n" +
-		"    exit 0\n" +
-		"    ;;\n" +
-		"  update-index)\n" +
-		"    if [ \"$#\" -ne 4 ] || [ \"$2\" != \"--fsmonitor-valid\" ] || [ \"$3\" != \"-z\" ] || [ \"$4\" != \"--stdin\" ]; then printf 'bad update-index args: %s\\n' \"$*\" >&2; exit 2; fi\n" +
-		"    cat >\"$AFS_TEST_STDIN\"\n" +
-		"    if ! cmp -s \"$AFS_TEST_STDIN\" \"$AFS_TEST_EXPECTED_STDIN\"; then printf 'bad update-index stdin\\n' >&2; exit 2; fi\n" +
-		"    printf 'update-index\\n' >>\"$AFS_TEST_RECORD\"\n" +
-		"    exit 0\n" +
-		"    ;;\n" +
-		"esac\n" +
-		"printf 'unexpected git command: %s\\n' \"$*\" >&2\n" +
-		"exit 2\n"
-	if err := os.WriteFile(fakeGit, []byte(fakeGitScript), 0o755); err != nil {
-		t.Fatalf("write fake git: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("AFS_TEST_RECORD", recordPath)
-	t.Setenv("AFS_TEST_STDIN", stdinPath)
-	t.Setenv("AFS_TEST_EXPECTED_STDIN", expectedStdinPath)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	gitDir := filepath.Join(tmp, "git")
-	workTree := filepath.Join(tmp, "worktree")
-	t.Setenv("AFS_TEST_GIT_DIR", gitDir)
-	t.Setenv("AFS_TEST_WORK_TREE", workTree)
-	if err := markIndexFSMonitorValid(ctx, gitDir, workTree); err != nil {
-		t.Fatalf("markIndexFSMonitorValid: %v", err)
-	}
-	recorded, err := os.ReadFile(recordPath)
-	if err != nil {
-		t.Fatalf("read env log: %v", err)
-	}
-	got := strings.Fields(string(recorded))
-	slices.Sort(got)
-	want := []string{"ls-files", "update-index"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("recorded commands = %#v, want %#v", got, want)
 	}
 }
 
@@ -656,6 +662,7 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("CloneBloblessNonInteractive: %v", err)
 	}
+	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	cfg.Branch = "dev"
 	cfg.FetchRef = "dev"
 	if err := store.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
@@ -730,6 +737,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareSource: %v", err)
 	}
+	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	if !prepared.Verified || !prepared.Acquired || prepared.Ref != cfg.Branch || prepared.Commit != tip {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
@@ -779,6 +787,11 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	wantFetchRef := "+refs/heads/main:" + verifiedSourceTrackingRef
 	if fetchRef != wantFetchRef {
 		t.Fatalf("remote.origin.fetch = %q, want %q", fetchRef, wantFetchRef)
+	}
+	// The generated hook targets os.Executable, which is the test runner here.
+	// Disable it before fetch so newer Git versions do not recurse into tests.
+	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		t.Fatalf("disable test fsmonitor hook: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(work, "NEW.md"), []byte("new\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -2600,6 +2613,23 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 func run(t *testing.T, name string, args ...string) {
 	t.Helper()
 	_ = runOutput(t, name, args...)
+}
+
+func assertArtifactWorktreeConfig(t *testing.T, ctx context.Context, gitDir string) {
+	t.Helper()
+	for key, want := range map[string]string{
+		"core.filemode":   "true",
+		"core.ignorecase": "false",
+		"core.symlinks":   "true",
+	} {
+		got, err := runGit(ctx, gitDir, "config", "--local", "--get", key)
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		if got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
 }
 
 func runOutput(t *testing.T, name string, args ...string) string {

@@ -133,6 +133,92 @@ func TestWriteThroughOpenedBaseHandlePromotesAndWrites(t *testing.T) {
 	}
 }
 
+func TestSetInodeAttributesAppliesExecutableBit(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(cachePath, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := model.RepoConfig{ID: "repo"}
+	base := model.BaseNode{RepoID: repo.ID, Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: "blob", SizeState: "known", SizeBytes: 4}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{base.Path: base}}, ov)
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov, Hydrator: &fakeLookupHydrator{size: 4, path: cachePath}}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	lookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: base.Path}
+	if err := fs.LookUpInode(context.Background(), lookup); err != nil {
+		t.Fatal(err)
+	}
+	mode := os.FileMode(0o755)
+	op := &fuseops.SetInodeAttributesOp{Inode: lookup.Entry.Child, Mode: &mode}
+	if err := fs.SetInodeAttributes(context.Background(), op); err != nil {
+		t.Fatalf("SetInodeAttributes: %v", err)
+	}
+	if op.Attributes.Mode.Perm() != 0o755 {
+		t.Fatalf("returned mode = %#o, want 0755", op.Attributes.Mode.Perm())
+	}
+	entry, ok := ov.entries[base.Path]
+	if !ok || entry.Mode != 0o100755 {
+		t.Fatalf("overlay entry = %+v, want promoted executable file", entry)
+	}
+}
+
+func TestCreateAndReadOverlaySymlink(t *testing.T) {
+	repo := model.RepoConfig{ID: "repo"}
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
+	engine := &Engine{Resolver: resolver, Repo: repo, Overlay: ov}
+	fs := NewArtifactFuse(repo, resolver, engine)
+	create := &fuseops.CreateSymlinkOp{
+		Parent: fuseops.RootInodeID,
+		Name:   "readme-link",
+		Target: "README.md",
+	}
+	if err := fs.CreateSymlink(context.Background(), create); err != nil {
+		t.Fatalf("CreateSymlink: %v", err)
+	}
+	if create.Entry.Attributes.Mode&os.ModeSymlink == 0 {
+		t.Fatalf("created mode = %#o, want symlink", create.Entry.Attributes.Mode)
+	}
+	read := &fuseops.ReadSymlinkOp{Inode: create.Entry.Child}
+	if err := fs.ReadSymlink(context.Background(), read); err != nil {
+		t.Fatalf("ReadSymlink: %v", err)
+	}
+	if read.Target != create.Target {
+		t.Fatalf("target = %q, want %q", read.Target, create.Target)
+	}
+}
+
+func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) {
+	fs := NewArtifactFuse(model.RepoConfig{}, nil, nil)
+	fs.mu.Lock()
+	source := fs.allocInode("source.txt", "file", 0o100644, 1)
+	replaced := fs.allocInode("destination.txt", "file", 0o100644, 1)
+	fs.mu.Unlock()
+
+	fs.moveInodePath("source.txt", "destination.txt")
+
+	moved, err := fs.requireInode(source.ID, syscall.ESTALE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Path != "destination.txt" {
+		t.Fatalf("source inode path = %q, want destination.txt", moved.Path)
+	}
+	if got := fs.pathToInode["destination.txt"]; got != source.ID {
+		t.Fatalf("destination inode = %d, want source %d", got, source.ID)
+	}
+	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced inode error = %v, want ESTALE", err)
+	}
+
+	if err := fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: replaced.ID, N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.pathToInode["destination.txt"]; got != source.ID {
+		t.Fatalf("forgetting replaced inode removed source mapping: got %d, want %d", got, source.ID)
+	}
+}
+
 func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string

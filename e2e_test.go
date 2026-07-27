@@ -34,7 +34,7 @@ func createLocalTestRepo(t *testing.T) string {
 	// Initialize bare repo.
 	run(t, "", "git", "init", "--bare", bareDir)
 
-	// Create a working tree and seed content across 3 commits.
+	// Create a working tree and seed content across 4 commits.
 	run(t, "", "git", "clone", bareDir, workDir)
 	run(t, workDir, "git", "config", "user.name", "E2E Setup")
 	run(t, workDir, "git", "config", "user.email", "e2e@test")
@@ -63,6 +63,11 @@ func createLocalTestRepo(t *testing.T) string {
 	}
 	run(t, workDir, "git", "add", "-A")
 	run(t, workDir, "git", "commit", "-m", "add packages directory")
+
+	// Commit 4: a gitlink without cloning submodule contents.
+	gitlinkOID := strings.TrimSpace(run(t, workDir, "git", "rev-parse", "HEAD"))
+	run(t, workDir, "git", "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",vendor/dependency")
+	run(t, workDir, "git", "commit", "-m", "add gitlink")
 
 	run(t, workDir, "git", "push", "origin", "main")
 	run(t, bareDir, "git", "config", "uploadpack.allowFilter", "true")

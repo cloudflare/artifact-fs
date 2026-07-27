@@ -53,6 +53,7 @@ type InodeRef struct {
 	Refcnt  int64
 	IsRoot  bool
 	Overlay bool
+	Stale   bool
 }
 
 type DirHandle struct {
@@ -131,19 +132,16 @@ func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32, gen int64) *In
 	return ref
 }
 
-func (fs *ArtifactFuse) getInode(id fuseops.InodeID) *InodeRef {
+func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeRef, error) {
 	fs.mu.RLock()
 	ref := fs.inodes[id]
-	fs.mu.RUnlock()
-	return ref
-}
-
-func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeRef, error) {
-	ref := fs.getInode(id)
-	if ref == nil {
+	if ref == nil || ref.Stale {
+		fs.mu.RUnlock()
 		return nil, missing
 	}
-	return ref, nil
+	snapshot := *ref
+	fs.mu.RUnlock()
+	return &snapshot, nil
 }
 
 func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
@@ -153,10 +151,32 @@ func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
 		ref.Refcnt--
 		if ref.Refcnt <= 0 && !ref.IsRoot {
 			delete(fs.inodes, id)
-			delete(fs.pathToInode, ref.Path)
+			if fs.pathToInode[ref.Path] == id {
+				delete(fs.pathToInode, ref.Path)
+			}
 		}
 	}
 	fs.mu.Unlock()
+}
+
+func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	id, ok := fs.pathToInode[oldPath]
+	if !ok {
+		return
+	}
+	if replacedID, exists := fs.pathToInode[newPath]; exists && replacedID != id {
+		if replaced := fs.inodes[replacedID]; replaced != nil {
+			replaced.Stale = true
+		}
+		delete(fs.pathToInode, newPath)
+	}
+	delete(fs.pathToInode, oldPath)
+	if ref := fs.inodes[id]; ref != nil {
+		ref.Path = newPath
+		fs.pathToInode[newPath] = id
+	}
 }
 
 func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*InodeRef, string, error) {
@@ -414,6 +434,8 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 }
 
 func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetInodeAttributesOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -497,6 +519,17 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		}
 		fs.closeCachedFilesForPath(ref.Path)
 	}
+	if op.Mode != nil {
+		if err := fs.engine.SetMode(ctx, ref.Path, uint32(op.Mode.Perm())); err != nil {
+			if errors.Is(err, iofs.ErrInvalid) {
+				return syscall.ENOTSUP
+			}
+			if errors.Is(err, iofs.ErrNotExist) {
+				return syscall.ENOENT
+			}
+			return syscall.EIO
+		}
+	}
 	// Handle mtime updates (e.g., from touch)
 	if op.Mtime != nil {
 		fs.closeCachedFilesForPath(ref.Path)
@@ -524,7 +557,9 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 		ref.Refcnt -= int64(op.N)
 		if ref.Refcnt <= 0 && !ref.IsRoot {
 			delete(fs.inodes, op.Inode)
-			delete(fs.pathToInode, ref.Path)
+			if fs.pathToInode[ref.Path] == op.Inode {
+				delete(fs.pathToInode, ref.Path)
+			}
 		}
 	}
 	fs.mu.Unlock()
@@ -794,6 +829,30 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 	return nil
 }
 
+func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSymlinkOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
+	}
+	if len(op.Target) > model.MaxSymlinkTargetBytes {
+		return syscall.ENAMETOOLONG
+	}
+	if err := fs.engine.Symlink(ctx, childPath, op.Target); err != nil {
+		return syscall.EIO
+	}
+	fs.mu.Lock()
+	ref := fs.allocInode(childPath, "symlink", 0o120000, fs.resolver.Generation())
+	fs.mu.Unlock()
+
+	op.Entry.Child = ref.ID
+	now := time.Now()
+	op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
+	setChildEntryExpiry(&op.Entry, time.Second)
+	return nil
+}
+
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
@@ -883,17 +942,15 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 		}
 		return syscall.EIO
 	}
+	fs.moveInodePath(oldPath, newPath)
 	fs.detachOpenHandles(newPath)
 	fs.moveOpenHandles(oldPath, newPath)
 	return nil
 }
 
-// maxSymlinkTargetBytes caps the size of a symlink target we'll hand back to
-// the kernel. Linux PATH_MAX is 4096, which is the largest target a real
-// symlink can point at anyway.
-const maxSymlinkTargetBytes = 4096
-
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -902,11 +959,18 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 	if err != nil {
 		return syscall.ENOENT
 	}
+	if n.FromOverlay && n.Overlay.Kind == model.OverlayKindSymlink {
+		if len(n.Overlay.TargetPath) > model.MaxSymlinkTargetBytes {
+			return syscall.ENAMETOOLONG
+		}
+		op.Target = n.Overlay.TargetPath
+		return nil
+	}
 	if n.Base.ObjectOID != "" {
 		if err := validateKnownSymlinkTargetSize(n.Base); err != nil {
 			return err
 		}
-		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, maxSymlinkTargetBytes)
+		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
 		if err != nil {
 			if errors.Is(err, model.ErrBlobTooLarge) {
 				return syscall.ENAMETOOLONG
@@ -926,7 +990,7 @@ func validateKnownSymlinkTargetSize(node model.BaseNode) error {
 	if node.SizeBytes < 0 {
 		return syscall.EIO
 	}
-	if node.SizeBytes > maxSymlinkTargetBytes {
+	if node.SizeBytes > model.MaxSymlinkTargetBytes {
 		return syscall.ENAMETOOLONG
 	}
 	return nil
@@ -1014,9 +1078,8 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
-		EnableReaddirplus:       true,
-		EnableAutoReaddirplus:   true,
 	}
+	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(mountCfg)
 
 	mfs, err := fuse.Mount(repo.MountPath, server, mountCfg)
