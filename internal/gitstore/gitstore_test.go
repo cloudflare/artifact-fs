@@ -105,6 +105,60 @@ func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	t.Fatal("gitlink missing from tree")
 }
 
+func TestConfigureStatusOptimizationRetriesIndexLock(t *testing.T) {
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	gitDir := filepath.Join(repo, ".git")
+	indexLock := filepath.Join(gitDir, "index.lock")
+	if err := os.WriteFile(indexLock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		hookPath := filepath.Join(gitDir, "hooks", "artifact-fs-fsmonitor")
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := os.Stat(hookPath); err == nil {
+				script := "#!/bin/sh\nprintf 'artifact-fs-test\\0'\n"
+				if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+					released <- err
+					return
+				}
+				released <- os.Remove(indexLock)
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				released <- err
+				return
+			}
+			if time.Now().After(deadline) {
+				released <- errors.New("timed out waiting for fsmonitor hook")
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg := model.RepoConfig{ID: "repo", Name: "repo", GitDir: gitDir, MountPath: repo}
+	if err := New(nil).ConfigureStatusOptimization(ctx, cfg, tmp); err != nil {
+		t.Fatalf("ConfigureStatusOptimization: %v", err)
+	}
+	if err := <-released; err != nil {
+		t.Fatalf("release index lock: %v", err)
+	}
+	if _, err := runGit(ctx, gitDir, "config", "--unset", "core.fsmonitor"); err != nil {
+		t.Fatalf("disable test fsmonitor hook: %v", err)
+	}
+}
+
 func TestFSMonitorHookScriptQuotesArgs(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -691,6 +745,7 @@ func TestPrepareExistingCloneNonInteractiveUpdatesBranch(t *testing.T) {
 	if err := store.CloneBloblessNonInteractive(ctx, cfg); err != nil {
 		t.Fatalf("CloneBloblessNonInteractive: %v", err)
 	}
+	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	cfg.Branch = "dev"
 	cfg.FetchRef = "dev"
 	if err := store.PrepareExistingCloneNonInteractive(ctx, cfg); err != nil {
@@ -765,6 +820,7 @@ func TestPrepareSourceIsShallowAndVerifiesRequiredCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareSource: %v", err)
 	}
+	assertArtifactWorktreeConfig(t, ctx, gitDir)
 	if !prepared.Verified || !prepared.Acquired || prepared.Ref != cfg.Branch || prepared.Commit != tip {
 		t.Fatalf("prepared source = %+v", prepared)
 	}
@@ -2640,6 +2696,23 @@ func TestBatchPoolBoundsConcurrentProcesses(t *testing.T) {
 func run(t *testing.T, name string, args ...string) {
 	t.Helper()
 	_ = runOutput(t, name, args...)
+}
+
+func assertArtifactWorktreeConfig(t *testing.T, ctx context.Context, gitDir string) {
+	t.Helper()
+	for key, want := range map[string]string{
+		"core.filemode":   "true",
+		"core.ignorecase": "false",
+		"core.symlinks":   "true",
+	} {
+		got, err := runGit(ctx, gitDir, "config", "--local", "--get", key)
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		if got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
 }
 
 func runOutput(t *testing.T, name string, args ...string) string {

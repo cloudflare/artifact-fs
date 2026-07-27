@@ -1693,6 +1693,9 @@ func (s *Service) scheduleHEADRetry(rt *repoRuntime) {
 
 func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
 	if err := s.git.ConfigureStatusOptimization(ctx, cfg, s.root); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		s.logger.Warn("git status optimization setup failed", "repo", cfg.Name, "error", err)
 	}
 }
@@ -1754,7 +1757,7 @@ func fsMonitorDirtyPaths(entries []model.OverlayEntry) []string {
 	}
 	for _, e := range entries {
 		add(e.Path)
-		if e.TargetPath != "" {
+		if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
 			add(e.TargetPath)
 		}
 	}

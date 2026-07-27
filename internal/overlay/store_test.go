@@ -286,14 +286,14 @@ func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	}
 }
 
-func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
+func TestNewBackfillsOverlayMetadata(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
 
 	if _, err := s.CreateFile(ctx, "old.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=0 WHERE path=?`, "old.txt"); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET mode=?, source_oid=?, ctime_unix_ns=0 WHERE path=?`, 0o100644, "base-oid", "old.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE overlay_entries DROP COLUMN source_mode`); err != nil {
@@ -314,6 +314,9 @@ func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
 	}
 	if got.CtimeUnixNs == 0 {
 		t.Fatal("expected zero ctime to be repaired")
+	}
+	if got.SourceMode != 0o100644 {
+		t.Fatalf("source mode = %#o, want legacy entry mode", got.SourceMode)
 	}
 }
 

@@ -188,6 +188,37 @@ func TestCreateAndReadOverlaySymlink(t *testing.T) {
 	}
 }
 
+func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) {
+	fs := NewArtifactFuse(model.RepoConfig{}, nil, nil)
+	fs.mu.Lock()
+	source := fs.allocInode("source.txt", "file", 0o100644, 1)
+	replaced := fs.allocInode("destination.txt", "file", 0o100644, 1)
+	fs.mu.Unlock()
+
+	fs.moveInodePath("source.txt", "destination.txt")
+
+	moved, err := fs.requireInode(source.ID, syscall.ESTALE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Path != "destination.txt" {
+		t.Fatalf("source inode path = %q, want destination.txt", moved.Path)
+	}
+	if got := fs.pathToInode["destination.txt"]; got != source.ID {
+		t.Fatalf("destination inode = %d, want source %d", got, source.ID)
+	}
+	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced inode error = %v, want ESTALE", err)
+	}
+
+	if err := fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: replaced.ID, N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.pathToInode["destination.txt"]; got != source.ID {
+		t.Fatalf("forgetting replaced inode removed source mapping: got %d, want %d", got, source.ID)
+	}
+}
+
 func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string

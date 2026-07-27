@@ -344,6 +344,9 @@ func (s *Store) cloneBlobless(ctx context.Context, cfg model.RepoConfig, extraEn
 
 	targetGitDir := filepath.Join(target, ".git")
 
+	if err := configureArtifactWorktree(ctx, targetGitDir); err != nil {
+		return err
+	}
 	// Populate the index so git status works inside the mount.
 	if _, err := runGit(ctx, targetGitDir, "read-tree", "HEAD"); err != nil {
 		return err
@@ -417,6 +420,9 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "config", "core.bare", "false"); err != nil {
 			return err
 		}
+		if err := configureArtifactWorktree(ctx, candidateGitDir); err != nil {
+			return err
+		}
 		if _, err := runGitWithEnv(ctx, candidateGitDir, env, "remote", "add", "origin", safeURL); err != nil {
 			return err
 		}
@@ -459,6 +465,22 @@ func (s *Store) PrepareSource(ctx context.Context, cfg model.RepoConfig, require
 	s.invalidateBatchPool(cfg.GitDir)
 	prepared.Acquired = true
 	return prepared, nil
+}
+
+func configureArtifactWorktree(ctx context.Context, gitDir string) error {
+	// Git's clone-time probes inspect the state filesystem, not the later FUSE
+	// mount. Record the semantics ArtifactFS actually exposes.
+	settings := [][2]string{
+		{"core.filemode", "true"},
+		{"core.ignorecase", "false"},
+		{"core.symlinks", "true"},
+	}
+	for _, setting := range settings {
+		if _, err := runGit(ctx, gitDir, "config", "--local", setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cloneExactRef(ctx context.Context, target string, safeURL string, env []string, ref string, depth int) error {
@@ -1808,10 +1830,30 @@ func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.Repo
 		return err
 	}
 	workTreeEnv := gitWorkTreeEnv(repo.MountPath)
-	if _, err := runGitWithEnv(ctx, repo.GitDir, workTreeEnv, "update-index", "--fsmonitor"); err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		_, err := runGitWithEnv(ctx, repo.GitDir, workTreeEnv, "update-index", "--fsmonitor")
+		if err == nil {
+			err = markIndexFSMonitorValid(ctx, repo.GitDir, repo.MountPath)
+		}
+		if err == nil {
+			return nil
+		}
+		if !isIndexLockContention(err) || attempt == 39 {
+			return err
+		}
+		if err := waitForGitRetry(ctx, 50*time.Millisecond); err != nil {
+			return err
+		}
 	}
-	return markIndexFSMonitorValid(ctx, repo.GitDir, repo.MountPath)
+}
+
+func isIndexLockContention(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "index.lock") &&
+		(strings.Contains(message, "file exists") || strings.Contains(message, "another git process"))
 }
 
 func gitWorkTreeEnv(workTree string) []string {

@@ -339,12 +339,14 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | `git rebase` | Supported | Reconciles rewritten commits and branch state |
 | `git fetch` | Supported | Background refresh loop fetches periodically |
 | `git pull --ff-only` | Supported | Publishes the fast-forwarded snapshot and reconciles the overlay |
+| `git push` | Supported | Uses the configured upstream and ambient credentials |
 
 ### Known limitations
 
 | Issue | Impact |
 |-------|--------|
 | Git submodules are not initialized | Gitlink paths appear as empty directories so status stays clean |
+| Checkout filters and EOL transforms are not applied to snapshot-only reads | Files use canonical blob bytes until Git writes a transformed overlay |
 | `git status` takes ~7s on large repos (5800+ entries) | Performance -- full tree walk through FUSE |
 | `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 

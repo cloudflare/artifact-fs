@@ -96,6 +96,9 @@ func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN source_mode INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
+		if _, err := db.ExecContext(ctx, `UPDATE overlay_entries SET source_mode=mode WHERE source_oid<>''`); err != nil {
+			return err
+		}
 	}
 	_, err = db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=? WHERE ctime_unix_ns=0`, time.Now().UnixNano())
 	return err

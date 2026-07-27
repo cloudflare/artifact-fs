@@ -430,7 +430,15 @@ func TestE2EGitCommitPreservesUnstagedAfterStagedCommit(t *testing.T) {
 func TestE2EGitCommitTrackedRename(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 
+	openSource, err := os.Open(filepath.Join(repo.mountPath, "SECURITY.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openSource.Close()
 	gitCmd(t, repo.mountPath, "mv", "SECURITY.md", "SECURITY-renamed.md")
+	if _, err := openSource.Stat(); err != nil {
+		t.Fatalf("stat open source after rename: %v", err)
+	}
 	assertGitStatus(t, repo.mountPath, map[string]string{"SECURITY.md -> SECURITY-renamed.md": "R "})
 
 	preCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
@@ -670,6 +678,28 @@ func TestE2EGitPullFastForward(t *testing.T) {
 	}
 	if tracking := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "origin/main")); tracking == prePullHEAD {
 		t.Fatalf("origin/main did not advance from %s", prePullHEAD)
+	}
+}
+
+func TestE2EGitPush(t *testing.T) {
+	if os.Getenv("AFS_E2E_REPO") != "" {
+		t.Skip("skipping push against AFS_E2E_REPO")
+	}
+	repo := newMountedE2ERepo(t)
+
+	writeTestFile(t, repo.mountPath, "PUSHED.md", "pushed from ArtifactFS\n")
+	gitCmd(t, repo.mountPath, "add", "PUSHED.md")
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "add pushed fixture",
+	)
+	head := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath, "push", "origin", "HEAD:refs/heads/e2e-push")
+
+	advertised := strings.Fields(gitCmd(t, repo.mountPath, "ls-remote", "origin", "refs/heads/e2e-push"))
+	if len(advertised) != 2 || advertised[0] != head {
+		t.Fatalf("pushed ref = %q, want %s", advertised, head)
 	}
 }
 

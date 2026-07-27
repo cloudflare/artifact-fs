@@ -224,11 +224,13 @@ func TestFSMonitorDirtyPathsIncludesChangedPathsAndRenameEndpoints(t *testing.T)
 	paths := fsMonitorDirtyPaths([]model.OverlayEntry{
 		{Path: "src/pkg/file.go", Kind: model.OverlayKindModify},
 		{Path: "new/name.go", Kind: model.OverlayKindRename, TargetPath: "old/name.go"},
+		{Path: "readme-link", Kind: model.OverlayKindSymlink, TargetPath: "../README.md"},
 		{Path: ".", Kind: model.OverlayKindMkdir},
 	})
 	want := []string{
 		"new/name.go",
 		"old/name.go",
+		"readme-link",
 		"src/pkg/file.go",
 	}
 	if !reflect.DeepEqual(paths, want) {
