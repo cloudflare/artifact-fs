@@ -497,6 +497,17 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		}
 		fs.closeCachedFilesForPath(ref.Path)
 	}
+	if op.Mode != nil {
+		if err := fs.engine.SetMode(ctx, ref.Path, uint32(op.Mode.Perm())); err != nil {
+			if errors.Is(err, iofs.ErrInvalid) {
+				return syscall.ENOTSUP
+			}
+			if errors.Is(err, iofs.ErrNotExist) {
+				return syscall.ENOENT
+			}
+			return syscall.EIO
+		}
+	}
 	// Handle mtime updates (e.g., from touch)
 	if op.Mtime != nil {
 		fs.closeCachedFilesForPath(ref.Path)
@@ -794,6 +805,28 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 	return nil
 }
 
+func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSymlinkOp) error {
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
+	}
+	if len(op.Target) > model.MaxSymlinkTargetBytes {
+		return syscall.ENAMETOOLONG
+	}
+	if err := fs.engine.Symlink(ctx, childPath, op.Target); err != nil {
+		return syscall.EIO
+	}
+	fs.mu.Lock()
+	ref := fs.allocInode(childPath, "symlink", 0o120000, fs.resolver.Generation())
+	fs.mu.Unlock()
+
+	op.Entry.Child = ref.ID
+	now := time.Now()
+	op.Entry.Attributes = inodeAttrs(0o120000, uint64(len(op.Target)), "symlink", now, now)
+	setChildEntryExpiry(&op.Entry, time.Second)
+	return nil
+}
+
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
@@ -888,11 +921,6 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	return nil
 }
 
-// maxSymlinkTargetBytes caps the size of a symlink target we'll hand back to
-// the kernel. Linux PATH_MAX is 4096, which is the largest target a real
-// symlink can point at anyway.
-const maxSymlinkTargetBytes = 4096
-
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
@@ -902,11 +930,18 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 	if err != nil {
 		return syscall.ENOENT
 	}
+	if n.FromOverlay && n.Overlay.Kind == model.OverlayKindSymlink {
+		if len(n.Overlay.TargetPath) > model.MaxSymlinkTargetBytes {
+			return syscall.ENAMETOOLONG
+		}
+		op.Target = n.Overlay.TargetPath
+		return nil
+	}
 	if n.Base.ObjectOID != "" {
 		if err := validateKnownSymlinkTargetSize(n.Base); err != nil {
 			return err
 		}
-		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, maxSymlinkTargetBytes)
+		data, err := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
 		if err != nil {
 			if errors.Is(err, model.ErrBlobTooLarge) {
 				return syscall.ENAMETOOLONG
@@ -926,7 +961,7 @@ func validateKnownSymlinkTargetSize(node model.BaseNode) error {
 	if node.SizeBytes < 0 {
 		return syscall.EIO
 	}
-	if node.SizeBytes > maxSymlinkTargetBytes {
+	if node.SizeBytes > model.MaxSymlinkTargetBytes {
 		return syscall.ENAMETOOLONG
 	}
 	return nil

@@ -32,6 +32,7 @@ var migrations = []string{
 	  mtime_unix_ns INTEGER NOT NULL,
 	  ctime_unix_ns INTEGER NOT NULL,
 	  source_oid TEXT,
+	  source_mode INTEGER NOT NULL DEFAULT 0,
 	  target_path TEXT
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_overlay_kind ON overlay_entries(kind);`,
@@ -71,7 +72,7 @@ func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	defer rows.Close()
-	hasCtime := false
+	cols := map[string]bool{}
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -81,15 +82,18 @@ func ensureOverlaySchema(ctx context.Context, db *sql.DB) error {
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 			return err
 		}
-		if name == "ctime_unix_ns" {
-			hasCtime = true
-		}
+		cols[name] = true
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if !hasCtime {
+	if !cols["ctime_unix_ns"] {
 		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN ctime_unix_ns INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !cols["source_mode"] {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE overlay_entries ADD COLUMN source_mode INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -101,7 +105,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // overlayCols is the column list for overlay_entries queries. Keep in sync with
 // the Scan call in queryEntries and the single-row scan in Get.
-const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path`
+const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path`
 
 func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 	e, ok, _ := s.Lookup(context.Background(), path)
@@ -111,7 +115,7 @@ func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 func (s *Store) Lookup(ctx context.Context, path string) (model.OverlayEntry, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
 	var e model.OverlayEntry
-	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.SourceMode, &e.TargetPath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return model.OverlayEntry{}, false, nil
 		}
@@ -140,6 +144,38 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 	if e, ok, err := s.Lookup(ctx, path); err != nil {
 		return model.OverlayEntry{}, err
 	} else if ok && !e.IsDeleted() {
+		return e, nil
+	}
+	if base.Type == "symlink" {
+		if src == nil {
+			return model.OverlayEntry{}, errors.New("symlink blob is not hydrated")
+		}
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			return model.OverlayEntry{}, err
+		}
+		target, err := io.ReadAll(io.LimitReader(src, model.MaxSymlinkTargetBytes+1))
+		if err != nil {
+			return model.OverlayEntry{}, err
+		}
+		if len(target) > model.MaxSymlinkTargetBytes {
+			return model.OverlayEntry{}, fmt.Errorf("symlink target exceeds %d bytes", model.MaxSymlinkTargetBytes)
+		}
+		now := time.Now().UnixNano()
+		e := model.OverlayEntry{
+			RepoID:      s.repo.ID,
+			Path:        model.CleanPath(path),
+			Kind:        model.OverlayKindSymlink,
+			Mode:        base.Mode,
+			SizeBytes:   int64(len(target)),
+			MtimeUnixNs: now,
+			CtimeUnixNs: now,
+			SourceOID:   base.ObjectOID,
+			SourceMode:  base.Mode,
+			TargetPath:  string(target),
+		}
+		if err := s.upsertEntry(ctx, e); err != nil {
+			return model.OverlayEntry{}, err
+		}
 		return e, nil
 	}
 	tmp, err := os.CreateTemp(s.upperDir, ".artifact-fs-entry-*")
@@ -176,6 +212,7 @@ func (s *Store) EnsureCopyOnWriteFrom(ctx context.Context, _ model.RepoConfig, p
 		MtimeUnixNs: now,
 		CtimeUnixNs: now,
 		SourceOID:   base.ObjectOID,
+		SourceMode:  base.Mode,
 	}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		os.Remove(backing)
@@ -205,6 +242,29 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: model.OverlayKindCreate, BackingPath: backing, Mode: mode, MtimeUnixNs: now, CtimeUnixNs: now}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		os.Remove(backing)
+		return model.OverlayEntry{}, err
+	}
+	return e, nil
+}
+
+func (s *Store) CreateSymlink(ctx context.Context, path string, target string) (model.OverlayEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(target) > model.MaxSymlinkTargetBytes {
+		return model.OverlayEntry{}, fmt.Errorf("symlink target exceeds %d bytes", model.MaxSymlinkTargetBytes)
+	}
+	now := time.Now().UnixNano()
+	e := model.OverlayEntry{
+		RepoID:      s.repo.ID,
+		Path:        model.CleanPath(path),
+		Kind:        model.OverlayKindSymlink,
+		Mode:        0o120000,
+		SizeBytes:   int64(len(target)),
+		MtimeUnixNs: now,
+		CtimeUnixNs: now,
+		TargetPath:  target,
+	}
+	if err := s.upsertEntry(ctx, e); err != nil {
 		return model.OverlayEntry{}, err
 	}
 	return e, nil
@@ -335,17 +395,27 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	newBacking := e.BackingPath
 	newKind := model.OverlayKindRename
 	newTargetPath := oldPath
+	whiteoutTargetPath := oldPath
+	newSourceOID := e.SourceOID
+	newSourceMode := e.SourceMode
 	writeSourceWhiteout := true
 	if e.Kind == model.OverlayKindRename && e.TargetPath != "" {
 		newTargetPath = e.TargetPath
+		whiteoutTargetPath = e.TargetPath
 	}
 	mode := e.Mode
 	normalizedDirMode := false
 	switch e.Kind {
-	case model.OverlayKindCreate, model.OverlayKindSymlink:
+	case model.OverlayKindCreate:
 		newKind = e.Kind
 		newTargetPath = ""
 		writeSourceWhiteout = false
+	case model.OverlayKindSymlink:
+		newKind = e.Kind
+		newTargetPath = e.TargetPath
+		writeSourceWhiteout = e.SourceOID != ""
+		newSourceOID = ""
+		newSourceMode = 0
 	case model.OverlayKindMkdir:
 		hasDescendants, err := s.hasOverlayDescendants(ctx, oldPath)
 		if err != nil {
@@ -387,7 +457,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, mode, e.SizeBytes, e.MtimeUnixNs, now, e.SourceOID, newTargetPath); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, mode, e.SizeBytes, e.MtimeUnixNs, now, newSourceOID, newSourceMode, newTargetPath); err != nil {
 		return err
 	}
 	if e.Kind == model.OverlayKindMkdir {
@@ -397,7 +467,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 		}
 	}
 	if writeSourceWhiteout {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns,target_path=excluded.target_path`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", newTargetPath); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mode=0,source_oid='',source_mode=0,mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns,target_path=excluded.target_path`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, whiteoutTargetPath); err != nil {
 			return err
 		}
 	}
@@ -410,7 +480,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	return nil
 }
 
-func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string) error {
+func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oldPath = model.CleanPath(oldPath)
@@ -422,8 +492,16 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 	if !ok || e.IsDeleted() {
 		return os.ErrNotExist
 	}
+	newKind := model.OverlayKindModify
+	if e.Kind == model.OverlayKindSymlink {
+		newKind = model.OverlayKindSymlink
+	}
 	if oldPath == newPath {
-		_, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, target_path='' WHERE path=?`, model.OverlayKindModify, sourceOID, oldPath)
+		targetPath := ""
+		if newKind == model.OverlayKindSymlink {
+			targetPath = e.TargetPath
+		}
+		_, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=?`, newKind, sourceOID, sourceMode, targetPath, oldPath)
 		return err
 	}
 	newBacking := e.BackingPath
@@ -445,8 +523,13 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, newPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindModify, newBacking, e.Mode, e.SizeBytes, e.MtimeUnixNs, now, sourceOID, ""); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, e.Mode, e.SizeBytes, e.MtimeUnixNs, now, sourceOID, sourceMode, e.TargetPath); err != nil {
 		return err
+	}
+	if e.Kind == model.OverlayKindSymlink && e.SourceOID != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, ""); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -528,19 +611,35 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 	return err
 }
 
+func (s *Store) SetMode(ctx context.Context, path string, mode uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path = model.CleanPath(path)
+	e, ok, err := s.Lookup(ctx, path)
+	if err != nil {
+		return err
+	}
+	if !ok || e.IsDeleted() {
+		return os.ErrNotExist
+	}
+	e.Mode = e.Mode&^0o777 | mode&0o777
+	if e.BackingPath != "" {
+		if err := os.Chmod(e.BackingPath, os.FileMode(e.Mode)); err != nil {
+			return err
+		}
+	}
+	e.CtimeUnixNs = time.Now().UnixNano()
+	return s.upsertEntry(ctx, e)
+}
+
 // Reconcile prunes overlay entries that are stale relative to the new base
 // snapshot. Called after a generation change (commit, branch switch, fetch).
 //
-// Rules for each overlay entry:
-//   - modify with source_oid matching the base OID at path: base unchanged, KEEP
-//   - rename with source_oid matching the base OID at original path: base unchanged, KEEP
-//   - modify/rename with source_oid mismatch: base changed, REMOVE
-//   - create where base now has the path: was committed or exists on new branch, REMOVE
-//   - create where base doesn't have the path: user-created, KEEP
-//   - delete (whiteout) where base doesn't have the path: irrelevant, REMOVE
-//   - delete (whiteout) where base has the path: still meaningful, KEEP
-//   - mkdir where base now has a dir at the path: REMOVE
-//   - mkdir where base doesn't have the path: user-created, KEEP
+// Source OID and mode identify the base version an overlay entry was derived
+// from. When either changes, matching overlay content was committed and can be
+// removed; divergent content is kept and rebased onto the new source metadata.
+// Creates, symlinks, deletes, and directories are removed once the new base
+// independently represents their pending operation.
 func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool)) error {
 	if baseLookup == nil {
 		return nil
@@ -579,9 +678,10 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 				before := e
 				e.Kind = model.OverlayKindCreate
 				e.SourceOID = ""
+				e.SourceMode = 0
 				toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
-			} else if e.SourceOID != base.ObjectOID {
-				matches, err := backingMatchesBlobOID(e.BackingPath, base.ObjectOID)
+			} else if e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode {
+				matches, err := overlayEntryMatchesBase(e, base)
 				if err != nil {
 					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
 				}
@@ -590,6 +690,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 				} else {
 					before := e
 					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
 					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
 				}
 			}
@@ -607,7 +708,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 				return err
 			}
 			if destinationExists && !sourceExists {
-				matches, err := backingMatchesBlobOID(e.BackingPath, destination.ObjectOID)
+				matches, err := overlayEntryMatchesBase(e, destination)
 				if err != nil {
 					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
 				}
@@ -618,9 +719,10 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 				}
 			}
 			if sourceExists {
-				if e.SourceOID != sourceBase.ObjectOID {
+				if e.SourceOID != sourceBase.ObjectOID || e.SourceMode != sourceBase.Mode {
 					before := e
 					e.SourceOID = sourceBase.ObjectOID
+					e.SourceMode = sourceBase.Mode
 					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
 				}
 			} else {
@@ -628,9 +730,11 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 				if destinationExists {
 					e.Kind = model.OverlayKindModify
 					e.SourceOID = destination.ObjectOID
+					e.SourceMode = destination.Mode
 				} else {
 					e.Kind = model.OverlayKindCreate
 					e.SourceOID = ""
+					e.SourceMode = 0
 				}
 				e.TargetPath = ""
 				toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
@@ -650,7 +754,7 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 			}
 		case model.OverlayKindCreate:
 			if baseExists {
-				matches, err := backingMatchesBlobOID(e.BackingPath, base.ObjectOID)
+				matches, err := overlayEntryMatchesBase(e, base)
 				if err != nil {
 					return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
 				}
@@ -660,12 +764,30 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 					before := e
 					e.Kind = model.OverlayKindModify
 					e.SourceOID = base.ObjectOID
+					e.SourceMode = base.Mode
 					toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
 				}
 			}
 		case model.OverlayKindMkdir:
 			if baseExists && base.Type == "dir" {
 				toRemove = append(toRemove, e)
+			}
+		case model.OverlayKindSymlink:
+			if baseExists && base.Type == "symlink" {
+				if e.SourceOID != base.ObjectOID || e.SourceMode != base.Mode {
+					matches, err := overlayEntryMatchesBase(e, base)
+					if err != nil {
+						return fmt.Errorf("reconcile hash %s: %w", e.Path, err)
+					}
+					if matches {
+						toRemove = append(toRemove, e)
+					} else {
+						before := e
+						e.SourceOID = base.ObjectOID
+						e.SourceMode = base.Mode
+						toUpdate = append(toUpdate, reconcileUpdate{before: before, after: e})
+					}
+				}
 			}
 		}
 	}
@@ -677,18 +799,16 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 		return err
 	}
 	defer tx.Rollback()
-	// Guard the DELETE so a concurrent FUSE write between our read and this
-	// delete is not lost. source_oid protects modify/rename entries (writes
-	// change the OID). mtime_unix_ns protects create/delete entries where
-	// source_oid is always empty -- any concurrent write updates the mtime.
-	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND mtime_unix_ns=?`)
+	// Guard the mutations so a concurrent FUSE write or chmod between our read
+	// and this transaction is not lost.
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	deleted := make([]model.OverlayEntry, 0, len(toRemove))
 	for _, e := range toRemove {
-		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.MtimeUnixNs)
+		res, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.SourceMode, e.Mode, e.MtimeUnixNs, e.CtimeUnixNs)
 		if err != nil {
 			return err
 		}
@@ -696,13 +816,13 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 			deleted = append(deleted, e)
 		}
 	}
-	updateStmt, err := tx.PrepareContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, target_path=? WHERE path=? AND kind=? AND source_oid=? AND mtime_unix_ns=?`)
+	updateStmt, err := tx.PrepareContext(ctx, `UPDATE overlay_entries SET kind=?, source_oid=?, source_mode=?, target_path=? WHERE path=? AND kind=? AND source_oid=? AND source_mode=? AND mode=? AND mtime_unix_ns=? AND ctime_unix_ns=?`)
 	if err != nil {
 		return err
 	}
 	defer updateStmt.Close()
 	for _, update := range toUpdate {
-		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.MtimeUnixNs); err != nil {
+		if _, err := updateStmt.ExecContext(ctx, update.after.Kind, update.after.SourceOID, update.after.SourceMode, update.after.TargetPath, update.before.Path, update.before.Kind, update.before.SourceOID, update.before.SourceMode, update.before.Mode, update.before.MtimeUnixNs, update.before.CtimeUnixNs); err != nil {
 			return err
 		}
 	}
@@ -722,15 +842,6 @@ func (s *Store) ReconcileChecked(ctx context.Context, baseLookup func(path strin
 }
 
 func backingMatchesBlobOID(path string, oid string) (bool, error) {
-	var h hash.Hash
-	switch len(oid) {
-	case sha1.Size * 2:
-		h = sha1.New()
-	case sha256.Size * 2:
-		h = sha256.New()
-	default:
-		return false, nil
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
@@ -740,10 +851,33 @@ func backingMatchesBlobOID(path string, oid string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if _, err := fmt.Fprintf(h, "blob %d\x00", st.Size()); err != nil {
+	return readerMatchesBlobOID(f, st.Size(), oid)
+}
+
+func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
+	if base.Mode != 0 && e.Mode&0o777 != base.Mode&0o777 {
+		return false, nil
+	}
+	if e.Kind == model.OverlayKindSymlink {
+		return readerMatchesBlobOID(strings.NewReader(e.TargetPath), int64(len(e.TargetPath)), base.ObjectOID)
+	}
+	return backingMatchesBlobOID(e.BackingPath, base.ObjectOID)
+}
+
+func readerMatchesBlobOID(r io.Reader, size int64, oid string) (bool, error) {
+	var h hash.Hash
+	switch len(oid) {
+	case sha1.Size * 2:
+		h = sha1.New()
+	case sha256.Size * 2:
+		h = sha256.New()
+	default:
+		return false, nil
+	}
+	if _, err := fmt.Fprintf(h, "blob %d\x00", size); err != nil {
 		return false, err
 	}
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, r); err != nil {
 		return false, err
 	}
 	return strings.EqualFold(hex.EncodeToString(h.Sum(nil)), oid), nil
@@ -783,7 +917,7 @@ func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]
 	var out []model.OverlayEntry
 	for rows.Next() {
 		var e model.OverlayEntry
-		if err := rows.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
+		if err := rows.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.CtimeUnixNs, &e.SourceOID, &e.SourceMode, &e.TargetPath); err != nil {
 			return nil, err
 		}
 		e.RepoID = s.repo.ID
@@ -797,8 +931,8 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 		return errors.New("empty path")
 	}
 	_, err := s.db.ExecContext(ctx, `
-	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, target_path)
-	VALUES(?,?,?,?,?,?,?,?,?)
+	INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path)
+	VALUES(?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(path) DO UPDATE SET
 	kind=excluded.kind,
 	backing_path=excluded.backing_path,
@@ -807,7 +941,8 @@ func (s *Store) upsertEntry(ctx context.Context, e model.OverlayEntry) error {
 	mtime_unix_ns=excluded.mtime_unix_ns,
 	ctime_unix_ns=excluded.ctime_unix_ns,
 	source_oid=excluded.source_oid,
-	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.TargetPath)
+	source_mode=excluded.source_mode,
+	target_path=excluded.target_path`, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.SourceMode, e.TargetPath)
 	return err
 }
 

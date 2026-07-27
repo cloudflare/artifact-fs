@@ -61,6 +61,231 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestCreateSymlinkReconcilesAfterCommit(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	target := "../README.md"
+
+	created, err := s.CreateSymlink(ctx, "docs/readme-link", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Kind != model.OverlayKindSymlink || created.NodeType() != "symlink" {
+		t.Fatalf("created entry = %+v", created)
+	}
+	if created.TargetPath != target || created.SizeBytes != int64(len(target)) || created.BackingPath != "" {
+		t.Fatalf("created symlink metadata = %+v", created)
+	}
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		if path != "docs/readme-link" {
+			return model.BaseNode{}, false
+		}
+		return model.BaseNode{
+			Path:      path,
+			Type:      "symlink",
+			Mode:      0o120000,
+			ObjectOID: testBlobOID([]byte(target)),
+		}, true
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get("docs/readme-link"); ok {
+		t.Fatal("committed symlink should be removed from overlay")
+	}
+}
+
+func TestSetModePreservesUncommittedModeAndReconcilesCommittedMode(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	baseData := []byte("base")
+	baseOID := testBlobOID(baseData)
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, baseOID), baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: baseOID}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, base.Path, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMode(ctx, base.Path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := s.Get(base.Path)
+	if !ok {
+		t.Fatal("expected mode-only overlay entry")
+	}
+	if entry.Mode != 0o100755 {
+		t.Fatalf("entry mode = %#o, want 0100755", entry.Mode)
+	}
+	st, err := os.Stat(entry.BackingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("backing mode = %#o, want 0755", st.Mode().Perm())
+	}
+
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: baseOID}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get(base.Path); !ok {
+		t.Fatal("uncommitted executable-bit change should remain in overlay")
+	}
+
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		return model.BaseNode{Path: path, Type: "file", Mode: 0o100755, ObjectOID: baseOID}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get(base.Path); ok {
+		t.Fatal("committed executable-bit change should be removed from overlay")
+	}
+}
+
+func TestReconcilePreservesUnstagedModeAfterContentCommit(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	original := []byte("original")
+	originalOID := testBlobOID(original)
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: originalOID}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, base.Path, base); err != nil {
+		t.Fatal(err)
+	}
+	committed := []byte("committed")
+	if err := s.Truncate(ctx, base.Path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, base.Path, 0, committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMode(ctx, base.Path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	committedOID := testBlobOID(committed)
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: committedOID}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := s.Get(base.Path)
+	if !ok {
+		t.Fatal("unstaged executable-bit change should remain after committing content")
+	}
+	if entry.Mode != 0o100755 || entry.SourceOID != committedOID || entry.SourceMode != 0o100644 {
+		t.Fatalf("rebased overlay entry = %+v", entry)
+	}
+}
+
+func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	original := []byte("original")
+	originalOID := testBlobOID(original)
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, originalOID), original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "script.sh", Type: "file", Mode: 0o100644, ObjectOID: originalOID}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, base.Path, base); err != nil {
+		t.Fatal(err)
+	}
+	committed := []byte("committed")
+	if err := s.Truncate(ctx, base.Path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, base.Path, 0, committed); err != nil {
+		t.Fatal(err)
+	}
+
+	concurrent, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { concurrent.Close() })
+	lookups := 0
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		lookups++
+		if lookups == 2 {
+			if err := concurrent.SetMode(ctx, path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return model.BaseNode{Path: path, Type: "file", Mode: 0o100644, ObjectOID: testBlobOID(committed)}, true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := s.Get(base.Path)
+	if !ok {
+		t.Fatal("concurrent executable-bit change was deleted")
+	}
+	if entry.Mode != 0o100755 {
+		t.Fatalf("entry mode = %#o, want 0100755", entry.Mode)
+	}
+}
+
+func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	target := "../README.md"
+	oid := testBlobOID([]byte(target))
+	if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, oid), []byte(target), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := model.BaseNode{Path: "docs/link", Type: "symlink", Mode: 0o120000, ObjectOID: oid}
+	promoted, err := s.EnsureCopyOnWrite(ctx, cfg, base.Path, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Kind != model.OverlayKindSymlink || promoted.TargetPath != target || promoted.SourceOID != oid {
+		t.Fatalf("promoted symlink = %+v", promoted)
+	}
+	if err := s.Rename(ctx, base.Path, "link"); err != nil {
+		t.Fatal(err)
+	}
+	if source, ok := s.Get(base.Path); !ok || !source.IsDeleted() {
+		t.Fatalf("source entry = %+v, ok=%v, want whiteout", source, ok)
+	}
+	if destination, ok := s.Get("link"); !ok || destination.Kind != model.OverlayKindSymlink || destination.TargetPath != target || destination.SourceOID != "" {
+		t.Fatalf("destination entry = %+v, ok=%v", destination, ok)
+	}
+
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		if path == base.Path {
+			return base, true
+		}
+		return model.BaseNode{}, false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if source, ok := s.Get(base.Path); !ok || !source.IsDeleted() {
+		t.Fatalf("uncommitted rename source after reconcile = %+v, ok=%v", source, ok)
+	}
+	if destination, ok := s.Get("link"); !ok || destination.Kind != model.OverlayKindSymlink {
+		t.Fatalf("uncommitted rename destination after reconcile = %+v, ok=%v", destination, ok)
+	}
+
+	if err := s.Reconcile(ctx, func(path string) (model.BaseNode, bool) {
+		if path == "link" {
+			return model.BaseNode{Path: path, Type: "symlink", Mode: 0o120000, ObjectOID: oid}, true
+		}
+		return model.BaseNode{}, false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get(base.Path); ok {
+		t.Fatal("committed symlink rename source should be removed from overlay")
+	}
+	if _, ok := s.Get("link"); ok {
+		t.Fatal("committed symlink rename destination should be removed from overlay")
+	}
+}
+
 func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
@@ -69,6 +294,12 @@ func TestNewRepairsZeroCtimeBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET ctime_unix_ns=0 WHERE path=?`, "old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE overlay_entries DROP COLUMN source_mode`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 

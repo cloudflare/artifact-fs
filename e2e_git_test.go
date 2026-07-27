@@ -396,12 +396,225 @@ func TestE2EGitCommitTrackedDelete(t *testing.T) {
 	assertPathExists(t, filepath.Join(repo.mountPath, "README.md"))
 }
 
+func TestE2EGitCommitExecutableBit(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	readmePath := filepath.Join(repo.mountPath, "README.md")
+	stagedContent := readFileEventually(t, readmePath) + "staged before chmod\n"
+	if err := os.WriteFile(readmePath, []byte(stagedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.mountPath, "add", "README.md")
+	if err := os.Chmod(readmePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": "MM"})
+
+	preContentCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "update readme before mode",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, preContentCommitHEAD, map[string]string{"README.md": " M"})
+	if got := readFileStr(t, readmePath); got != stagedContent {
+		t.Fatalf("README.md content = %q, want staged content", got)
+	}
+	headEntry := strings.Fields(gitCmd(t, repo.mountPath, "ls-tree", "HEAD", "README.md"))
+	if len(headEntry) == 0 || headEntry[0] != "100644" {
+		t.Fatalf("HEAD entry = %q, want mode 100644", headEntry)
+	}
+	st, err := os.Stat(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("worktree mode after content commit = %#o, want 0755", st.Mode().Perm())
+	}
+
+	assertGitStatus(t, repo.mountPath, map[string]string{"README.md": " M"})
+	gitCmd(t, repo.mountPath, "add", "README.md")
+	if summary := gitCmd(t, repo.mountPath, "diff", "--cached", "--summary"); !strings.Contains(summary, "mode change 100644 => 100755 README.md") {
+		t.Fatalf("staged summary = %q, want executable-bit change", summary)
+	}
+
+	preCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "make readme executable",
+	)
+
+	waitForHeadAndStatus(t, repo.mountPath, preCommitHEAD, map[string]string{})
+	waitForOverlayClean(t, repo)
+	st, err = os.Stat(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("README.md mode = %#o, want 0755", st.Mode().Perm())
+	}
+	if staged := gitCmd(t, repo.mountPath, "ls-files", "--stage", "README.md"); !strings.HasPrefix(staged, "100755 ") {
+		t.Fatalf("index entry = %q, want mode 100755", staged)
+	}
+}
+
+func TestE2EGitCommitSymlink(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	linkPath := filepath.Join(repo.mountPath, "readme-link")
+	if err := os.Symlink("README.md", linkPath); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(linkPath); err != nil || target != "README.md" {
+		t.Fatalf("readlink before commit = %q, %v", target, err)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{"readme-link": "??"})
+	gitCmd(t, repo.mountPath, "add", "readme-link")
+
+	preCommitHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "add readme symlink",
+	)
+
+	waitForHeadAndStatus(t, repo.mountPath, preCommitHEAD, map[string]string{})
+	waitForOverlayClean(t, repo)
+	if target, err := os.Readlink(linkPath); err != nil || target != "README.md" {
+		t.Fatalf("readlink after commit = %q, %v", target, err)
+	}
+	if staged := gitCmd(t, repo.mountPath, "ls-files", "--stage", "readme-link"); !strings.HasPrefix(staged, "120000 ") {
+		t.Fatalf("index entry = %q, want mode 120000", staged)
+	}
+
+	renamedPath := filepath.Join(repo.mountPath, "renamed-readme-link")
+	gitCmd(t, repo.mountPath, "mv", "readme-link", "renamed-readme-link")
+	assertGitStatus(t, repo.mountPath, map[string]string{"readme-link -> renamed-readme-link": "R "})
+	preRenameHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "rename readme symlink",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, preRenameHEAD, map[string]string{})
+	waitForOverlayClean(t, repo)
+	assertPathMissing(t, linkPath)
+	if target, err := os.Readlink(renamedPath); err != nil || target != "README.md" {
+		t.Fatalf("renamed readlink = %q, %v", target, err)
+	}
+	if staged := gitCmd(t, repo.mountPath, "ls-files", "--stage", "renamed-readme-link"); !strings.HasPrefix(staged, "120000 ") {
+		t.Fatalf("renamed index entry = %q, want mode 120000", staged)
+	}
+}
+
+func TestE2EGitResetHardAndStash(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	readmePath := filepath.Join(repo.mountPath, "README.md")
+	original := readFileEventually(t, readmePath)
+	if err := os.WriteFile(readmePath, []byte(original+"reset me\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readmePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	addedPath := filepath.Join(repo.mountPath, "added-before-reset.txt")
+	if err := os.WriteFile(addedPath, []byte("discard me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.mountPath, "add", "README.md", "added-before-reset.txt")
+	gitCmd(t, repo.mountPath, "reset", "--hard", "HEAD")
+	assertGitStatus(t, repo.mountPath, map[string]string{})
+	assertPathMissing(t, addedPath)
+	if got := readFileStr(t, readmePath); got != original {
+		t.Fatalf("README.md after reset --hard = %q, want original", got)
+	}
+	st, err := os.Stat(readmePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Fatalf("README.md mode after reset --hard = %#o, want 0644", st.Mode().Perm())
+	}
+
+	if err := os.WriteFile(readmePath, []byte(original+"stash me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	untrackedPath := filepath.Join(repo.mountPath, "stash-untracked.txt")
+	if err := os.WriteFile(untrackedPath, []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.mountPath, "stash", "push", "--include-untracked", "-m", "artifact-fs e2e")
+	assertGitStatus(t, repo.mountPath, map[string]string{})
+	assertPathMissing(t, untrackedPath)
+	if list := gitCmd(t, repo.mountPath, "stash", "list"); !strings.Contains(list, "artifact-fs e2e") {
+		t.Fatalf("stash list = %q", list)
+	}
+	gitCmd(t, repo.mountPath, "stash", "pop")
+	assertGitStatus(t, repo.mountPath, map[string]string{
+		"README.md":           " M",
+		"stash-untracked.txt": "??",
+	})
+	if got := readFileStr(t, readmePath); got != original+"stash me\n" {
+		t.Fatalf("README.md after stash pop = %q", got)
+	}
+	if got := readFileStr(t, untrackedPath); got != "untracked\n" {
+		t.Fatalf("untracked file after stash pop = %q", got)
+	}
+}
+
+func TestE2EGitPullFastForward(t *testing.T) {
+	if os.Getenv("AFS_E2E_REPO") != "" {
+		t.Skip("skipping remote advance against AFS_E2E_REPO")
+	}
+	repo := newMountedE2ERepo(t)
+
+	remoteURL := strings.TrimSpace(gitCmd(t, repo.mountPath, "remote", "get-url", "origin"))
+	writer := filepath.Join(t.TempDir(), "writer")
+	run(t, "", "git", "clone", "--branch", "main", remoteURL, writer)
+	writeTestFile(t, writer, "REMOTE-ONLY.md", "remote fast-forward content\n")
+	run(t, writer, "git", "add", "REMOTE-ONLY.md")
+	run(t, writer,
+		"git",
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "advance remote for pull",
+	)
+	run(t, writer, "git", "push", "origin", "main")
+
+	prePullHEAD := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	gitCmd(t, repo.mountPath, "pull", "--ff-only", "origin", "main")
+	waitForHeadAndStatus(t, repo.mountPath, prePullHEAD, map[string]string{})
+	waitForOverlayClean(t, repo)
+	if got := readFileStr(t, filepath.Join(repo.mountPath, "REMOTE-ONLY.md")); got != "remote fast-forward content\n" {
+		t.Fatalf("REMOTE-ONLY.md after pull = %q", got)
+	}
+	if tracking := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "origin/main")); tracking == prePullHEAD {
+		t.Fatalf("origin/main did not advance from %s", prePullHEAD)
+	}
+}
+
 func assertGitStatus(t *testing.T, dir string, want map[string]string) {
 	t.Helper()
 	got := gitStatusShortMap(t, dir)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("git status mismatch:\n got: %v\nwant: %v", got, want)
 	}
+}
+
+func waitForOverlayClean(t *testing.T, repo *mountedE2ERepo) {
+	t.Helper()
+	waitForCondition(t, 10*time.Second, "overlay reconciliation", func() (bool, string) {
+		status, err := repo.svc.Status(context.Background(), repoName)
+		if err != nil {
+			return false, err.Error()
+		}
+		if !status.DirtyOverlay {
+			return true, ""
+		}
+		return false, "overlay remains dirty"
+	})
 }
 
 func gitStatusShortMap(t *testing.T, dir string) map[string]string {

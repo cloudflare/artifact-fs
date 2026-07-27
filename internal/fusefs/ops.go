@@ -124,6 +124,13 @@ func (e *Engine) Create(ctx context.Context, path string, mode uint32) error {
 	return err
 }
 
+func (e *Engine) Symlink(ctx context.Context, path string, target string) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	_, err := e.Overlay.CreateSymlink(ctx, path, target)
+	return err
+}
+
 func (e *Engine) Unlink(ctx context.Context, path string) error {
 	e.Resolver.transition.RLock()
 	defer e.Resolver.transition.RUnlock()
@@ -159,7 +166,7 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 				return fs.ErrInvalid
 			}
 			if ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink {
-				return e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, newPath, dst.ObjectOID)
+				return e.Overlay.RenameAndMarkModifiedFromBase(ctx, oldPath, newPath, dst.ObjectOID, dst.Mode)
 			}
 		}
 		return e.Overlay.Rename(ctx, oldPath, newPath)
@@ -237,6 +244,36 @@ func (e *Engine) SetMtime(ctx context.Context, path string, t time.Time) error {
 		}
 	}
 	return e.Overlay.SetMtime(ctx, path, t)
+}
+
+func (e *Engine) SetMode(ctx context.Context, path string, mode uint32) error {
+	e.Resolver.transition.RLock()
+	defer e.Resolver.transition.RUnlock()
+	path = model.CleanPath(path)
+	if path == "." {
+		return fs.ErrInvalid
+	}
+	if _, ok, err := e.Overlay.Lookup(ctx, path); err != nil {
+		return err
+	} else if !ok {
+		n, err := e.Resolver.resolvePath(path)
+		if err != nil {
+			return err
+		}
+		switch n.Base.Type {
+		case "dir":
+			if err := e.Overlay.Mkdir(ctx, path, n.Base.Mode); err != nil {
+				return err
+			}
+		case "file":
+			if err := e.ensureOverlay(ctx, path); err != nil {
+				return err
+			}
+		default:
+			return fs.ErrInvalid
+		}
+	}
+	return e.Overlay.SetMode(ctx, path, mode)
 }
 
 func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
