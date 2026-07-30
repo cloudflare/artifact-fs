@@ -490,6 +490,7 @@ func TestE2E(t *testing.T) {
 }
 
 func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
+	t.Setenv("AFS_FUSE_DEBUG", "1")
 	repo := newMountedE2ERepo(t)
 
 	source := filepath.Join(repo.mountPath, "tree")
