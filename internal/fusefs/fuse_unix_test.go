@@ -441,13 +441,15 @@ func TestGetInodeAttributesHydrationFailureReturnsEIO(t *testing.T) {
 	}
 }
 
-func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.T) {
+func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 	repo := model.RepoConfig{ID: "repo"}
 	tests := []struct {
-		name    string
-		base    model.BaseNode
-		overlay map[string]model.OverlayEntry
-		want    uint64
+		name              string
+		base              model.BaseNode
+		overlay           map[string]model.OverlayEntry
+		want              uint64
+		wantHydrateCalls  int
+		wantReadBlobCalls int
 	}{
 		{
 			name: "known base file",
@@ -468,9 +470,10 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 			want: 4096,
 		},
 		{
-			name: "base symlink",
-			base: model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "symlink", Mode: 0o120000, ObjectOID: "blob", SizeState: "unknown"},
-			want: 0,
+			name:              "base symlink",
+			base:              model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "symlink", Mode: 0o120000, ObjectOID: "blob", SizeState: "unknown"},
+			want:              uint64(len("package.json")),
+			wantReadBlobCalls: 1,
 		},
 	}
 
@@ -480,7 +483,7 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 				&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": tt.base}},
 				&fakeOverlay{entries: tt.overlay},
 			)
-			h := &fakeLookupHydrator{size: 12}
+			h := &fakeLookupHydrator{size: 12, data: []byte("package.json")}
 			fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
 			op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
 
@@ -490,8 +493,11 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 			if op.Entry.Attributes.Size != tt.want {
 				t.Fatalf("lookup size = %d, want %d", op.Entry.Attributes.Size, tt.want)
 			}
-			if h.calls != 0 {
-				t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+			if h.calls != tt.wantHydrateCalls {
+				t.Fatalf("EnsureHydrated calls = %d, want %d", h.calls, tt.wantHydrateCalls)
+			}
+			if h.readBlobCalls != tt.wantReadBlobCalls {
+				t.Fatalf("ReadBlob calls = %d, want %d", h.readBlobCalls, tt.wantReadBlobCalls)
 			}
 		})
 	}
@@ -614,10 +620,12 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 }
 
 type fakeLookupHydrator struct {
-	size  int64
-	calls int
-	err   error
-	path  string
+	size          int64
+	calls         int
+	readBlobCalls int
+	err           error
+	path          string
+	data          []byte
 }
 
 func (f *fakeLookupHydrator) Enqueue(model.HydrationTask) {}
@@ -642,7 +650,11 @@ func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoCo
 }
 
 func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {
-	return nil, nil
+	f.readBlobCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.data, nil
 }
 
 func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }

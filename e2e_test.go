@@ -625,7 +625,16 @@ func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Rename(copiedMoved, emptyDestination); err != nil {
-		t.Fatalf("replace empty destination: %v", err)
+		sourceEntries, sourceReadErr := os.ReadDir(copiedMoved)
+		destinationEntries, destinationReadErr := os.ReadDir(emptyDestination)
+		t.Fatalf(
+			"replace empty destination: %v (source entries=%v, source read error=%v, destination entries=%v, destination read error=%v)",
+			err,
+			dirEntryNames(sourceEntries),
+			sourceReadErr,
+			dirEntryNames(destinationEntries),
+			destinationReadErr,
+		)
 	}
 	replacementInfo, err := os.Stat(emptyDestination)
 	if err != nil {
@@ -671,6 +680,14 @@ func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
 	if got := readFileStr(t, filepath.Join(rejectedDestination, "destination.txt")); got != "destination\n" {
 		t.Fatalf("rejected destination content = %q", got)
 	}
+}
+
+func dirEntryNames(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 func TestE2EVerifiedSource(t *testing.T) {
