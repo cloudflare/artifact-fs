@@ -19,6 +19,7 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 const repoName = "e2e-test"
@@ -490,7 +491,6 @@ func TestE2E(t *testing.T) {
 }
 
 func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
-	t.Setenv("AFS_FUSE_DEBUG", "1")
 	repo := newMountedE2ERepo(t)
 
 	source := filepath.Join(repo.mountPath, "tree")
@@ -625,7 +625,7 @@ func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(copiedMoved, emptyDestination); err != nil {
+	if err := unix.Rename(copiedMoved, emptyDestination); err != nil {
 		sourceEntries, sourceReadErr := os.ReadDir(copiedMoved)
 		destinationEntries, destinationReadErr := os.ReadDir(emptyDestination)
 		t.Fatalf(

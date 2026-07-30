@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1136,9 +1135,6 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 		Subtype:                 "artifact-fs",
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
-	}
-	if os.Getenv("AFS_FUSE_DEBUG") == "1" {
-		mountCfg.DebugLogger = log.New(os.Stderr, "fuse: ", 0)
 	}
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(mountCfg)
