@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -672,8 +673,8 @@ func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(rejectedSource, rejectedDestination); err == nil {
-		t.Fatal("rename over nonempty destination unexpectedly succeeded")
+	if err := unix.Rename(rejectedSource, rejectedDestination); !errors.Is(err, unix.ENOTEMPTY) {
+		t.Fatalf("rename over nonempty destination error = %v, want ENOTEMPTY", err)
 	}
 	if got := readFileStr(t, filepath.Join(rejectedSource, "source.txt")); got != "source\n" {
 		t.Fatalf("rejected source content = %q", got)
