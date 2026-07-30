@@ -46,15 +46,16 @@ type ArtifactFuse struct {
 }
 
 type InodeRef struct {
-	ID      fuseops.InodeID
-	Path    string
-	Type    string // file, dir, symlink
-	Mode    uint32
-	Gen     int64
-	Refcnt  int64
-	IsRoot  bool
-	Overlay bool
-	Stale   bool
+	ID       fuseops.InodeID
+	Path     string
+	Type     string // file, dir, symlink
+	Mode     uint32
+	Gen      int64
+	Refcnt   int64
+	IsRoot   bool
+	Overlay  bool
+	Stale    bool
+	Detached bool
 }
 
 type DirHandle struct {
@@ -183,7 +184,11 @@ func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 	for path, id := range fs.pathToInode {
 		if samePathOrDescendant(path, newPath) && !movingIDs[id] {
 			if replaced := fs.inodes[id]; replaced != nil {
-				replaced.Stale = true
+				if replaced.Type == "dir" {
+					replaced.Detached = true
+				} else {
+					replaced.Stale = true
+				}
 			}
 			delete(fs.pathToInode, path)
 		}
@@ -212,6 +217,9 @@ func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*Inode
 	parent, err := fs.requireInode(parentID, syscall.ENOENT)
 	if err != nil {
 		return nil, "", err
+	}
+	if parent.Detached {
+		return nil, "", syscall.ENOENT
 	}
 	return parent, cleanChildPath(parent.Path, name), nil
 }
@@ -432,6 +440,9 @@ func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInode
 	if err != nil {
 		return err
 	}
+	if parent.Detached {
+		return syscall.ENOENT
+	}
 
 	childPath := cleanChildPath(parent.Path, op.Name)
 
@@ -470,6 +481,12 @@ func (fs *ArtifactFuse) GetInodeAttributes(ctx context.Context, op *fuseops.GetI
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
+	}
+	if ref.Detached {
+		now := time.Now()
+		op.Attributes = inodeAttrs(ref.Mode, 4096, ref.Type, now, now)
+		op.AttributesExpiration = attrExpiry(time.Second)
+		return nil
 	}
 
 	if ref.IsRoot {
@@ -549,6 +566,9 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 	if err != nil {
 		return err
 	}
+	if ref.Detached {
+		return syscall.ESTALE
+	}
 	if op.Size != nil {
 		fs.closeCachedFilesForPath(ref.Path)
 		if err := fs.engine.Truncate(ctx, ref.Path, int64(*op.Size)); err != nil {
@@ -609,6 +629,15 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
+	}
+	if ref.Detached {
+		fs.mu.Lock()
+		handle := fs.nextHandleID
+		fs.nextHandleID++
+		fs.dirHandles[handle] = &DirHandle{inode: ref, gen: ref.Gen}
+		fs.mu.Unlock()
+		op.Handle = handle
+		return nil
 	}
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
 	entries, gen, commitTime, err := fs.resolver.ReaddirSnapshot(ctx, ref.Path)
@@ -961,6 +990,9 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	newParent, err := fs.requireInode(op.NewParent, syscall.ENOENT)
 	if err != nil {
 		return err
+	}
+	if oldParent.Detached || newParent.Detached {
+		return syscall.ENOENT
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
