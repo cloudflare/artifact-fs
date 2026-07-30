@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	iofs "io/fs"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -119,7 +120,7 @@ func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, 
 	f.entries[model.CleanPath(newPath)] = e
 	return nil
 }
-func (f *fakeOverlay) RenameTree(_ context.Context, oldPath, newPath string, basePaths []string) error {
+func (f *fakeOverlay) RenameTree(_ context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	moved := map[string]model.OverlayEntry{}
@@ -134,11 +135,19 @@ func (f *fakeOverlay) RenameTree(_ context.Context, oldPath, newPath string, bas
 		e.Path = newPath + strings.TrimPrefix(path, oldPath)
 		moved[e.Path] = e
 	}
-	for path, e := range moved {
-		f.entries[path] = e
+	for path := range f.entries {
+		if path == newPath || strings.HasPrefix(path, newPath+"/") {
+			delete(f.entries, path)
+		}
 	}
-	for _, path := range basePaths {
+	maps.Copy(f.entries, moved)
+	for _, path := range sourceBasePaths {
 		f.entries[path] = model.OverlayEntry{Path: path, Kind: model.OverlayKindDelete}
+	}
+	for _, path := range destinationBasePaths {
+		if _, overwritten := moved[path]; path != newPath && !overwritten {
+			f.entries[path] = model.OverlayEntry{Path: path, Kind: model.OverlayKindDelete}
+		}
 	}
 	return nil
 }

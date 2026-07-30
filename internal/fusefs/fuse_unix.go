@@ -426,6 +426,8 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 }
 
 func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
 	if err != nil {
 		return err
@@ -596,6 +598,8 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 }
 
 func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -644,6 +648,8 @@ func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error 
 }
 
 func (fs *ArtifactFuse) ReadDirPlus(_ context.Context, op *fuseops.ReadDirPlusOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	dh, err := fs.dirHandle(op.Handle)
 	if err != nil {
 		return err
@@ -883,6 +889,8 @@ func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSym
 }
 
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err
@@ -902,6 +910,8 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err

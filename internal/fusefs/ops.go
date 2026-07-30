@@ -205,7 +205,11 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 		return err
 	}
 
-	basePaths, err := e.snapshotTreePaths(ctx, oldPath)
+	destinationBasePaths, err := e.snapshotTreePaths(ctx, newPath)
+	if err != nil {
+		return err
+	}
+	sourceBasePaths, err := e.snapshotTreePaths(ctx, oldPath)
 	if err != nil {
 		return err
 	}
@@ -227,7 +231,7 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 			return err
 		}
 	}
-	return e.Overlay.RenameTree(ctx, oldPath, newPath, basePaths)
+	return e.Overlay.RenameTree(ctx, oldPath, newPath, sourceBasePaths, destinationBasePaths)
 }
 
 type resolvedTreeNode struct {

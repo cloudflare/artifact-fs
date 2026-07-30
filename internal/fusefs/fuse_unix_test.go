@@ -226,6 +226,7 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	child := fs.allocInode("source/nested/file.txt", "file", 0o100644, 1)
 	sibling := fs.allocInode("source-other/file.txt", "file", 0o100644, 1)
 	replaced := fs.allocInode("destination", "dir", 0o755, 1)
+	replacedChild := fs.allocInode("destination/nested/file.txt", "file", 0o100644, 1)
 	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
 	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
 	fs.mu.Unlock()
@@ -249,6 +250,18 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
 		t.Fatalf("replaced inode error = %v, want ESTALE", err)
 	}
+	if _, err := fs.requireInode(replacedChild.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced child inode error = %v, want ESTALE", err)
+	}
+	if got := fs.pathToInode["destination/nested/file.txt"]; got != child.ID {
+		t.Fatalf("destination child inode = %d, want source child %d", got, child.ID)
+	}
+	if err := fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: replacedChild.ID, N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.pathToInode["destination/nested/file.txt"]; got != child.ID {
+		t.Fatalf("forgetting replaced child removed source child mapping: got %d, want %d", got, child.ID)
+	}
 	if got := fs.dirHandles[1].inode.Path; got != "destination/nested" {
 		t.Fatalf("directory handle path = %q", got)
 	}
@@ -257,16 +270,31 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	}
 }
 
-func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
+func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		call func(*ArtifactFuse) error
 	}{
+		{name: "lookup", call: func(fs *ArtifactFuse) error {
+			return fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
+		}},
+		{name: "opendir", call: func(fs *ArtifactFuse) error {
+			return fs.OpenDir(context.Background(), &fuseops.OpenDirOp{})
+		}},
+		{name: "readdirplus", call: func(fs *ArtifactFuse) error {
+			return fs.ReadDirPlus(context.Background(), &fuseops.ReadDirPlusOp{})
+		}},
 		{name: "open", call: func(fs *ArtifactFuse) error {
 			return fs.OpenFile(context.Background(), &fuseops.OpenFileOp{})
 		}},
 		{name: "setattr", call: func(fs *ArtifactFuse) error {
 			return fs.SetInodeAttributes(context.Background(), &fuseops.SetInodeAttributesOp{})
+		}},
+		{name: "mkdir", call: func(fs *ArtifactFuse) error {
+			return fs.MkDir(context.Background(), &fuseops.MkDirOp{})
+		}},
+		{name: "rmdir", call: func(fs *ArtifactFuse) error {
+			return fs.RmDir(context.Background(), &fuseops.RmDirOp{})
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

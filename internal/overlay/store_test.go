@@ -628,7 +628,7 @@ func TestRenameTreeWhiteoutsEveryTrackedSourcePath(t *testing.T) {
 	}
 
 	basePaths := []string{"src", "src/a.txt", "src/deleted.txt", "src/link"}
-	if err := s.RenameTree(ctx, "src", "dst", basePaths); err != nil {
+	if err := s.RenameTree(ctx, "src", "dst", basePaths, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -666,7 +666,7 @@ func TestRenameTreeReplacesEmptyOverlayDestination(t *testing.T) {
 	}
 	replaced, _ := s.Get("dst")
 
-	if err := s.RenameTree(ctx, "src", "dst", nil); err != nil {
+	if err := s.RenameTree(ctx, "src", "dst", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -675,6 +675,120 @@ func TestRenameTreeReplacesEmptyOverlayDestination(t *testing.T) {
 	}
 	if e, ok := s.Get("dst/a.txt"); !ok || e.IsDeleted() {
 		t.Fatalf("moved child = %+v, ok=%v", e, ok)
+	}
+}
+
+func TestRenameTreeRejectsNonEmptyOverlayDestinationWithoutMutation(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/source.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child, err := s.CreateFile(ctx, "dst/concurrent.txt", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, child.Path, 0, []byte("preserve me")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RenameTree(ctx, "src", "dst", nil, nil); !os.IsExist(err) {
+		t.Fatalf("RenameTree error = %v, want os.ErrExist", err)
+	}
+
+	for _, path := range []string{"src", "src/source.txt", "dst", "dst/concurrent.txt"} {
+		if e, ok := s.Get(path); !ok || e.IsDeleted() {
+			t.Fatalf("entry %q = %+v, ok=%v; want preserved", path, e, ok)
+		}
+	}
+	if data, err := os.ReadFile(child.BackingPath); err != nil {
+		t.Fatal(err)
+	} else if string(data) != "preserve me" {
+		t.Fatalf("destination child content = %q", data)
+	}
+	if _, ok := s.Get("dst/source.txt"); ok {
+		t.Fatal("source child appeared at rejected destination")
+	}
+}
+
+func TestRenameTreeAllowsDeletedDestinationDescendants(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/source.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "dst/deleted.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RenameTree(ctx, "src", "dst", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := s.Get("dst/source.txt"); !ok || e.IsDeleted() {
+		t.Fatalf("moved child = %+v, ok=%v", e, ok)
+	}
+	if _, ok := s.Get("dst/deleted.txt"); ok {
+		t.Fatal("destination tombstone survived replacement")
+	}
+}
+
+func TestRenameTreeKeepsReplacedBaseDescendantsHidden(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "src/overlap", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/source.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "dst/overlap"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "dst/gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	destinationBasePaths := []string{
+		"dst",
+		"dst/gone.txt",
+		"dst/overlap",
+		"dst/overlap/stale.txt",
+	}
+	if err := s.RenameTree(ctx, "src", "dst", nil, destinationBasePaths); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"dst/gone.txt", "dst/overlap/stale.txt"} {
+		if e, ok := s.Get(path); !ok || !e.IsDeleted() {
+			t.Fatalf("replaced base path %q = %+v, ok=%v; want tombstone", path, e, ok)
+		}
+	}
+	if e, ok := s.Get("dst/overlap"); !ok || e.Kind != model.OverlayKindMkdir {
+		t.Fatalf("incoming overlapping directory = %+v, ok=%v", e, ok)
+	}
+	if e, ok := s.Get("dst/source.txt"); !ok || e.IsDeleted() {
+		t.Fatalf("incoming source file = %+v, ok=%v", e, ok)
 	}
 }
 

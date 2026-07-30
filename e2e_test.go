@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -60,6 +61,26 @@ func createLocalTestRepo(t *testing.T) string {
 			t.Fatal(err)
 		}
 		writeTestFile(t, dir, "package.json", `{"name":"`+pkg+`","version":"0.0.1"}`+"\n")
+	}
+	wranglerDir := filepath.Join(workDir, "packages", "wrangler")
+	for _, dir := range []string{
+		filepath.Join(wranglerDir, "bin"),
+		filepath.Join(wranglerDir, "nested", "deep"),
+		filepath.Join(wranglerDir, "src"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(wranglerDir, "src"), "index.js", "export function main() {\n  return 'wrangler';\n}\n")
+	writeTestFile(t, filepath.Join(wranglerDir, "nested", "deep"), "config.json", `{"compatibility_date":"2026-07-30"}`+"\n")
+	scriptPath := filepath.Join(wranglerDir, "bin", "run.sh")
+	writeTestFile(t, filepath.Dir(scriptPath), filepath.Base(scriptPath), "#!/bin/sh\necho wrangler\n")
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("package.json", filepath.Join(wranglerDir, "manifest-link")); err != nil {
+		t.Fatal(err)
 	}
 	run(t, workDir, "git", "add", "-A")
 	run(t, workDir, "git", "commit", "-m", "add packages directory")
@@ -465,6 +486,190 @@ func TestE2E(t *testing.T) {
 	case <-errCh:
 	case <-time.After(10 * time.Second):
 		t.Log("daemon did not exit within 10s")
+	}
+}
+
+func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	source := filepath.Join(repo.mountPath, "tree")
+	deep := filepath.Join(source, "nested", "deeper")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(deep, "payload.bin")
+	initialBinary := []byte{0x00, 0x01, 0x02, 0xfe, 0xff}
+	if err := os.WriteFile(binaryPath, initialBinary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(source, "run.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho moved\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("nested", "deeper", "payload.bin"), filepath.Join(source, "payload-link")); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(repo.mountPath, "tree-sibling")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "untouched.txt"), []byte("sibling\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryInfo, err := os.Stat(binaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openFile, err := os.OpenFile(binaryPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openFile.Close()
+	openDir, err := os.Open(deep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openDir.Close()
+
+	run(t, repo.mountPath, "mv", "tree", "tree-moved")
+	moved := filepath.Join(repo.mountPath, "tree-moved")
+	movedBinary := filepath.Join(moved, "nested", "deeper", "payload.bin")
+	assertPathMissing(t, source)
+	assertPathExists(t, movedBinary)
+	movedInfo, err := os.Stat(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedBinaryInfo, err := os.Stat(movedBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(sourceInfo, movedInfo) {
+		t.Fatal("directory inode identity changed across CLI mv")
+	}
+	if !os.SameFile(binaryInfo, movedBinaryInfo) {
+		t.Fatal("descendant inode identity changed across CLI mv")
+	}
+	if _, err := openFile.WriteAt([]byte{0xaa, 0xbb}, 1); err != nil {
+		t.Fatalf("write through moved open handle: %v", err)
+	}
+	if err := openFile.Sync(); err != nil {
+		t.Fatalf("sync moved open handle: %v", err)
+	}
+	if _, err := openFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	gotThroughHandle, err := io.ReadAll(openFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBinary := []byte{0x00, 0xaa, 0xbb, 0xfe, 0xff}
+	if !bytes.Equal(gotThroughHandle, wantBinary) {
+		t.Fatalf("open handle content = %v, want %v", gotThroughHandle, wantBinary)
+	}
+	if got, err := os.ReadFile(movedBinary); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, wantBinary) {
+		t.Fatalf("moved binary content = %v, want %v", got, wantBinary)
+	}
+	names, err := openDir.Readdirnames(-1)
+	if err != nil {
+		t.Fatalf("read moved open directory handle: %v", err)
+	}
+	if !slices.Contains(names, "payload.bin") {
+		t.Fatalf("moved directory handle entries = %v", names)
+	}
+	if target, err := os.Readlink(filepath.Join(moved, "payload-link")); err != nil {
+		t.Fatal(err)
+	} else if target != filepath.Join("nested", "deeper", "payload.bin") {
+		t.Fatalf("moved symlink target = %q", target)
+	}
+	if info, err := os.Stat(filepath.Join(moved, "run.sh")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("moved executable mode = %#o", info.Mode().Perm())
+	}
+	if got := readFileStr(t, filepath.Join(sibling, "untouched.txt")); got != "sibling\n" {
+		t.Fatalf("prefix sibling content = %q", got)
+	}
+
+	run(t, repo.mountPath, "cp", "-R", "packages/wrangler", "wrangler-copy")
+	copied := filepath.Join(repo.mountPath, "wrangler-copy")
+	if got := readFileStr(t, filepath.Join(copied, "nested", "deep", "config.json")); !strings.Contains(got, "compatibility_date") {
+		t.Fatalf("recursive copy nested content = %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(copied, "manifest-link")); err != nil {
+		t.Fatal(err)
+	} else if target != "package.json" {
+		t.Fatalf("recursive copy symlink target = %q", target)
+	}
+	run(t, repo.mountPath, "mv", "wrangler-copy", "wrangler-copy-moved")
+	copiedMoved := filepath.Join(repo.mountPath, "wrangler-copy-moved")
+	assertPathMissing(t, copied)
+	assertPathExists(t, filepath.Join(copiedMoved, "src", "index.js"))
+
+	emptyDestination := filepath.Join(repo.mountPath, "empty-destination")
+	if err := os.Mkdir(emptyDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	replacedInfo, err := os.Stat(emptyDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(copiedMoved, emptyDestination); err != nil {
+		t.Fatalf("replace empty destination: %v", err)
+	}
+	replacementInfo, err := os.Stat(emptyDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(replacedInfo, replacementInfo) {
+		t.Fatal("replaced destination retained its stale inode identity")
+	}
+	assertPathExists(t, filepath.Join(emptyDestination, "bin", "run.sh"))
+
+	run(t, repo.mountPath, "rm", "-rf", "packages/miniflare")
+	trackedReplacementSource := filepath.Join(repo.mountPath, "tracked-replacement-source")
+	if err := os.Mkdir(trackedReplacementSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trackedReplacementSource, "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo.mountPath, "mv", "tracked-replacement-source", "packages/miniflare")
+	assertPathExists(t, filepath.Join(repo.mountPath, "packages", "miniflare", "incoming.txt"))
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "miniflare", "package.json"))
+
+	rejectedSource := filepath.Join(repo.mountPath, "rejected-source")
+	rejectedDestination := filepath.Join(repo.mountPath, "rejected-destination")
+	if err := os.MkdirAll(rejectedSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rejectedSource, "source.txt"), []byte("source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rejectedDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(rejectedSource, rejectedDestination); err == nil {
+		t.Fatal("rename over nonempty destination unexpectedly succeeded")
+	}
+	if got := readFileStr(t, filepath.Join(rejectedSource, "source.txt")); got != "source\n" {
+		t.Fatalf("rejected source content = %q", got)
+	}
+	if got := readFileStr(t, filepath.Join(rejectedDestination, "destination.txt")); got != "destination\n" {
+		t.Fatalf("rejected destination content = %q", got)
 	}
 }
 

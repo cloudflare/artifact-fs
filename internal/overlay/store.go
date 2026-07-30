@@ -396,7 +396,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 		return nil
 	}
 	if e.Kind == model.OverlayKindMkdir {
-		return s.renameTreeLocked(ctx, oldPath, newPath, nil)
+		return s.renameTreeLocked(ctx, oldPath, newPath, nil, nil)
 	}
 	newBacking := e.BackingPath
 	newKind := model.OverlayKindRename
@@ -459,13 +459,13 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	return nil
 }
 
-func (s *Store) RenameTree(ctx context.Context, oldPath, newPath string, basePaths []string) error {
+func (s *Store) RenameTree(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.renameTreeLocked(ctx, model.CleanPath(oldPath), model.CleanPath(newPath), basePaths)
+	return s.renameTreeLocked(ctx, model.CleanPath(oldPath), model.CleanPath(newPath), sourceBasePaths, destinationBasePaths)
 }
 
-func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, basePaths []string) error {
+func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
 	if oldPath == newPath {
 		e, ok, err := s.Lookup(ctx, oldPath)
 		if err != nil {
@@ -504,17 +504,37 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, b
 	if err != nil {
 		return err
 	}
-	tracked := make(map[string]bool, len(basePaths))
-	for _, path := range basePaths {
+	for _, e := range destinationEntries {
+		if e.IsDeleted() {
+			continue
+		}
+		if e.Path == newPath && e.Kind == model.OverlayKindMkdir {
+			continue
+		}
+		if e.Path == newPath {
+			return iofs.ErrInvalid
+		}
+		return os.ErrExist
+	}
+	tracked := make(map[string]bool, len(sourceBasePaths))
+	for _, path := range sourceBasePaths {
 		path = model.CleanPath(path)
 		if path == oldPath || strings.HasPrefix(path, oldPath+"/") {
 			tracked[path] = true
+		}
+	}
+	replacedBasePaths := make(map[string]bool, len(destinationBasePaths))
+	for _, path := range destinationBasePaths {
+		path = model.CleanPath(path)
+		if strings.HasPrefix(path, newPath+"/") {
+			replacedBasePaths[path] = true
 		}
 	}
 
 	now := time.Now().UnixNano()
 	moved := make([]model.OverlayEntry, 0, len(sourceEntries))
 	movedBackings := make(map[string]bool, len(sourceEntries))
+	movedPaths := make(map[string]bool, len(sourceEntries))
 	for _, e := range sourceEntries {
 		if e.IsDeleted() {
 			continue
@@ -547,6 +567,7 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, b
 		if e.BackingPath != "" {
 			movedBackings[e.BackingPath] = true
 		}
+		movedPaths[e.Path] = true
 		moved = append(moved, e)
 	}
 
@@ -577,6 +598,14 @@ func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, b
 		}
 	}
 	for path := range tracked {
+		if _, err := insert.ExecContext(ctx, path, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, path); err != nil {
+			return err
+		}
+	}
+	for path := range replacedBasePaths {
+		if movedPaths[path] {
+			continue
+		}
 		if _, err := insert.ExecContext(ctx, path, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, path); err != nil {
 			return err
 		}
