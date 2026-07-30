@@ -247,12 +247,8 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 			t.Fatalf("inode %d path = %q, want %q", id, got.Path, want)
 		}
 	}
-	replacedRef, err := fs.requireInode(replaced.ID, syscall.ESTALE)
-	if err != nil {
-		t.Fatalf("replaced directory inode error = %v, want detached inode", err)
-	}
-	if !replacedRef.Detached {
-		t.Fatal("replaced directory inode was not detached")
+	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced inode error = %v, want ESTALE", err)
 	}
 	if _, err := fs.requireInode(replacedChild.ID, syscall.ESTALE); err != syscall.ESTALE {
 		t.Fatalf("replaced child inode error = %v, want ESTALE", err)
@@ -271,43 +267,6 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	}
 	if got := fs.fileHandles[2].path; got != "destination/nested/file.txt" {
 		t.Fatalf("file handle path = %q", got)
-	}
-}
-
-func TestDetachedReplacedDirectoryKeepsOpenHandleWithoutExposingReplacement(t *testing.T) {
-	fs := NewArtifactFuse(model.RepoConfig{}, nil, nil)
-	fs.mu.Lock()
-	replaced := fs.allocInode("destination", "dir", 0o755, 1)
-	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{
-		ID:   replaced.ID,
-		Path: replaced.Path,
-		Type: replaced.Type,
-		Mode: replaced.Mode,
-		Gen:  replaced.Gen,
-	}}
-	fs.mu.Unlock()
-
-	fs.moveInodePath("source", "destination")
-
-	getattr := &fuseops.GetInodeAttributesOp{Inode: replaced.ID}
-	if err := fs.GetInodeAttributes(context.Background(), getattr); err != nil {
-		t.Fatalf("getattr detached directory: %v", err)
-	}
-	if getattr.Attributes.Mode&os.ModeDir == 0 {
-		t.Fatalf("detached mode = %v, want directory", getattr.Attributes.Mode)
-	}
-	if err := fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{
-		Parent: replaced.ID,
-		Name:   "incoming.txt",
-	}); err != syscall.ENOENT {
-		t.Fatalf("lookup through detached directory = %v, want ENOENT", err)
-	}
-	readdir := &fuseops.ReadDirOp{Handle: 1, Dst: make([]byte, 4096)}
-	if err := fs.ReadDir(context.Background(), readdir); err != nil {
-		t.Fatalf("readdir detached directory: %v", err)
-	}
-	if readdir.BytesRead != 0 {
-		t.Fatalf("detached directory returned %d bytes, want empty", readdir.BytesRead)
 	}
 }
 

@@ -854,10 +854,69 @@ func testE2ERecursiveCopyMoveAndReplace(t *testing.T) {
 		t.Fatal("replaced destination retained its stale inode identity")
 	}
 	assertPathExists(t, filepath.Join(emptyDestination, "bin", "run.sh"))
-	if names, err := replacedHandle.Readdirnames(-1); err != nil {
-		t.Fatalf("read replaced open destination handle: %v", err)
-	} else if len(names) != 0 {
-		t.Fatalf("replaced open destination handle entries = %v, want empty", names)
+	assertReplacedDirectoryHandleMatchesNative(t, replacedHandle, filepath.Join("bin", "run.sh"))
+}
+
+func assertReplacedDirectoryHandleMatchesNative(t *testing.T, mountedHandle *os.File, incomingChild string) {
+	t.Helper()
+	nativeRoot := t.TempDir()
+	nativeSource := filepath.Join(nativeRoot, "source")
+	nativeDestination := filepath.Join(nativeRoot, "destination")
+	if err := os.MkdirAll(filepath.Join(nativeSource, filepath.Dir(incomingChild)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeSource, incomingChild), []byte("native\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nativeDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nativeHandle, err := os.Open(nativeDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nativeHandle.Close()
+	if err := unix.Rename(nativeSource, nativeDestination); err != nil {
+		t.Fatalf("native replace empty destination: %v", err)
+	}
+
+	nativeNames, nativeReadErr := nativeHandle.Readdirnames(-1)
+	mountedNames, mountedReadErr := mountedHandle.Readdirnames(-1)
+	if nativeMissing, mountedMissing := os.IsNotExist(nativeReadErr), os.IsNotExist(mountedReadErr); nativeMissing != mountedMissing {
+		t.Fatalf(
+			"readdir replaced destination differs from native filesystem: native names=%v error=%v, mounted names=%v error=%v",
+			nativeNames,
+			nativeReadErr,
+			mountedNames,
+			mountedReadErr,
+		)
+	}
+	if nativeReadErr != nil && !os.IsNotExist(nativeReadErr) {
+		t.Fatalf("native readdir replaced destination: %v", nativeReadErr)
+	}
+	if mountedReadErr != nil && !os.IsNotExist(mountedReadErr) {
+		t.Fatalf("mounted readdir replaced destination: %v", mountedReadErr)
+	}
+	if nativeReadErr == nil && !slices.Equal(nativeNames, mountedNames) {
+		t.Fatalf("replaced destination entries differ from native filesystem: native=%v mounted=%v", nativeNames, mountedNames)
+	}
+	if len(nativeNames) != 0 || len(mountedNames) != 0 {
+		t.Fatalf("replaced destination handle exposed entries: native=%v mounted=%v", nativeNames, mountedNames)
+	}
+
+	nativeChildFD, nativeOpenErr := unix.Openat(int(nativeHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if nativeChildFD >= 0 {
+		_ = unix.Close(nativeChildFD)
+	}
+	mountedChildFD, mountedOpenErr := unix.Openat(int(mountedHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if mountedChildFD >= 0 {
+		_ = unix.Close(mountedChildFD)
+	}
+	if !errors.Is(nativeOpenErr, unix.ENOENT) {
+		t.Fatalf("native openat replaced destination = %v, want ENOENT", nativeOpenErr)
+	}
+	if !errors.Is(mountedOpenErr, unix.ENOENT) {
+		t.Fatalf("mounted openat replaced destination = %v, want native ENOENT", mountedOpenErr)
 	}
 }
 
