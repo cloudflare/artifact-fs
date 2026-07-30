@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
@@ -146,23 +147,19 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 		_, err := e.Resolver.resolvePath(oldPath)
 		return err
 	}
-	if ov, ok, lookupErr := e.Overlay.Lookup(ctx, oldPath); lookupErr != nil {
-		return lookupErr
-	} else if ok {
-		if ov.IsDeleted() {
-			return os.ErrNotExist
-		}
-		if ov.Kind == model.OverlayKindMkdir {
-			if _, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), oldPath); err != nil {
-				return err
-			} else if ok {
-				return fs.ErrInvalid
-			}
-		}
+	source, err := e.Resolver.resolvePath(oldPath)
+	if err != nil {
+		return err
+	}
+	if resolvedNodeType(source) == "dir" {
+		return e.renameDirectory(ctx, oldPath, newPath)
+	}
+	if source.FromOverlay {
+		ov := source.Overlay
 		if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
 			return err
 		} else if ok {
-			if dst.Type == "dir" || ov.Kind == model.OverlayKindMkdir {
+			if dst.Type == "dir" {
 				return fs.ErrInvalid
 			}
 			if ov.Kind == model.OverlayKindCreate || ov.Kind == model.OverlayKindSymlink {
@@ -170,18 +167,6 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 			}
 		}
 		return e.Overlay.Rename(ctx, oldPath, newPath)
-	}
-	if n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), oldPath); err != nil {
-		return err
-	} else if ok && n.Type == "dir" {
-		return fs.ErrInvalid
-	}
-	n, err := e.Resolver.resolvePath(oldPath)
-	if err != nil {
-		return err
-	}
-	if n.Base.Type == "dir" {
-		return fs.ErrInvalid
 	}
 	if dst, ok, err := e.Resolver.Snapshot.LookupNode(ctx, e.Resolver.Generation(), newPath); err != nil {
 		return err
@@ -192,6 +177,121 @@ func (e *Engine) Rename(ctx context.Context, oldPath, newPath string) error {
 		return err
 	}
 	return e.Overlay.Rename(ctx, oldPath, newPath)
+}
+
+func resolvedNodeType(n ResolvedNode) string {
+	if n.FromOverlay {
+		return n.Overlay.NodeType()
+	}
+	return n.Base.Type
+}
+
+func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) error {
+	if oldPath == "." || newPath == "." || strings.HasPrefix(newPath, oldPath+"/") {
+		return fs.ErrInvalid
+	}
+	if destination, err := e.Resolver.resolvePath(newPath); err == nil {
+		if resolvedNodeType(destination) != "dir" {
+			return fs.ErrInvalid
+		}
+		children, err := e.Resolver.readdirTypedAt(ctx, newPath, e.Resolver.Generation())
+		if err != nil {
+			return err
+		}
+		if len(children) != 0 {
+			return os.ErrExist
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	basePaths, err := e.snapshotTreePaths(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	visible, err := e.mergedTree(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	for _, n := range visible {
+		if n.node.FromOverlay {
+			continue
+		}
+		if n.node.Base.Type == "dir" {
+			if err := e.Overlay.Mkdir(ctx, n.path, n.node.Base.Mode); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := e.ensureOverlay(ctx, n.path); err != nil {
+			return err
+		}
+	}
+	return e.Overlay.RenameTree(ctx, oldPath, newPath, basePaths)
+}
+
+type resolvedTreeNode struct {
+	path string
+	node ResolvedNode
+}
+
+func (e *Engine) mergedTree(ctx context.Context, root string) ([]resolvedTreeNode, error) {
+	var out []resolvedTreeNode
+	var walk func(string) error
+	walk = func(path string) error {
+		n, err := e.Resolver.resolvePath(path)
+		if err != nil {
+			return err
+		}
+		out = append(out, resolvedTreeNode{path: path, node: n})
+		if resolvedNodeType(n) != "dir" {
+			return nil
+		}
+		children, err := e.Resolver.readdirTypedAt(ctx, path, e.Resolver.Generation())
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if err := walk(model.CleanPath(filepath.Join(path, child.Name))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(root); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (e *Engine) snapshotTreePaths(ctx context.Context, root string) ([]string, error) {
+	gen := e.Resolver.Generation()
+	n, ok, err := e.Resolver.Snapshot.LookupNode(ctx, gen, root)
+	if err != nil || !ok {
+		return nil, err
+	}
+	var out []string
+	var walk func(model.BaseNode) error
+	walk = func(n model.BaseNode) error {
+		out = append(out, n.Path)
+		if n.Type != "dir" {
+			return nil
+		}
+		children, err := e.Resolver.Snapshot.ListChildren(gen, n.Path)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if err := walk(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(n); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (e *Engine) Mkdir(ctx context.Context, path string, mode uint32) error {

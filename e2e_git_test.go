@@ -211,6 +211,34 @@ func TestE2EGitStatusPorcelain(t *testing.T) {
 	})
 }
 
+func TestE2EGitRenameTrackedDirectory(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	previousHead := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+
+	gitCmd(t, repo.mountPath, "mv", "packages/wrangler", "packages/wrangler-renamed")
+
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	renamedManifest := filepath.Join(repo.mountPath, "packages", "wrangler-renamed", "package.json")
+	if got := readFileStr(t, renamedManifest); !strings.Contains(got, `"name":"wrangler"`) {
+		t.Fatalf("renamed package manifest = %q", got)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{
+		"packages/wrangler/package.json -> packages/wrangler-renamed/package.json": "R ",
+	})
+
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "rename tracked directory",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, previousHead, map[string]string{})
+	waitForOverlayClean(t, repo)
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	if got := readFileStr(t, renamedManifest); !strings.Contains(got, `"name":"wrangler"`) {
+		t.Fatalf("renamed package manifest after reconcile = %q", got)
+	}
+}
+
 func TestE2EGitCheckoutBranchSwitch(t *testing.T) {
 	repo := newMountedE2ERepo(t)
 

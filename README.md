@@ -289,6 +289,7 @@ Work in progress. The table reflects operations exercised by the FUSE E2E suite;
 | Create new file | Supported | Persisted in writable overlay |
 | Write / append to file | Supported | Copy-on-write for tracked files |
 | Rename file | Supported | Works for both overlay and tracked (snapshot-only) files |
+| Rename directory | Supported | Moves tracked and overlay-created directory trees |
 | Delete file (`rm`) | Supported | Whiteout recorded in overlay |
 | `rmdir` | Supported | Checks directory is empty first |
 | Truncate | Supported | Hydrates blob before truncating |

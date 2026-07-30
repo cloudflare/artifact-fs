@@ -219,6 +219,44 @@ func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) 
 	}
 }
 
+func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
+	fs := NewArtifactFuse(model.RepoConfig{}, nil, nil)
+	fs.mu.Lock()
+	source := fs.allocInode("source", "dir", 0o755, 1)
+	child := fs.allocInode("source/nested/file.txt", "file", 0o100644, 1)
+	sibling := fs.allocInode("source-other/file.txt", "file", 0o100644, 1)
+	replaced := fs.allocInode("destination", "dir", 0o755, 1)
+	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
+	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
+	fs.mu.Unlock()
+
+	fs.moveInodePath("source", "destination")
+	fs.moveOpenHandles("source", "destination")
+
+	for id, want := range map[fuseops.InodeID]string{
+		source.ID:  "destination",
+		child.ID:   "destination/nested/file.txt",
+		sibling.ID: "source-other/file.txt",
+	} {
+		got, err := fs.requireInode(id, syscall.ESTALE)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Path != want {
+			t.Fatalf("inode %d path = %q, want %q", id, got.Path, want)
+		}
+	}
+	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced inode error = %v, want ESTALE", err)
+	}
+	if got := fs.dirHandles[1].inode.Path; got != "destination/nested" {
+		t.Fatalf("directory handle path = %q", got)
+	}
+	if got := fs.fileHandles[2].path; got != "destination/nested/file.txt" {
+		t.Fatalf("file handle path = %q", got)
+	}
+}
+
 func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string

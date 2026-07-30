@@ -10,6 +10,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
 type fakeBatchHydrator struct {
@@ -292,5 +293,55 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}
 	if string(after) != "new" {
 		t.Fatalf("read after write = %q, want new", after)
+	}
+}
+
+func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	ov, err := overlaystore.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+
+	cachePath := filepath.Join(tmp, "blob")
+	if err := os.WriteFile(cachePath, []byte("tracked content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &fakeSnapshot{
+		nodes: map[string]model.BaseNode{
+			"src":       {Path: "src", Type: "dir", Mode: 0o40000},
+			"src/a.txt": {Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"},
+		},
+		kids: map[string][]model.BaseNode{
+			"src": {{Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"}},
+		},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+	resolver.SetGeneration(1)
+	engine := &Engine{
+		Repo:     cfg,
+		Resolver: resolver,
+		Overlay:  ov,
+		Hydrator: &fakeBatchHydrator{path: cachePath},
+	}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := engine.Read(context.Background(), "dst/a.txt", 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tracked content" {
+		t.Fatalf("moved content = %q", got)
+	}
+	if _, err := resolver.ResolvePath("src/a.txt"); !os.IsNotExist(err) {
+		t.Fatalf("source child resolve err = %v, want not exist", err)
 	}
 }

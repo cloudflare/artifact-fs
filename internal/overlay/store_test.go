@@ -5,7 +5,6 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -558,7 +557,7 @@ func TestRenamePreservesDirectoryKindAndRepairsMode(t *testing.T) {
 	}
 }
 
-func TestRenameRejectsNonEmptyOverlayDirectory(t *testing.T) {
+func TestRenameMovesNonEmptyOverlayDirectory(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
 
@@ -568,14 +567,114 @@ func TestRenameRejectsNonEmptyOverlayDirectory(t *testing.T) {
 	if _, err := s.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Rename(ctx, "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("err = %v, want fs.ErrInvalid", err)
+	if err := s.Mkdir(ctx, "src/nested", 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := s.Get("src"); !ok {
-		t.Fatal("source directory should remain after rejected rename")
+	if _, err := s.CreateFile(ctx, "src/nested/b.txt", 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := s.Get("dst"); ok {
-		t.Fatal("destination directory should not exist after rejected rename")
+	if _, err := s.WriteFile(ctx, "src/nested/b.txt", 0, []byte("nested")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Rename(ctx, "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"src", "src/a.txt", "src/nested", "src/nested/b.txt"} {
+		if _, ok := s.Get(path); ok {
+			t.Fatalf("source entry %q still exists", path)
+		}
+	}
+	for _, path := range []string{"dst", "dst/a.txt", "dst/nested", "dst/nested/b.txt"} {
+		if e, ok := s.Get(path); !ok || e.IsDeleted() {
+			t.Fatalf("destination entry %q = %+v, ok=%v", path, e, ok)
+		}
+	}
+	moved, _ := s.Get("dst/nested/b.txt")
+	if data, err := os.ReadFile(moved.BackingPath); err != nil {
+		t.Fatal(err)
+	} else if string(data) != "nested" {
+		t.Fatalf("moved content = %q, want nested", data)
+	}
+}
+
+func TestRenameTreeWhiteoutsEveryTrackedSourcePath(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	baseFile := model.BaseNode{Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "aaa"}
+	cacheTestBlob(t, cfg, baseFile.ObjectOID)
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, baseFile.Path, baseFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "src/nested", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/nested/new.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSymlink(ctx, "src/link", "../target"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE overlay_entries SET source_oid=?, source_mode=? WHERE path=?`, "bbb", 0o120000, "src/link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "src/deleted.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	basePaths := []string{"src", "src/a.txt", "src/deleted.txt", "src/link"}
+	if err := s.RenameTree(ctx, "src", "dst", basePaths); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range basePaths {
+		if e, ok := s.Get(path); !ok || !e.IsDeleted() {
+			t.Fatalf("tracked source %q = %+v, ok=%v; want whiteout", path, e, ok)
+		}
+	}
+	if e, ok := s.Get("dst/a.txt"); !ok || e.Kind != model.OverlayKindRename || e.TargetPath != "src/a.txt" {
+		t.Fatalf("moved tracked file = %+v, ok=%v", e, ok)
+	}
+	if e, ok := s.Get("dst/nested/new.txt"); !ok || e.Kind != model.OverlayKindCreate {
+		t.Fatalf("moved untracked file = %+v, ok=%v", e, ok)
+	}
+	if e, ok := s.Get("dst/link"); !ok || e.Kind != model.OverlayKindSymlink || e.SourceOID != "" || e.TargetPath != "../target" {
+		t.Fatalf("moved tracked symlink = %+v, ok=%v", e, ok)
+	}
+	if _, ok := s.Get("dst/deleted.txt"); ok {
+		t.Fatal("deleted tracked child should not be recreated at destination")
+	}
+}
+
+func TestRenameTreeReplacesEmptyOverlayDestination(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateFile(ctx, "src/a.txt", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	replaced, _ := s.Get("dst")
+
+	if err := s.RenameTree(ctx, "src", "dst", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(replaced.BackingPath); !os.IsNotExist(err) {
+		t.Fatalf("replaced destination backing still exists: %v", err)
+	}
+	if e, ok := s.Get("dst/a.txt"); !ok || e.IsDeleted() {
+		t.Fatalf("moved child = %+v, ok=%v", e, ok)
 	}
 }
 

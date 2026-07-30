@@ -238,6 +238,18 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("fs/rename_nonempty_overlay_directory", func(t *testing.T) {
+		oldPath := filepath.Join(mountPath, "e2e-test-dir")
+		newPath := filepath.Join(mountPath, "e2e-renamed-dir")
+		if err := os.Rename(oldPath, newPath); err != nil {
+			t.Fatal(err)
+		}
+		assertPathMissing(t, oldPath)
+		if got := readFileStr(t, filepath.Join(newPath, "nested.txt")); got != "nested\n" {
+			t.Fatalf("renamed nested file = %q", got)
+		}
+	})
+
 	t.Run("fs/rename", func(t *testing.T) {
 		src := filepath.Join(mountPath, "e2e-test-file.txt")
 		dst := filepath.Join(mountPath, "e2e-renamed.txt")
@@ -264,8 +276,8 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("fs/rmdir", func(t *testing.T) {
-		os.Remove(filepath.Join(mountPath, "e2e-test-dir", "nested.txt"))
-		p := filepath.Join(mountPath, "e2e-test-dir")
+		os.Remove(filepath.Join(mountPath, "e2e-renamed-dir", "nested.txt"))
+		p := filepath.Join(mountPath, "e2e-renamed-dir")
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}

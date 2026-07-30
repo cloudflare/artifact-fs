@@ -9,6 +9,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -162,21 +163,49 @@ func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
 func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	id, ok := fs.pathToInode[oldPath]
-	if !ok {
-		return
+	type inodeMove struct {
+		id      fuseops.InodeID
+		oldPath string
+		newPath string
 	}
-	if replacedID, exists := fs.pathToInode[newPath]; exists && replacedID != id {
-		if replaced := fs.inodes[replacedID]; replaced != nil {
-			replaced.Stale = true
+	var moves []inodeMove
+	movingIDs := map[fuseops.InodeID]bool{}
+	for path, id := range fs.pathToInode {
+		if samePathOrDescendant(path, oldPath) {
+			moves = append(moves, inodeMove{
+				id:      id,
+				oldPath: path,
+				newPath: newPath + strings.TrimPrefix(path, oldPath),
+			})
+			movingIDs[id] = true
 		}
-		delete(fs.pathToInode, newPath)
 	}
-	delete(fs.pathToInode, oldPath)
-	if ref := fs.inodes[id]; ref != nil {
-		ref.Path = newPath
-		fs.pathToInode[newPath] = id
+	for path, id := range fs.pathToInode {
+		if samePathOrDescendant(path, newPath) && !movingIDs[id] {
+			if replaced := fs.inodes[id]; replaced != nil {
+				replaced.Stale = true
+			}
+			delete(fs.pathToInode, path)
+		}
 	}
+	for _, move := range moves {
+		delete(fs.pathToInode, move.oldPath)
+	}
+	for _, move := range moves {
+		if ref := fs.inodes[move.id]; ref != nil {
+			ref.Path = move.newPath
+			fs.pathToInode[move.newPath] = move.id
+		}
+	}
+	for _, dh := range fs.dirHandles {
+		if samePathOrDescendant(dh.inode.Path, oldPath) {
+			dh.inode.Path = newPath + strings.TrimPrefix(dh.inode.Path, oldPath)
+		}
+	}
+}
+
+func samePathOrDescendant(path, root string) bool {
+	return path == root || strings.HasPrefix(path, root+"/")
 }
 
 func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*InodeRef, string, error) {
@@ -268,7 +297,7 @@ func (fs *ArtifactFuse) detachOpenHandles(path string) {
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
-		matches := fh.path == path
+		matches := samePathOrDescendant(fh.path, path)
 		fh.mu.Unlock()
 		if matches {
 			handles = append(handles, fh)
@@ -287,7 +316,7 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
-		matches := fh.path == oldPath
+		matches := samePathOrDescendant(fh.path, oldPath)
 		fh.mu.Unlock()
 		if matches {
 			handles = append(handles, fh)
@@ -296,7 +325,7 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	fs.mu.RUnlock()
 	for _, fh := range handles {
 		fh.mu.Lock()
-		fh.path = newPath
+		fh.path = newPath + strings.TrimPrefix(fh.path, oldPath)
 		fh.mu.Unlock()
 	}
 }
@@ -922,23 +951,35 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	if oldPath == newPath {
 		return nil
 	}
-	if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
-		return syscall.EIO
+	source, err := fs.resolver.ResolvePath(oldPath)
+	if err != nil {
+		return syscall.ENOENT
 	}
-	if err := fs.pinOpenHandles(oldPath); err != nil {
-		return syscall.EIO
-	}
-	if _, err := fs.resolver.ResolvePath(newPath); err == nil {
-		if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+	if resolvedNodeType(source) != "dir" {
+		if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
 			return syscall.EIO
 		}
-		if err := fs.pinOpenHandles(newPath); err != nil {
+		if err := fs.pinOpenHandles(oldPath); err != nil {
 			return syscall.EIO
+		}
+		if _, err := fs.resolver.ResolvePath(newPath); err == nil {
+			if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+				return syscall.EIO
+			}
+			if err := fs.pinOpenHandles(newPath); err != nil {
+				return syscall.EIO
+			}
 		}
 	}
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		if errors.Is(err, iofs.ErrInvalid) {
 			return syscall.ENOTSUP
+		}
+		if os.IsExist(err) {
+			return syscall.ENOTEMPTY
+		}
+		if errors.Is(err, iofs.ErrNotExist) {
+			return syscall.ENOENT
 		}
 		return syscall.EIO
 	}

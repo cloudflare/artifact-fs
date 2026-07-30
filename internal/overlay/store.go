@@ -395,6 +395,9 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if oldPath == newPath {
 		return nil
 	}
+	if e.Kind == model.OverlayKindMkdir {
+		return s.renameTreeLocked(ctx, oldPath, newPath, nil)
+	}
 	newBacking := e.BackingPath
 	newKind := model.OverlayKindRename
 	newTargetPath := oldPath
@@ -407,7 +410,6 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 		whiteoutTargetPath = e.TargetPath
 	}
 	mode := e.Mode
-	normalizedDirMode := false
 	switch e.Kind {
 	case model.OverlayKindCreate:
 		newKind = e.Kind
@@ -419,32 +421,12 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 		writeSourceWhiteout = e.SourceOID != ""
 		newSourceOID = ""
 		newSourceMode = 0
-	case model.OverlayKindMkdir:
-		hasDescendants, err := s.hasOverlayDescendants(ctx, oldPath)
-		if err != nil {
-			return err
-		}
-		if hasDescendants {
-			return iofs.ErrInvalid
-		}
-		newKind = model.OverlayKindMkdir
-		newTargetPath = ""
-		writeSourceWhiteout = false
-		if normalizedMode, normalized := normalizeGitDirMode(mode); normalized {
-			mode = normalizedMode
-			normalizedDirMode = true
-		}
 	}
 	var replaced model.OverlayEntry
 	if dst, exists, err := s.Lookup(ctx, newPath); err != nil {
 		return err
 	} else if exists {
 		replaced = dst
-	}
-	if normalizedDirMode && newBacking != "" {
-		if err := os.Chmod(newBacking, os.FileMode(mode)); err != nil {
-			return err
-		}
 	}
 	// Backing files have stable identities independent of their visible path, so
 	// the database transaction is the complete rename operation.
@@ -463,12 +445,6 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`, newPath, newKind, newBacking, mode, e.SizeBytes, e.MtimeUnixNs, now, newSourceOID, newSourceMode, newTargetPath); err != nil {
 		return err
 	}
-	if e.Kind == model.OverlayKindMkdir {
-		prefix := oldPath + "/"
-		if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE kind=? AND substr(path, 1, length(?))=?`, model.OverlayKindDelete, prefix, prefix); err != nil {
-			return err
-		}
-	}
 	if writeSourceWhiteout {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mode=0,source_oid='',source_mode=0,mtime_unix_ns=excluded.mtime_unix_ns,ctime_unix_ns=excluded.ctime_unix_ns,target_path=excluded.target_path`, oldPath, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, whiteoutTargetPath); err != nil {
 			return err
@@ -481,6 +457,145 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 		_ = os.RemoveAll(replaced.BackingPath)
 	}
 	return nil
+}
+
+func (s *Store) RenameTree(ctx context.Context, oldPath, newPath string, basePaths []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.renameTreeLocked(ctx, model.CleanPath(oldPath), model.CleanPath(newPath), basePaths)
+}
+
+func (s *Store) renameTreeLocked(ctx context.Context, oldPath, newPath string, basePaths []string) error {
+	if oldPath == newPath {
+		e, ok, err := s.Lookup(ctx, oldPath)
+		if err != nil {
+			return err
+		}
+		if !ok || e.IsDeleted() {
+			return os.ErrNotExist
+		}
+		return nil
+	}
+	if oldPath == "." || newPath == "." || strings.HasPrefix(newPath, oldPath+"/") {
+		return iofs.ErrInvalid
+	}
+
+	sourceEntries, err := s.listTreeEntries(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	var root model.OverlayEntry
+	rootFound := false
+	for _, e := range sourceEntries {
+		if e.Path == oldPath && !e.IsDeleted() {
+			root = e
+			rootFound = true
+			break
+		}
+	}
+	if !rootFound {
+		return os.ErrNotExist
+	}
+	if root.Kind != model.OverlayKindMkdir {
+		return iofs.ErrInvalid
+	}
+
+	destinationEntries, err := s.listTreeEntries(ctx, newPath)
+	if err != nil {
+		return err
+	}
+	tracked := make(map[string]bool, len(basePaths))
+	for _, path := range basePaths {
+		path = model.CleanPath(path)
+		if path == oldPath || strings.HasPrefix(path, oldPath+"/") {
+			tracked[path] = true
+		}
+	}
+
+	now := time.Now().UnixNano()
+	moved := make([]model.OverlayEntry, 0, len(sourceEntries))
+	movedBackings := make(map[string]bool, len(sourceEntries))
+	for _, e := range sourceEntries {
+		if e.IsDeleted() {
+			continue
+		}
+		sourcePath := e.Path
+		e.Path = newPath + strings.TrimPrefix(e.Path, oldPath)
+		e.CtimeUnixNs = now
+		if tracked[sourcePath] {
+			switch e.Kind {
+			case model.OverlayKindModify:
+				e.Kind = model.OverlayKindRename
+				if e.TargetPath == "" {
+					e.TargetPath = sourcePath
+				}
+			case model.OverlayKindSymlink:
+				e.SourceOID = ""
+				e.SourceMode = 0
+			}
+		}
+		if e.Kind == model.OverlayKindMkdir {
+			if mode, normalized := normalizeGitDirMode(e.Mode); normalized {
+				e.Mode = mode
+				if e.BackingPath != "" {
+					if err := os.Chmod(e.BackingPath, os.FileMode(mode)); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if e.BackingPath != "" {
+			movedBackings[e.BackingPath] = true
+		}
+		moved = append(moved, e)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	deleteTree := func(path string) error {
+		prefix := path + "/"
+		_, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=? OR substr(path, 1, length(?))=?`, path, prefix, prefix)
+		return err
+	}
+	if err := deleteTree(newPath); err != nil {
+		return err
+	}
+	if err := deleteTree(oldPath); err != nil {
+		return err
+	}
+	insert, err := tx.PrepareContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, ctime_unix_ns, source_oid, source_mode, target_path) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer insert.Close()
+	for _, e := range moved {
+		if _, err := insert.ExecContext(ctx, e.Path, e.Kind, e.BackingPath, e.Mode, e.SizeBytes, e.MtimeUnixNs, e.CtimeUnixNs, e.SourceOID, e.SourceMode, e.TargetPath); err != nil {
+			return err
+		}
+	}
+	for path := range tracked {
+		if _, err := insert.ExecContext(ctx, path, model.OverlayKindDelete, "", 0, 0, now, now, "", 0, path); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	for _, e := range destinationEntries {
+		if e.BackingPath != "" && !movedBackings[e.BackingPath] {
+			_ = os.RemoveAll(e.BackingPath)
+		}
+	}
+	return nil
+}
+
+func (s *Store) listTreeEntries(ctx context.Context, path string) ([]model.OverlayEntry, error) {
+	prefix := path + "/"
+	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path=? OR substr(path, 1, length(?))=? ORDER BY path`, path, prefix, prefix)
 }
 
 func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newPath string, sourceOID string, sourceMode uint32) error {
@@ -541,25 +656,6 @@ func (s *Store) RenameAndMarkModifiedFromBase(ctx context.Context, oldPath, newP
 		_ = os.RemoveAll(replaced.BackingPath)
 	}
 	return nil
-}
-
-func (s *Store) hasOverlayDescendants(ctx context.Context, path string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	prefix := path + "/"
-	for rows.Next() {
-		var candidate string
-		if err := rows.Scan(&candidate); err != nil {
-			return false, err
-		}
-		if strings.HasPrefix(candidate, prefix) {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
 }
 
 func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
