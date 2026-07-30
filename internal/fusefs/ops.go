@@ -218,6 +218,14 @@ func (e *Engine) renameDirectory(ctx context.Context, oldPath, newPath string) e
 		return err
 	}
 	for _, n := range visible {
+		if n.node.FromOverlay || n.node.Base.Type == "dir" || n.node.Base.ObjectOID == "" {
+			continue
+		}
+		if _, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, n.node.Base); err != nil {
+			return err
+		}
+	}
+	for _, n := range visible {
 		if n.node.FromOverlay {
 			continue
 		}

@@ -964,14 +964,27 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
-	if oldPath == newPath {
-		return nil
-	}
 	source, err := fs.resolver.ResolvePath(oldPath)
 	if err != nil {
 		return syscall.ENOENT
 	}
-	if resolvedNodeType(source) != "dir" {
+	sourceType := resolvedNodeType(source)
+	if oldPath == newPath {
+		return nil
+	}
+	if sourceType == "dir" && strings.HasPrefix(newPath, oldPath+"/") {
+		return syscall.EINVAL
+	}
+	if destination, err := fs.resolver.ResolvePath(newPath); err == nil {
+		destinationType := resolvedNodeType(destination)
+		if sourceType == "dir" && destinationType != "dir" {
+			return syscall.ENOTDIR
+		}
+		if sourceType != "dir" && destinationType == "dir" {
+			return syscall.EISDIR
+		}
+	}
+	if sourceType != "dir" {
 		if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
 			return syscall.EIO
 		}
@@ -989,7 +1002,7 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		if errors.Is(err, iofs.ErrInvalid) {
-			return syscall.ENOTSUP
+			return syscall.EINVAL
 		}
 		if os.IsExist(err) {
 			return syscall.ENOTEMPTY

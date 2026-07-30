@@ -65,7 +65,13 @@ jobs:
           go test -c -o "$RUNNER_TEMP/artifact-fs-e2e.test" .
           sudo --preserve-env=AFS_RUN_E2E_TESTS "$RUNNER_TEMP/artifact-fs-e2e.test" \
             -test.count=1 \
-            -test.run '^(TestE2EVerifiedSource|TestE2EFilesystemDirectoryMoveWorkflows|TestE2EGit.*)$' \
+            -test.run '^TestFUSEMountSmoke$' \
+            -test.timeout=2m \
+            -test.v
+          sudo --preserve-env=AFS_RUN_E2E_TESTS "$RUNNER_TEMP/artifact-fs-e2e.test" \
+            -test.count=1 \
+            -test.run '^TestE2E' \
+            -test.timeout=20m \
             -test.v
 
   container-examples:

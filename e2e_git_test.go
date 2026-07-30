@@ -109,6 +109,16 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 
 func (r *mountedE2ERepo) close(t *testing.T) {
 	t.Helper()
+	r.stop(t)
+	removeAllWithRetry(t, r.mountDir)
+	removeAllWithRetry(t, r.root)
+}
+
+func (r *mountedE2ERepo) stop(t *testing.T) {
+	t.Helper()
+	if r.svc == nil {
+		return
+	}
 	r.cancel()
 	if err := r.svc.Close(); err != nil {
 		t.Errorf("close daemon: %v", err)
@@ -123,8 +133,30 @@ func (r *mountedE2ERepo) close(t *testing.T) {
 		t.Log("daemon did not exit within 10s")
 	}
 	time.Sleep(200 * time.Millisecond)
-	removeAllWithRetry(t, r.mountDir)
-	removeAllWithRetry(t, r.root)
+	r.svc = nil
+}
+
+func (r *mountedE2ERepo) restart(t *testing.T) {
+	t.Helper()
+	r.stop(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	svc, err := daemon.New(ctx, r.root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	svc.SetMountRoot(r.mountDir)
+	errCh := make(chan error, 1)
+	go func() { errCh <- svc.Start(ctx) }()
+	if !waitForMount(t, r.mountPath, 60*time.Second) {
+		cancel()
+		_ = svc.Close()
+		t.Fatal("FUSE mount did not reappear after restart")
+	}
+	r.svc = svc
+	r.cancel = cancel
+	r.errCh = errCh
 }
 
 func TestE2EGitCleanState(t *testing.T) {

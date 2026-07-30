@@ -270,6 +270,69 @@ func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
 	}
 }
 
+func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
+	snapshot := &fakeSnapshot{nodes: map[string]model.BaseNode{
+		"src-dir":       {Path: "src-dir", Type: "dir", Mode: 0o40000},
+		"src-dir/child": {Path: "src-dir/child", Type: "dir", Mode: 0o40000},
+		"dst-file":      {Path: "dst-file", Type: "file", Mode: 0o100644},
+		"src-file":      {Path: "src-file", Type: "file", Mode: 0o100644},
+		"dst-dir":       {Path: "dst-dir", Type: "dir", Mode: 0o40000},
+	}}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(snapshot, overlay)
+	engine := &Engine{Resolver: resolver, Overlay: overlay}
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, engine)
+
+	for _, test := range []struct {
+		name string
+		op   fuseops.RenameOp
+		want error
+	}{
+		{
+			name: "directory_over_file",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src-dir", NewParent: fuseops.RootInodeID, NewName: "dst-file"},
+			want: syscall.ENOTDIR,
+		},
+		{
+			name: "file_over_directory",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src-file", NewParent: fuseops.RootInodeID, NewName: "dst-dir"},
+			want: syscall.EISDIR,
+		},
+		{
+			name: "missing_same_path",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "missing", NewParent: fuseops.RootInodeID, NewName: "missing"},
+			want: syscall.ENOENT,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := fs.Rename(context.Background(), &test.op); err != test.want {
+				t.Fatalf("Rename error = %v, want %v", err, test.want)
+			}
+		})
+	}
+
+	sourceLookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "src-dir"}
+	if err := fs.LookUpInode(context.Background(), sourceLookup); err != nil {
+		t.Fatal(err)
+	}
+	childLookup := &fuseops.LookUpInodeOp{Parent: sourceLookup.Entry.Child, Name: "child"}
+	if err := fs.LookUpInode(context.Background(), childLookup); err != nil {
+		t.Fatal(err)
+	}
+	selfDescendant := &fuseops.RenameOp{
+		OldParent: fuseops.RootInodeID,
+		OldName:   "src-dir",
+		NewParent: childLookup.Entry.Child,
+		NewName:   "moved",
+	}
+	if err := fs.Rename(context.Background(), selfDescendant); err != syscall.EINVAL {
+		t.Fatalf("Rename into descendant error = %v, want EINVAL", err)
+	}
+	if len(overlay.entries) != 0 {
+		t.Fatalf("rejected renames mutated overlay: %+v", overlay.entries)
+	}
+}
+
 func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string

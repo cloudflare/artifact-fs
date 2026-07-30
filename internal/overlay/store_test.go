@@ -792,6 +792,120 @@ func TestRenameTreeKeepsReplacedBaseDescendantsHidden(t *testing.T) {
 	}
 }
 
+func TestRenameTreePersistsAcrossReopen(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	baseFile := model.BaseNode{Path: "src/tracked.txt", Type: "file", Mode: 0o100644, ObjectOID: "tracked"}
+	cacheTestBlob(t, cfg, baseFile.ObjectOID)
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, baseFile.Path, baseFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "src/nested", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.CreateFile(ctx, "src/nested/local.txt", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteFile(ctx, created.Path, 0, []byte("local")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Mkdir(ctx, "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove(ctx, "dst/old.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RenameTree(
+		ctx,
+		"src",
+		"dst",
+		[]string{"src", "src/tracked.txt"},
+		[]string{"dst", "dst/old.txt"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	for _, path := range []string{"src", "src/tracked.txt"} {
+		if entry, ok := reopened.Get(path); !ok || !entry.IsDeleted() {
+			t.Fatalf("reopened source whiteout %q = %+v, ok=%v", path, entry, ok)
+		}
+	}
+	for _, path := range []string{"dst", "dst/tracked.txt", "dst/nested", "dst/nested/local.txt"} {
+		if entry, ok := reopened.Get(path); !ok || entry.IsDeleted() {
+			t.Fatalf("reopened destination entry %q = %+v, ok=%v", path, entry, ok)
+		}
+	}
+	if entry, ok := reopened.Get("dst/old.txt"); !ok || !entry.IsDeleted() {
+		t.Fatalf("reopened replaced descendant tombstone = %+v, ok=%v", entry, ok)
+	}
+	local, _ := reopened.Get("dst/nested/local.txt")
+	if data, err := os.ReadFile(local.BackingPath); err != nil {
+		t.Fatal(err)
+	} else if string(data) != "local" {
+		t.Fatalf("reopened local content = %q", data)
+	}
+}
+
+func TestRenameTreeReconcilesAcrossBaseChange(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+	baseFile := model.BaseNode{Path: "src/tracked.txt", Type: "file", Mode: 0o100644, ObjectOID: "old"}
+	cacheTestBlob(t, cfg, baseFile.ObjectOID)
+
+	if err := s.Mkdir(ctx, "src", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnsureCopyOnWrite(ctx, cfg, baseFile.Path, baseFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameTree(ctx, "src", "dst", []string{"src", baseFile.Path}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "src":
+			return model.BaseNode{Path: "src", Type: "dir", Mode: 0o40000}, true
+		case "src/tracked.txt":
+			return model.BaseNode{Path: path, Type: "file", Mode: 0o100755, ObjectOID: "new"}, true
+		case "dst":
+			return model.BaseNode{Path: "dst", Type: "dir", Mode: 0o40000}, true
+		default:
+			return model.BaseNode{}, false
+		}
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+	if entry, ok := s.Get("dst"); ok {
+		t.Fatalf("destination directory represented by new base should reconcile, got %+v", entry)
+	}
+	if entry, ok := s.Get("dst/tracked.txt"); !ok ||
+		entry.Kind != model.OverlayKindRename ||
+		entry.TargetPath != "src/tracked.txt" ||
+		entry.SourceOID != "new" ||
+		entry.SourceMode != 0o100755 {
+		t.Fatalf("reconciled tree rename entry = %+v, ok=%v", entry, ok)
+	}
+	if entry, ok := s.Get("src/tracked.txt"); !ok || !entry.IsDeleted() {
+		t.Fatalf("reconciled source whiteout = %+v, ok=%v", entry, ok)
+	}
+}
+
 func TestRenameOverlayDirectoryIgnoresDeletedDescendants(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
