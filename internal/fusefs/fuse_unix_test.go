@@ -219,16 +219,145 @@ func TestMoveInodePathPreservesSourceIdentityAndStalesReplacement(t *testing.T) 
 	}
 }
 
-func TestHandleCreationAndInvalidationWaitForNamespaceMutation(t *testing.T) {
+func TestMoveInodePathRewritesDirectoryDescendants(t *testing.T) {
+	fs := NewArtifactFuse(model.RepoConfig{}, nil, nil)
+	fs.mu.Lock()
+	source := fs.allocInode("source", "dir", 0o755, 1)
+	child := fs.allocInode("source/nested/file.txt", "file", 0o100644, 1)
+	sibling := fs.allocInode("source-other/file.txt", "file", 0o100644, 1)
+	replaced := fs.allocInode("destination", "dir", 0o755, 1)
+	replacedChild := fs.allocInode("destination/nested/file.txt", "file", 0o100644, 1)
+	fs.dirHandles[1] = &DirHandle{inode: &InodeRef{Path: "source/nested"}}
+	fs.fileHandles[2] = &FileHandle{path: "source/nested/file.txt"}
+	fs.mu.Unlock()
+
+	fs.moveInodePath("source", "destination")
+	fs.moveOpenHandles("source", "destination")
+
+	for id, want := range map[fuseops.InodeID]string{
+		source.ID:  "destination",
+		child.ID:   "destination/nested/file.txt",
+		sibling.ID: "source-other/file.txt",
+	} {
+		got, err := fs.requireInode(id, syscall.ESTALE)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Path != want {
+			t.Fatalf("inode %d path = %q, want %q", id, got.Path, want)
+		}
+	}
+	if _, err := fs.requireInode(replaced.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced inode error = %v, want ESTALE", err)
+	}
+	if _, err := fs.requireInode(replacedChild.ID, syscall.ESTALE); err != syscall.ESTALE {
+		t.Fatalf("replaced child inode error = %v, want ESTALE", err)
+	}
+	if got := fs.pathToInode["destination/nested/file.txt"]; got != child.ID {
+		t.Fatalf("destination child inode = %d, want source child %d", got, child.ID)
+	}
+	if err := fs.ForgetInode(context.Background(), &fuseops.ForgetInodeOp{Inode: replacedChild.ID, N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fs.pathToInode["destination/nested/file.txt"]; got != child.ID {
+		t.Fatalf("forgetting replaced child removed source child mapping: got %d, want %d", got, child.ID)
+	}
+	if got := fs.dirHandles[1].inode.Path; got != "destination/nested" {
+		t.Fatalf("directory handle path = %q", got)
+	}
+	if got := fs.fileHandles[2].path; got != "destination/nested/file.txt" {
+		t.Fatalf("file handle path = %q", got)
+	}
+}
+
+func TestRenameReturnsNativeErrorsBeforeMutatingOverlay(t *testing.T) {
+	snapshot := &fakeSnapshot{nodes: map[string]model.BaseNode{
+		"src-dir":       {Path: "src-dir", Type: "dir", Mode: 0o40000},
+		"src-dir/child": {Path: "src-dir/child", Type: "dir", Mode: 0o40000},
+		"dst-file":      {Path: "dst-file", Type: "file", Mode: 0o100644},
+		"src-file":      {Path: "src-file", Type: "file", Mode: 0o100644},
+		"dst-dir":       {Path: "dst-dir", Type: "dir", Mode: 0o40000},
+	}}
+	overlay := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
+	resolver := newResolver(snapshot, overlay)
+	engine := &Engine{Resolver: resolver, Overlay: overlay}
+	fs := NewArtifactFuse(model.RepoConfig{ID: "repo"}, resolver, engine)
+
+	for _, test := range []struct {
+		name string
+		op   fuseops.RenameOp
+		want error
+	}{
+		{
+			name: "directory_over_file",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src-dir", NewParent: fuseops.RootInodeID, NewName: "dst-file"},
+			want: syscall.ENOTDIR,
+		},
+		{
+			name: "file_over_directory",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "src-file", NewParent: fuseops.RootInodeID, NewName: "dst-dir"},
+			want: syscall.EISDIR,
+		},
+		{
+			name: "missing_same_path",
+			op:   fuseops.RenameOp{OldParent: fuseops.RootInodeID, OldName: "missing", NewParent: fuseops.RootInodeID, NewName: "missing"},
+			want: syscall.ENOENT,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := fs.Rename(context.Background(), &test.op); err != test.want {
+				t.Fatalf("Rename error = %v, want %v", err, test.want)
+			}
+		})
+	}
+
+	sourceLookup := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "src-dir"}
+	if err := fs.LookUpInode(context.Background(), sourceLookup); err != nil {
+		t.Fatal(err)
+	}
+	childLookup := &fuseops.LookUpInodeOp{Parent: sourceLookup.Entry.Child, Name: "child"}
+	if err := fs.LookUpInode(context.Background(), childLookup); err != nil {
+		t.Fatal(err)
+	}
+	selfDescendant := &fuseops.RenameOp{
+		OldParent: fuseops.RootInodeID,
+		OldName:   "src-dir",
+		NewParent: childLookup.Entry.Child,
+		NewName:   "moved",
+	}
+	if err := fs.Rename(context.Background(), selfDescendant); err != syscall.EINVAL {
+		t.Fatalf("Rename into descendant error = %v, want EINVAL", err)
+	}
+	if len(overlay.entries) != 0 {
+		t.Fatalf("rejected renames mutated overlay: %+v", overlay.entries)
+	}
+}
+
+func TestInodeAndHandleCreationWaitForNamespaceMutation(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		call func(*ArtifactFuse) error
 	}{
+		{name: "lookup", call: func(fs *ArtifactFuse) error {
+			return fs.LookUpInode(context.Background(), &fuseops.LookUpInodeOp{})
+		}},
+		{name: "opendir", call: func(fs *ArtifactFuse) error {
+			return fs.OpenDir(context.Background(), &fuseops.OpenDirOp{})
+		}},
+		{name: "readdirplus", call: func(fs *ArtifactFuse) error {
+			return fs.ReadDirPlus(context.Background(), &fuseops.ReadDirPlusOp{})
+		}},
 		{name: "open", call: func(fs *ArtifactFuse) error {
 			return fs.OpenFile(context.Background(), &fuseops.OpenFileOp{})
 		}},
 		{name: "setattr", call: func(fs *ArtifactFuse) error {
 			return fs.SetInodeAttributes(context.Background(), &fuseops.SetInodeAttributesOp{})
+		}},
+		{name: "mkdir", call: func(fs *ArtifactFuse) error {
+			return fs.MkDir(context.Background(), &fuseops.MkDirOp{})
+		}},
+		{name: "rmdir", call: func(fs *ArtifactFuse) error {
+			return fs.RmDir(context.Background(), &fuseops.RmDirOp{})
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -375,13 +504,15 @@ func TestGetInodeAttributesHydrationFailureReturnsEIO(t *testing.T) {
 	}
 }
 
-func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.T) {
+func TestLookUpInodeResolvesUnknownBaseAttributeSizes(t *testing.T) {
 	repo := model.RepoConfig{ID: "repo"}
 	tests := []struct {
-		name    string
-		base    model.BaseNode
-		overlay map[string]model.OverlayEntry
-		want    uint64
+		name              string
+		base              model.BaseNode
+		overlay           map[string]model.OverlayEntry
+		want              uint64
+		wantHydrateCalls  int
+		wantReadBlobCalls int
 	}{
 		{
 			name: "known base file",
@@ -402,9 +533,10 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 			want: 4096,
 		},
 		{
-			name: "base symlink",
-			base: model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "symlink", Mode: 0o120000, ObjectOID: "blob", SizeState: "unknown"},
-			want: 0,
+			name:              "base symlink",
+			base:              model.BaseNode{RepoID: repo.ID, Path: "file.txt", Type: "symlink", Mode: 0o120000, ObjectOID: "blob", SizeState: "unknown"},
+			want:              uint64(len("package.json")),
+			wantReadBlobCalls: 1,
 		},
 	}
 
@@ -414,7 +546,7 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 				&fakeSnapshot{nodes: map[string]model.BaseNode{"file.txt": tt.base}},
 				&fakeOverlay{entries: tt.overlay},
 			)
-			h := &fakeLookupHydrator{size: 12}
+			h := &fakeLookupHydrator{size: 12, data: []byte("package.json")}
 			fs := NewArtifactFuse(repo, r, &Engine{Resolver: r, Repo: repo, Hydrator: h})
 			op := &fuseops.LookUpInodeOp{Parent: fuseops.RootInodeID, Name: "file.txt"}
 
@@ -424,8 +556,11 @@ func TestLookUpInodeDoesNotHydrateKnownOverlayDirOrSymlinkAttributes(t *testing.
 			if op.Entry.Attributes.Size != tt.want {
 				t.Fatalf("lookup size = %d, want %d", op.Entry.Attributes.Size, tt.want)
 			}
-			if h.calls != 0 {
-				t.Fatalf("EnsureHydrated calls = %d, want 0", h.calls)
+			if h.calls != tt.wantHydrateCalls {
+				t.Fatalf("EnsureHydrated calls = %d, want %d", h.calls, tt.wantHydrateCalls)
+			}
+			if h.readBlobCalls != tt.wantReadBlobCalls {
+				t.Fatalf("ReadBlob calls = %d, want %d", h.readBlobCalls, tt.wantReadBlobCalls)
 			}
 		})
 	}
@@ -548,10 +683,12 @@ func TestReadDirPlusDropsLookupWhenEntryDoesNotFit(t *testing.T) {
 }
 
 type fakeLookupHydrator struct {
-	size  int64
-	calls int
-	err   error
-	path  string
+	size          int64
+	calls         int
+	readBlobCalls int
+	err           error
+	path          string
+	data          []byte
 }
 
 func (f *fakeLookupHydrator) Enqueue(model.HydrationTask) {}
@@ -576,7 +713,11 @@ func (f *fakeLookupHydrator) OpenHydrated(ctx context.Context, repo model.RepoCo
 }
 
 func (f *fakeLookupHydrator) ReadBlob(_ context.Context, _ model.RepoConfig, _ model.BaseNode, _ int64) ([]byte, error) {
-	return nil, nil
+	f.readBlobCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.data, nil
 }
 
 func (f *fakeLookupHydrator) QueueDepth(model.RepoID) int { return 0 }

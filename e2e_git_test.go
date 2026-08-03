@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -108,6 +109,16 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 
 func (r *mountedE2ERepo) close(t *testing.T) {
 	t.Helper()
+	r.stop(t)
+	removeAllWithRetry(t, r.mountDir)
+	removeAllWithRetry(t, r.root)
+}
+
+func (r *mountedE2ERepo) stop(t *testing.T) {
+	t.Helper()
+	if r.svc == nil {
+		return
+	}
 	r.cancel()
 	if err := r.svc.Close(); err != nil {
 		t.Errorf("close daemon: %v", err)
@@ -122,8 +133,30 @@ func (r *mountedE2ERepo) close(t *testing.T) {
 		t.Log("daemon did not exit within 10s")
 	}
 	time.Sleep(200 * time.Millisecond)
-	removeAllWithRetry(t, r.mountDir)
-	removeAllWithRetry(t, r.root)
+	r.svc = nil
+}
+
+func (r *mountedE2ERepo) restart(t *testing.T) {
+	t.Helper()
+	r.stop(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	svc, err := daemon.New(ctx, r.root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	svc.SetMountRoot(r.mountDir)
+	errCh := make(chan error, 1)
+	go func() { errCh <- svc.Start(ctx) }()
+	if !waitForMount(t, r.mountPath, 60*time.Second) {
+		cancel()
+		_ = svc.Close()
+		t.Fatal("FUSE mount did not reappear after restart")
+	}
+	r.svc = svc
+	r.cancel = cancel
+	r.errCh = errCh
 }
 
 func TestE2EGitCleanState(t *testing.T) {
@@ -209,6 +242,64 @@ func TestE2EGitStatusPorcelain(t *testing.T) {
 		"SECURITY.md -> SECURITY-renamed.md": "R ",
 		"untracked.txt":                      "??",
 	})
+}
+
+func TestE2EGitRenameTrackedDirectory(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	previousHead := strings.TrimSpace(gitCmd(t, repo.mountPath, "rev-parse", "HEAD"))
+	openDescendant, err := os.Open(filepath.Join(repo.mountPath, "packages", "wrangler", "src", "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openDescendant.Close()
+
+	gitCmd(t, repo.mountPath, "mv", "packages/wrangler", "packages/wrangler-renamed")
+
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	renamedRoot := filepath.Join(repo.mountPath, "packages", "wrangler-renamed")
+	renamedManifest := filepath.Join(renamedRoot, "package.json")
+	if got := readFileStr(t, renamedManifest); !strings.Contains(got, `"name":"wrangler"`) {
+		t.Fatalf("renamed package manifest = %q", got)
+	}
+	if got := readFileStr(t, filepath.Join(renamedRoot, "nested", "deep", "config.json")); !strings.Contains(got, "compatibility_date") {
+		t.Fatalf("renamed nested config = %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(renamedRoot, "manifest-link")); err != nil {
+		t.Fatal(err)
+	} else if target != "package.json" {
+		t.Fatalf("renamed symlink target = %q", target)
+	}
+	if info, err := os.Stat(filepath.Join(renamedRoot, "bin", "run.sh")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("renamed executable mode = %#o", info.Mode().Perm())
+	}
+	if data, err := io.ReadAll(openDescendant); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(string(data), "wrangler") {
+		t.Fatalf("open tracked descendant after git mv = %q", data)
+	}
+	assertGitStatus(t, repo.mountPath, map[string]string{
+		"packages/wrangler/bin/run.sh -> packages/wrangler-renamed/bin/run.sh":                           "R ",
+		"packages/wrangler/manifest-link -> packages/wrangler-renamed/manifest-link":                     "R ",
+		"packages/wrangler/nested/deep/config.json -> packages/wrangler-renamed/nested/deep/config.json": "R ",
+		"packages/wrangler/package.json -> packages/wrangler-renamed/package.json":                       "R ",
+		"packages/wrangler/src/index.js -> packages/wrangler-renamed/src/index.js":                       "R ",
+	})
+
+	gitCmd(t, repo.mountPath,
+		"-c", "user.name=E2E Test",
+		"-c", "user.email=e2e@test",
+		"commit", "-m", "rename tracked directory",
+	)
+	waitForHeadAndStatus(t, repo.mountPath, previousHead, map[string]string{})
+	waitForOverlayClean(t, repo)
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	if got := readFileStr(t, renamedManifest); !strings.Contains(got, `"name":"wrangler"`) {
+		t.Fatalf("renamed package manifest after reconcile = %q", got)
+	}
+	assertPathExists(t, filepath.Join(renamedRoot, "nested", "deep", "config.json"))
+	assertPathExists(t, filepath.Join(renamedRoot, "bin", "run.sh"))
 }
 
 func TestE2EGitCheckoutBranchSwitch(t *testing.T) {

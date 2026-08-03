@@ -5,12 +5,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,9 +22,17 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 const repoName = "e2e-test"
+
+func TestFUSEMountSmoke(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	if got := readFileStr(t, filepath.Join(repo.mountPath, "README.md")); !strings.Contains(got, "Test Repo") {
+		t.Fatalf("mounted README.md = %q", got)
+	}
+}
 
 // createLocalTestRepo creates a bare git repo seeded with enough content
 // to exercise all e2e test assertions. Returns a file:// URL suitable for
@@ -60,6 +72,26 @@ func createLocalTestRepo(t *testing.T) string {
 			t.Fatal(err)
 		}
 		writeTestFile(t, dir, "package.json", `{"name":"`+pkg+`","version":"0.0.1"}`+"\n")
+	}
+	wranglerDir := filepath.Join(workDir, "packages", "wrangler")
+	for _, dir := range []string{
+		filepath.Join(wranglerDir, "bin"),
+		filepath.Join(wranglerDir, "nested", "deep"),
+		filepath.Join(wranglerDir, "src"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(wranglerDir, "src"), "index.js", "export function main() {\n  return 'wrangler';\n}\n")
+	writeTestFile(t, filepath.Join(wranglerDir, "nested", "deep"), "config.json", `{"compatibility_date":"2026-07-30"}`+"\n")
+	scriptPath := filepath.Join(wranglerDir, "bin", "run.sh")
+	writeTestFile(t, filepath.Dir(scriptPath), filepath.Base(scriptPath), "#!/bin/sh\necho wrangler\n")
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("package.json", filepath.Join(wranglerDir, "manifest-link")); err != nil {
+		t.Fatal(err)
 	}
 	run(t, workDir, "git", "add", "-A")
 	run(t, workDir, "git", "commit", "-m", "add packages directory")
@@ -238,6 +270,18 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("fs/rename_nonempty_overlay_directory", func(t *testing.T) {
+		oldPath := filepath.Join(mountPath, "e2e-test-dir")
+		newPath := filepath.Join(mountPath, "e2e-renamed-dir")
+		if err := os.Rename(oldPath, newPath); err != nil {
+			t.Fatal(err)
+		}
+		assertPathMissing(t, oldPath)
+		if got := readFileStr(t, filepath.Join(newPath, "nested.txt")); got != "nested\n" {
+			t.Fatalf("renamed nested file = %q", got)
+		}
+	})
+
 	t.Run("fs/rename", func(t *testing.T) {
 		src := filepath.Join(mountPath, "e2e-test-file.txt")
 		dst := filepath.Join(mountPath, "e2e-renamed.txt")
@@ -264,8 +308,8 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("fs/rmdir", func(t *testing.T) {
-		os.Remove(filepath.Join(mountPath, "e2e-test-dir", "nested.txt"))
-		p := filepath.Join(mountPath, "e2e-test-dir")
+		os.Remove(filepath.Join(mountPath, "e2e-renamed-dir", "nested.txt"))
+		p := filepath.Join(mountPath, "e2e-renamed-dir")
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}
@@ -454,6 +498,581 @@ func TestE2E(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Log("daemon did not exit within 10s")
 	}
+}
+
+func TestE2EFilesystemDirectoryMoveWorkflows(t *testing.T) {
+	t.Run("cli_move_preserves_tree_and_open_handles", testE2ECLIDirectoryMove)
+	t.Run("recursive_copy_move_and_replace_empty_destination", testE2ERecursiveCopyMoveAndReplace)
+	t.Run("replace_visible_empty_tracked_destination", testE2EReplaceVisibleEmptyTrackedDirectory)
+	t.Run("replace_deleted_tracked_destination", testE2EReplaceDeletedTrackedDirectory)
+	t.Run("reject_nonempty_destination", testE2ERejectNonemptyDirectoryReplacement)
+	t.Run("native_rename_error_contract", testE2ENativeDirectoryRenameErrors)
+}
+
+func TestE2EFilesystemDirectoryRenamePersistsAcrossRestart(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	renamedRoot := filepath.Join(repo.mountPath, "packages", "wrangler-pending")
+	if err := unix.Rename(filepath.Join(repo.mountPath, "packages", "wrangler"), renamedRoot); err != nil {
+		t.Fatal(err)
+	}
+	trackedDestination := filepath.Join(repo.mountPath, "packages", "miniflare")
+	if err := os.Remove(filepath.Join(trackedDestination, "package.json")); err != nil {
+		t.Fatal(err)
+	}
+	replacementSource := filepath.Join(repo.mountPath, "replacement-source")
+	if err := os.MkdirAll(filepath.Join(replacementSource, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(replacementSource, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(replacementSource, trackedDestination); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeStatus := gitCmd(t, repo.mountPath, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	assertPathExists(t, filepath.Join(renamedRoot, "nested", "deep", "config.json"))
+	assertPathMissing(t, filepath.Join(trackedDestination, "package.json"))
+	assertPathExists(t, filepath.Join(trackedDestination, "nested", "incoming.txt"))
+
+	repo.restart(t)
+
+	afterStatus := gitCmd(t, repo.mountPath, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if afterStatus != beforeStatus {
+		t.Fatalf("Git status changed across restart:\nbefore: %q\nafter:  %q", beforeStatus, afterStatus)
+	}
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "wrangler"))
+	if got := readFileStr(t, filepath.Join(renamedRoot, "nested", "deep", "config.json")); !strings.Contains(got, "compatibility_date") {
+		t.Fatalf("renamed tracked content after restart = %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(renamedRoot, "manifest-link")); err != nil {
+		t.Fatal(err)
+	} else if target != "package.json" {
+		t.Fatalf("renamed symlink target after restart = %q", target)
+	}
+	if info, err := os.Stat(filepath.Join(renamedRoot, "bin", "run.sh")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("renamed executable mode after restart = %#o", info.Mode().Perm())
+	}
+	assertPathMissing(t, filepath.Join(trackedDestination, "package.json"))
+	if got := readFileStr(t, filepath.Join(trackedDestination, "nested", "incoming.txt")); got != "incoming\n" {
+		t.Fatalf("replacement content after restart = %q", got)
+	}
+}
+
+func TestE2EFilesystemDirectoryRenameConcurrentAccess(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	left := filepath.Join(repo.mountPath, "concurrent-left")
+	right := filepath.Join(repo.mountPath, "concurrent-right")
+	if err := os.MkdirAll(filepath.Join(left, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(left, "nested", "value.txt"), []byte("stable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Stat(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	var workers sync.WaitGroup
+	var started sync.WaitGroup
+	started.Add(5)
+	report := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+	for range 4 {
+		workers.Go(func() {
+			started.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, root := range []string{left, right} {
+					if _, err := os.Stat(root); err != nil && !os.IsNotExist(err) {
+						report(fmt.Errorf("stat %q during rename: %w", root, err))
+						return
+					}
+					if _, err := os.ReadDir(root); err != nil && !os.IsNotExist(err) {
+						report(fmt.Errorf("readdir %q during rename: %w", root, err))
+						return
+					}
+					data, err := os.ReadFile(filepath.Join(root, "nested", "value.txt"))
+					if err != nil {
+						if !os.IsNotExist(err) {
+							report(fmt.Errorf("read %q during rename: %w", root, err))
+							return
+						}
+					} else if string(data) != "stable\n" {
+						report(fmt.Errorf("read %q during rename = %q", root, data))
+						return
+					}
+				}
+			}
+		})
+	}
+	workers.Go(func() {
+		started.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			cmd := exec.Command("git", "status", "--porcelain=v1", "--untracked-files=all")
+			cmd.Dir = repo.mountPath
+			if output, err := cmd.CombinedOutput(); err != nil {
+				report(fmt.Errorf("git status during rename: %w: %s", err, output))
+				return
+			}
+		}
+	})
+	started.Wait()
+
+	current, next := left, right
+	var renameErr error
+	for range 40 {
+		if renameErr = unix.Rename(current, next); renameErr != nil {
+			break
+		}
+		current, next = next, current
+		time.Sleep(time.Millisecond)
+	}
+	close(stop)
+	workers.Wait()
+	if renameErr != nil {
+		t.Fatalf("concurrent rename: %v", renameErr)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	assertPathMissing(t, next)
+	if got := readFileStr(t, filepath.Join(current, "nested", "value.txt")); got != "stable\n" {
+		t.Fatalf("final concurrent content = %q", got)
+	}
+	final, err := os.Stat(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(original, final) {
+		t.Fatal("directory inode identity changed during concurrent rename stress")
+	}
+}
+
+func testE2ECLIDirectoryMove(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	source := filepath.Join(repo.mountPath, "tree")
+	deep := filepath.Join(source, "nested", "deeper")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(deep, "payload.bin")
+	initialBinary := []byte{0x00, 0x01, 0x02, 0xfe, 0xff}
+	if err := os.WriteFile(binaryPath, initialBinary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(source, "run.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho moved\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("nested", "deeper", "payload.bin"), filepath.Join(source, "payload-link")); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(repo.mountPath, "tree-sibling")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "untouched.txt"), []byte("sibling\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryInfo, err := os.Stat(binaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openFile, err := os.OpenFile(binaryPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openFile.Close()
+	openDir, err := os.Open(deep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openDir.Close()
+	dirFD, err := unix.Open(deep, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(dirFD)
+
+	run(t, repo.mountPath, "mv", "tree", "tree-moved")
+	moved := filepath.Join(repo.mountPath, "tree-moved")
+	movedBinary := filepath.Join(moved, "nested", "deeper", "payload.bin")
+	assertPathMissing(t, source)
+	assertPathExists(t, movedBinary)
+	movedInfo, err := os.Stat(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedBinaryInfo, err := os.Stat(movedBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(sourceInfo, movedInfo) {
+		t.Fatal("directory inode identity changed across CLI mv")
+	}
+	if !os.SameFile(binaryInfo, movedBinaryInfo) {
+		t.Fatal("descendant inode identity changed across CLI mv")
+	}
+	if _, err := openFile.WriteAt([]byte{0xaa, 0xbb}, 1); err != nil {
+		t.Fatalf("write through moved open handle: %v", err)
+	}
+	if err := openFile.Sync(); err != nil {
+		t.Fatalf("sync moved open handle: %v", err)
+	}
+	if _, err := openFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	gotThroughHandle, err := io.ReadAll(openFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBinary := []byte{0x00, 0xaa, 0xbb, 0xfe, 0xff}
+	if !bytes.Equal(gotThroughHandle, wantBinary) {
+		t.Fatalf("open handle content = %v, want %v", gotThroughHandle, wantBinary)
+	}
+	if got, err := os.ReadFile(movedBinary); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(got, wantBinary) {
+		t.Fatalf("moved binary content = %v, want %v", got, wantBinary)
+	}
+	names, err := openDir.Readdirnames(-1)
+	if err != nil {
+		t.Fatalf("read moved open directory handle: %v", err)
+	}
+	if !slices.Contains(names, "payload.bin") {
+		t.Fatalf("moved directory handle entries = %v", names)
+	}
+	childFD, err := unix.Openat(dirFD, "payload.bin", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("openat through moved directory descriptor: %v", err)
+	}
+	childFile := os.NewFile(uintptr(childFD), "moved-payload")
+	gotThroughDirFD, err := io.ReadAll(childFile)
+	closeErr := childFile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(gotThroughDirFD, wantBinary) {
+		t.Fatalf("openat content = %v, want %v", gotThroughDirFD, wantBinary)
+	}
+	if target, err := os.Readlink(filepath.Join(moved, "payload-link")); err != nil {
+		t.Fatal(err)
+	} else if target != filepath.Join("nested", "deeper", "payload.bin") {
+		t.Fatalf("moved symlink target = %q", target)
+	}
+	if info, err := os.Stat(filepath.Join(moved, "run.sh")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("moved executable mode = %#o", info.Mode().Perm())
+	}
+	if got := readFileStr(t, filepath.Join(sibling, "untouched.txt")); got != "sibling\n" {
+		t.Fatalf("prefix sibling content = %q", got)
+	}
+}
+
+func testE2ERecursiveCopyMoveAndReplace(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	run(t, repo.mountPath, "cp", "-R", "packages/wrangler", "wrangler-copy")
+	copied := filepath.Join(repo.mountPath, "wrangler-copy")
+	if got := readFileStr(t, filepath.Join(copied, "nested", "deep", "config.json")); !strings.Contains(got, "compatibility_date") {
+		t.Fatalf("recursive copy nested content = %q", got)
+	}
+	if target, err := os.Readlink(filepath.Join(copied, "manifest-link")); err != nil {
+		t.Fatal(err)
+	} else if target != "package.json" {
+		t.Fatalf("recursive copy symlink target = %q", target)
+	}
+	run(t, repo.mountPath, "mv", "wrangler-copy", "wrangler-copy-moved")
+	copiedMoved := filepath.Join(repo.mountPath, "wrangler-copy-moved")
+	assertPathMissing(t, copied)
+	assertPathExists(t, filepath.Join(copiedMoved, "src", "index.js"))
+
+	emptyDestination := filepath.Join(repo.mountPath, "empty-destination")
+	if err := os.Mkdir(emptyDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	replacedHandle, err := os.Open(emptyDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacedHandle.Close()
+	replacedInfo, err := os.Stat(emptyDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(copiedMoved, emptyDestination); err != nil {
+		sourceEntries, sourceReadErr := os.ReadDir(copiedMoved)
+		destinationEntries, destinationReadErr := os.ReadDir(emptyDestination)
+		t.Fatalf(
+			"replace empty destination: %v (source entries=%v, source read error=%v, destination entries=%v, destination read error=%v)",
+			err,
+			dirEntryNames(sourceEntries),
+			sourceReadErr,
+			dirEntryNames(destinationEntries),
+			destinationReadErr,
+		)
+	}
+	replacementInfo, err := os.Stat(emptyDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(replacedInfo, replacementInfo) {
+		t.Fatal("replaced destination retained its stale inode identity")
+	}
+	assertPathExists(t, filepath.Join(emptyDestination, "bin", "run.sh"))
+	assertReplacedDirectoryHandleMatchesNative(t, replacedHandle, filepath.Join("bin", "run.sh"))
+}
+
+func assertReplacedDirectoryHandleMatchesNative(t *testing.T, mountedHandle *os.File, incomingChild string) {
+	t.Helper()
+	nativeRoot := t.TempDir()
+	nativeSource := filepath.Join(nativeRoot, "source")
+	nativeDestination := filepath.Join(nativeRoot, "destination")
+	if err := os.MkdirAll(filepath.Join(nativeSource, filepath.Dir(incomingChild)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeSource, incomingChild), []byte("native\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nativeDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nativeHandle, err := os.Open(nativeDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nativeHandle.Close()
+	if err := unix.Rename(nativeSource, nativeDestination); err != nil {
+		t.Fatalf("native replace empty destination: %v", err)
+	}
+
+	nativeNames, nativeReadErr := nativeHandle.Readdirnames(-1)
+	mountedNames, mountedReadErr := mountedHandle.Readdirnames(-1)
+	if nativeMissing, mountedMissing := os.IsNotExist(nativeReadErr), os.IsNotExist(mountedReadErr); nativeMissing != mountedMissing {
+		t.Fatalf(
+			"readdir replaced destination differs from native filesystem: native names=%v error=%v, mounted names=%v error=%v",
+			nativeNames,
+			nativeReadErr,
+			mountedNames,
+			mountedReadErr,
+		)
+	}
+	if nativeReadErr != nil && !os.IsNotExist(nativeReadErr) {
+		t.Fatalf("native readdir replaced destination: %v", nativeReadErr)
+	}
+	if mountedReadErr != nil && !os.IsNotExist(mountedReadErr) {
+		t.Fatalf("mounted readdir replaced destination: %v", mountedReadErr)
+	}
+	if nativeReadErr == nil && !slices.Equal(nativeNames, mountedNames) {
+		t.Fatalf("replaced destination entries differ from native filesystem: native=%v mounted=%v", nativeNames, mountedNames)
+	}
+	if len(nativeNames) != 0 || len(mountedNames) != 0 {
+		t.Fatalf("replaced destination handle exposed entries: native=%v mounted=%v", nativeNames, mountedNames)
+	}
+
+	nativeChildFD, nativeOpenErr := unix.Openat(int(nativeHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if nativeChildFD >= 0 {
+		_ = unix.Close(nativeChildFD)
+	}
+	mountedChildFD, mountedOpenErr := unix.Openat(int(mountedHandle.Fd()), incomingChild, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if mountedChildFD >= 0 {
+		_ = unix.Close(mountedChildFD)
+	}
+	if !errors.Is(nativeOpenErr, unix.ENOENT) {
+		t.Fatalf("native openat replaced destination = %v, want ENOENT", nativeOpenErr)
+	}
+	if !errors.Is(mountedOpenErr, unix.ENOENT) {
+		t.Fatalf("mounted openat replaced destination = %v, want native ENOENT", mountedOpenErr)
+	}
+}
+
+func testE2EReplaceVisibleEmptyTrackedDirectory(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	destination := filepath.Join(repo.mountPath, "packages", "miniflare")
+	if err := os.Remove(filepath.Join(destination, "package.json")); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(destination); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("tracked destination entries = %v, want empty", dirEntryNames(entries))
+	}
+	replacedInfo, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(repo.mountPath, "visible-tracked-replacement")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, source)
+	assertPathMissing(t, filepath.Join(destination, "package.json"))
+	if got := readFileStr(t, filepath.Join(destination, "nested", "incoming.txt")); got != "incoming\n" {
+		t.Fatalf("visible tracked replacement content = %q", got)
+	}
+	replacementInfo, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(replacedInfo, replacementInfo) {
+		t.Fatal("visible tracked destination retained its stale inode identity")
+	}
+}
+
+func testE2EReplaceDeletedTrackedDirectory(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	run(t, repo.mountPath, "rm", "-rf", "packages/miniflare")
+	trackedReplacementSource := filepath.Join(repo.mountPath, "tracked-replacement-source")
+	if err := os.Mkdir(trackedReplacementSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trackedReplacementSource, "incoming.txt"), []byte("incoming\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo.mountPath, "mv", "tracked-replacement-source", "packages/miniflare")
+	assertPathExists(t, filepath.Join(repo.mountPath, "packages", "miniflare", "incoming.txt"))
+	assertPathMissing(t, filepath.Join(repo.mountPath, "packages", "miniflare", "package.json"))
+}
+
+func testE2ERejectNonemptyDirectoryReplacement(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	rejectedSource := filepath.Join(repo.mountPath, "rejected-source")
+	rejectedDestination := filepath.Join(repo.mountPath, "rejected-destination")
+	if err := os.MkdirAll(rejectedSource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rejectedSource, "source.txt"), []byte("source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rejectedDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rejectedDestination, "destination.txt"), []byte("destination\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(rejectedSource, rejectedDestination); !errors.Is(err, unix.ENOTEMPTY) {
+		t.Fatalf("rename over nonempty destination error = %v, want ENOTEMPTY", err)
+	}
+	if got := readFileStr(t, filepath.Join(rejectedSource, "source.txt")); got != "source\n" {
+		t.Fatalf("rejected source content = %q", got)
+	}
+	if got := readFileStr(t, filepath.Join(rejectedDestination, "destination.txt")); got != "destination\n" {
+		t.Fatalf("rejected destination content = %q", got)
+	}
+}
+
+func testE2ENativeDirectoryRenameErrors(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+
+	fileSource := filepath.Join(repo.mountPath, "file-source")
+	directoryDestination := filepath.Join(repo.mountPath, "directory-destination")
+	if err := os.WriteFile(fileSource, []byte("file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directoryDestination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(fileSource, directoryDestination); !errors.Is(err, unix.EISDIR) {
+		t.Fatalf("file over directory error = %v, want EISDIR", err)
+	}
+
+	directorySource := filepath.Join(repo.mountPath, "directory-source")
+	fileDestination := filepath.Join(repo.mountPath, "file-destination")
+	if err := os.Mkdir(directorySource, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileDestination, []byte("destination\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(directorySource, fileDestination); !errors.Is(err, unix.ENOTDIR) {
+		t.Fatalf("directory over file error = %v, want ENOTDIR", err)
+	}
+
+	parent := filepath.Join(repo.mountPath, "self-parent")
+	if err := os.MkdirAll(filepath.Join(parent, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(parent, filepath.Join(parent, "child", "moved")); !errors.Is(err, unix.EINVAL) {
+		t.Fatalf("directory into descendant error = %v, want EINVAL", err)
+	}
+
+	missing := filepath.Join(repo.mountPath, "missing")
+	if err := unix.Rename(missing, missing); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("missing same-path rename error = %v, want ENOENT", err)
+	}
+	if err := unix.Rename(fileSource, fileSource); err != nil {
+		t.Fatalf("existing same-path rename: %v", err)
+	}
+	if got := readFileStr(t, fileSource); got != "file\n" {
+		t.Fatalf("same-path file content = %q", got)
+	}
+
+	oldParent := filepath.Join(repo.mountPath, "old-parent")
+	newParent := filepath.Join(repo.mountPath, "new-parent")
+	if err := os.MkdirAll(filepath.Join(oldParent, "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(newParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldParent, "tree", "value.txt"), []byte("cross-parent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Rename(filepath.Join(oldParent, "tree"), filepath.Join(newParent, "tree")); err != nil {
+		t.Fatalf("cross-parent directory rename: %v", err)
+	}
+	assertPathMissing(t, filepath.Join(oldParent, "tree"))
+	if got := readFileStr(t, filepath.Join(newParent, "tree", "value.txt")); got != "cross-parent\n" {
+		t.Fatalf("cross-parent content = %q", got)
+	}
+}
+
+func dirEntryNames(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 func TestE2EVerifiedSource(t *testing.T) {

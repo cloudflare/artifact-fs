@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	iofs "io/fs"
+	"maps"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +35,7 @@ func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, err
 	if v, ok := f.kids[path]; ok {
 		return v, nil
 	}
-	return nil, errors.New("not found")
+	return nil, nil
 }
 
 // fakeOverlay satisfies model.OverlayStore for testing.
@@ -52,8 +54,18 @@ func (f *fakeOverlay) Lookup(_ context.Context, path string) (model.OverlayEntry
 	e, ok := f.Get(path)
 	return e, ok, nil
 }
-func (f *fakeOverlay) ListByPrefix(_ context.Context, _ string) ([]model.OverlayEntry, error) {
-	return f.list, nil
+func (f *fakeOverlay) ListByPrefix(_ context.Context, prefix string) ([]model.OverlayEntry, error) {
+	if f.list != nil {
+		return f.list, nil
+	}
+	prefix = model.CleanPath(prefix)
+	var out []model.OverlayEntry
+	for path, e := range f.entries {
+		if prefix == "." || strings.HasPrefix(path, prefix+"/") {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (f *fakeOverlay) EnsureCopyOnWrite(_ context.Context, _ model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
 	if f.entries == nil {
@@ -106,6 +118,37 @@ func (f *fakeOverlay) RenameAndMarkModifiedFromBase(_ context.Context, oldPath, 
 	e.SourceOID = sourceOID
 	e.SourceMode = sourceMode
 	f.entries[model.CleanPath(newPath)] = e
+	return nil
+}
+func (f *fakeOverlay) RenameTree(_ context.Context, oldPath, newPath string, sourceBasePaths, destinationBasePaths []string) error {
+	oldPath = model.CleanPath(oldPath)
+	newPath = model.CleanPath(newPath)
+	moved := map[string]model.OverlayEntry{}
+	for path, e := range f.entries {
+		if path != oldPath && !strings.HasPrefix(path, oldPath+"/") {
+			continue
+		}
+		delete(f.entries, path)
+		if e.IsDeleted() {
+			continue
+		}
+		e.Path = newPath + strings.TrimPrefix(path, oldPath)
+		moved[e.Path] = e
+	}
+	for path := range f.entries {
+		if path == newPath || strings.HasPrefix(path, newPath+"/") {
+			delete(f.entries, path)
+		}
+	}
+	maps.Copy(f.entries, moved)
+	for _, path := range sourceBasePaths {
+		f.entries[path] = model.OverlayEntry{Path: path, Kind: model.OverlayKindDelete}
+	}
+	for _, path := range destinationBasePaths {
+		if _, overwritten := moved[path]; path != newPath && !overwritten {
+			f.entries[path] = model.OverlayEntry{Path: path, Kind: model.OverlayKindDelete}
+		}
+	}
 	return nil
 }
 func (f *fakeOverlay) Mkdir(_ context.Context, path string, mode uint32) error {
@@ -277,22 +320,88 @@ func TestSetMtimeRejectsRootAndBaseSymlink(t *testing.T) {
 	}
 }
 
-func TestRenameRejectsBaseDirectory(t *testing.T) {
+func TestRenameMovesBaseDirectoryTree(t *testing.T) {
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{}}
 	r := newResolver(
-		&fakeSnapshot{nodes: map[string]model.BaseNode{"src": {Path: "src", Type: "dir", Mode: 0o40000}}},
+		&fakeSnapshot{
+			nodes: map[string]model.BaseNode{
+				"src":          {Path: "src", Type: "dir", Mode: 0o40000},
+				"src/a.txt":    {Path: "src/a.txt", Type: "file", Mode: 0o100644},
+				"src/nested":   {Path: "src/nested", Type: "dir", Mode: 0o40000},
+				"src/nested/b": {Path: "src/nested/b", Type: "file", Mode: 0o100644},
+			},
+			kids: map[string][]model.BaseNode{
+				"src": {
+					{Path: "src/a.txt", Type: "file", Mode: 0o100644},
+					{Path: "src/nested", Type: "dir", Mode: 0o40000},
+				},
+				"src/nested": {
+					{Path: "src/nested/b", Type: "file", Mode: 0o100644},
+				},
+			},
+		},
 		ov,
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename base dir err = %v, want ErrInvalid", err)
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := ov.entries["src"]; ok {
-		t.Fatal("base directory rename should not create source overlay entry")
+	for _, path := range []string{"src", "src/a.txt", "src/nested", "src/nested/b"} {
+		if e, ok := ov.entries[path]; !ok || !e.IsDeleted() {
+			t.Fatalf("source %q = %+v, ok=%v; want whiteout", path, e, ok)
+		}
 	}
-	if _, ok := ov.entries["dst"]; ok {
-		t.Fatal("base directory rename should not create destination overlay entry")
+	for _, path := range []string{"dst", "dst/a.txt", "dst/nested", "dst/nested/b"} {
+		if e, ok := ov.entries[path]; !ok || e.IsDeleted() {
+			t.Fatalf("destination %q = %+v, ok=%v", path, e, ok)
+		}
+	}
+}
+
+func TestRenameMovesNonEmptyOverlayDirectoryTree(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src":          {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
+		"src/a.txt":    {Path: "src/a.txt", Kind: model.OverlayKindCreate, Mode: 0o644},
+		"src/nested":   {Path: "src/nested", Kind: model.OverlayKindMkdir, Mode: 0o755},
+		"src/nested/b": {Path: "src/nested/b", Kind: model.OverlayKindCreate, Mode: 0o644},
+	}}
+	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"dst", "dst/a.txt", "dst/nested", "dst/nested/b"} {
+		if _, ok := ov.entries[path]; !ok {
+			t.Fatalf("missing moved path %q", path)
+		}
+	}
+}
+
+func TestRenameDirectoryRejectsDescendantDestination(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src": {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
+	}}
+	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "src/nested"); !errors.Is(err, iofs.ErrInvalid) {
+		t.Fatalf("err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRenameDirectoryRejectsNonEmptyDestination(t *testing.T) {
+	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
+		"src":       {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
+		"dst":       {Path: "dst", Kind: model.OverlayKindMkdir, Mode: 0o755},
+		"dst/a.txt": {Path: "dst/a.txt", Kind: model.OverlayKindCreate, Mode: 0o644},
+	}}
+	r := newResolver(&fakeSnapshot{nodes: map[string]model.BaseNode{}}, ov)
+	engine := &Engine{Resolver: r, Overlay: ov}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("err = %v, want ErrExist", err)
 	}
 }
 
@@ -367,7 +476,7 @@ func TestRenameModifyRejectsBaseDirectoryDestination(t *testing.T) {
 	}
 }
 
-func TestRenameRejectsOverlayMkdirShadowingBaseDirectory(t *testing.T) {
+func TestRenameAllowsPromotedBaseDirectory(t *testing.T) {
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
 		"src": {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
 	}}
@@ -377,12 +486,18 @@ func TestRenameRejectsOverlayMkdirShadowingBaseDirectory(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename overlay mkdir shadowing base dir err = %v, want ErrInvalid", err)
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := ov.entries["src"]; !ok || !e.IsDeleted() {
+		t.Fatalf("source = %+v, ok=%v; want whiteout", e, ok)
+	}
+	if e, ok := ov.entries["dst"]; !ok || e.Kind != model.OverlayKindMkdir {
+		t.Fatalf("destination = %+v, ok=%v", e, ok)
 	}
 }
 
-func TestRenameRejectsOverlayMkdirShadowingBaseFile(t *testing.T) {
+func TestRenameAllowsOverlayDirectoryReplacingBaseFileAtSource(t *testing.T) {
 	ov := &fakeOverlay{entries: map[string]model.OverlayEntry{
 		"src": {Path: "src", Kind: model.OverlayKindMkdir, Mode: 0o755},
 	}}
@@ -392,8 +507,11 @@ func TestRenameRejectsOverlayMkdirShadowingBaseFile(t *testing.T) {
 	)
 	engine := &Engine{Resolver: r, Overlay: ov}
 
-	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, iofs.ErrInvalid) {
-		t.Fatalf("Rename overlay mkdir shadowing base file err = %v, want ErrInvalid", err)
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := ov.entries["src"]; !ok || !e.IsDeleted() {
+		t.Fatalf("source = %+v, ok=%v; want whiteout", e, ok)
 	}
 }
 

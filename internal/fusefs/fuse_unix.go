@@ -9,6 +9,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -162,21 +163,49 @@ func (fs *ArtifactFuse) dropInodeLookup(id fuseops.InodeID) {
 func (fs *ArtifactFuse) moveInodePath(oldPath, newPath string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	id, ok := fs.pathToInode[oldPath]
-	if !ok {
-		return
+	type inodeMove struct {
+		id      fuseops.InodeID
+		oldPath string
+		newPath string
 	}
-	if replacedID, exists := fs.pathToInode[newPath]; exists && replacedID != id {
-		if replaced := fs.inodes[replacedID]; replaced != nil {
-			replaced.Stale = true
+	var moves []inodeMove
+	movingIDs := map[fuseops.InodeID]bool{}
+	for path, id := range fs.pathToInode {
+		if samePathOrDescendant(path, oldPath) {
+			moves = append(moves, inodeMove{
+				id:      id,
+				oldPath: path,
+				newPath: newPath + strings.TrimPrefix(path, oldPath),
+			})
+			movingIDs[id] = true
 		}
-		delete(fs.pathToInode, newPath)
 	}
-	delete(fs.pathToInode, oldPath)
-	if ref := fs.inodes[id]; ref != nil {
-		ref.Path = newPath
-		fs.pathToInode[newPath] = id
+	for path, id := range fs.pathToInode {
+		if samePathOrDescendant(path, newPath) && !movingIDs[id] {
+			if replaced := fs.inodes[id]; replaced != nil {
+				replaced.Stale = true
+			}
+			delete(fs.pathToInode, path)
+		}
 	}
+	for _, move := range moves {
+		delete(fs.pathToInode, move.oldPath)
+	}
+	for _, move := range moves {
+		if ref := fs.inodes[move.id]; ref != nil {
+			ref.Path = move.newPath
+			fs.pathToInode[move.newPath] = move.id
+		}
+	}
+	for _, dh := range fs.dirHandles {
+		if samePathOrDescendant(dh.inode.Path, oldPath) {
+			dh.inode.Path = newPath + strings.TrimPrefix(dh.inode.Path, oldPath)
+		}
+	}
+}
+
+func samePathOrDescendant(path, root string) bool {
+	return path == root || strings.HasPrefix(path, root+"/")
 }
 
 func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*InodeRef, string, error) {
@@ -268,7 +297,7 @@ func (fs *ArtifactFuse) detachOpenHandles(path string) {
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
-		matches := fh.path == path
+		matches := samePathOrDescendant(fh.path, path)
 		fh.mu.Unlock()
 		if matches {
 			handles = append(handles, fh)
@@ -287,7 +316,7 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	var handles []*FileHandle
 	for _, fh := range fs.fileHandles {
 		fh.mu.Lock()
-		matches := fh.path == oldPath
+		matches := samePathOrDescendant(fh.path, oldPath)
 		fh.mu.Unlock()
 		if matches {
 			handles = append(handles, fh)
@@ -296,7 +325,7 @@ func (fs *ArtifactFuse) moveOpenHandles(oldPath, newPath string) {
 	fs.mu.RUnlock()
 	for _, fh := range handles {
 		fh.mu.Lock()
-		fh.path = newPath
+		fh.path = newPath + strings.TrimPrefix(fh.path, oldPath)
 		fh.mu.Unlock()
 	}
 }
@@ -397,6 +426,8 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 }
 
 func (fs *ArtifactFuse) LookUpInode(ctx context.Context, op *fuseops.LookUpInodeOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
 	if err != nil {
 		return err
@@ -493,6 +524,12 @@ func (fs *ArtifactFuse) resolveAttrs(ctx context.Context, path string) (mode uin
 			return 0, 0, "", time.Time{}, time.Time{}, hErr
 		}
 		size = hydratedSize
+	} else if n.Base.Type == "symlink" && n.Base.SizeState != "known" && n.Base.ObjectOID != "" {
+		target, readErr := fs.engine.Hydrator.ReadBlob(ctx, fs.repo, n.Base, model.MaxSymlinkTargetBytes)
+		if readErr != nil {
+			return 0, 0, "", time.Time{}, time.Time{}, readErr
+		}
+		size = int64(len(target))
 	}
 
 	// Base files use the HEAD commit timestamp for mtime so tools like
@@ -567,6 +604,8 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 }
 
 func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
 	if err != nil {
 		return err
@@ -615,6 +654,8 @@ func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error 
 }
 
 func (fs *ArtifactFuse) ReadDirPlus(_ context.Context, op *fuseops.ReadDirPlusOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	dh, err := fs.dirHandle(op.Handle)
 	if err != nil {
 		return err
@@ -854,6 +895,8 @@ func (fs *ArtifactFuse) CreateSymlink(ctx context.Context, op *fuseops.CreateSym
 }
 
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err
@@ -873,6 +916,8 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
+	fs.handleOps.RLock()
+	defer fs.handleOps.RUnlock()
 	_, childPath, err := fs.childPath(op.Parent, op.Name)
 	if err != nil {
 		return err
@@ -919,26 +964,51 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
+	source, err := fs.resolver.ResolvePath(oldPath)
+	if err != nil {
+		return syscall.ENOENT
+	}
+	sourceType := resolvedNodeType(source)
 	if oldPath == newPath {
 		return nil
 	}
-	if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
-		return syscall.EIO
+	if sourceType == "dir" && strings.HasPrefix(newPath, oldPath+"/") {
+		return syscall.EINVAL
 	}
-	if err := fs.pinOpenHandles(oldPath); err != nil {
-		return syscall.EIO
+	if destination, err := fs.resolver.ResolvePath(newPath); err == nil {
+		destinationType := resolvedNodeType(destination)
+		if sourceType == "dir" && destinationType != "dir" {
+			return syscall.ENOTDIR
+		}
+		if sourceType != "dir" && destinationType == "dir" {
+			return syscall.EISDIR
+		}
 	}
-	if _, err := fs.resolver.ResolvePath(newPath); err == nil {
-		if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+	if sourceType != "dir" {
+		if err := fs.engine.ensureOverlay(ctx, oldPath); err != nil {
 			return syscall.EIO
 		}
-		if err := fs.pinOpenHandles(newPath); err != nil {
+		if err := fs.pinOpenHandles(oldPath); err != nil {
 			return syscall.EIO
+		}
+		if _, err := fs.resolver.ResolvePath(newPath); err == nil {
+			if err := fs.engine.ensureOverlay(ctx, newPath); err != nil {
+				return syscall.EIO
+			}
+			if err := fs.pinOpenHandles(newPath); err != nil {
+				return syscall.EIO
+			}
 		}
 	}
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		if errors.Is(err, iofs.ErrInvalid) {
-			return syscall.ENOTSUP
+			return syscall.EINVAL
+		}
+		if os.IsExist(err) {
+			return syscall.ENOTEMPTY
+		}
+		if errors.Is(err, iofs.ErrNotExist) {
+			return syscall.ENOENT
 		}
 		return syscall.EIO
 	}

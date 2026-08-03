@@ -2,6 +2,7 @@ package fusefs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,13 +11,15 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	overlaystore "github.com/cloudflare/artifact-fs/internal/overlay"
 )
 
 type fakeBatchHydrator struct {
-	tasks      []model.HydrationTask
-	calls      int
-	path       string
-	pathsByOID map[string]string
+	tasks       []model.HydrationTask
+	calls       int
+	path        string
+	pathsByOID  map[string]string
+	errorsByOID map[string]error
 }
 
 type generationSnapshot struct {
@@ -31,6 +34,12 @@ type blockingCopyOverlay struct {
 	backingPath  string
 }
 
+type blockingRenameHydrator struct {
+	*fakeBatchHydrator
+	started chan struct{}
+	proceed chan struct{}
+}
+
 func (f *fakeBatchHydrator) Enqueue(task model.HydrationTask) {
 	f.tasks = append(f.tasks, task)
 }
@@ -41,6 +50,9 @@ func (f *fakeBatchHydrator) EnqueueBatch(tasks []model.HydrationTask) {
 
 func (f *fakeBatchHydrator) EnsureHydrated(_ context.Context, _ model.RepoConfig, node model.BaseNode) (string, int64, error) {
 	f.calls++
+	if err := f.errorsByOID[node.ObjectOID]; err != nil {
+		return "", 0, err
+	}
 	if f.pathsByOID != nil {
 		return f.pathsByOID[node.ObjectOID], 0, nil
 	}
@@ -61,6 +73,16 @@ func (f *fakeBatchHydrator) ReadBlob(context.Context, model.RepoConfig, model.Ba
 }
 
 func (f *fakeBatchHydrator) QueueDepth(model.RepoID) int { return len(f.tasks) }
+
+func (h *blockingRenameHydrator) OpenHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (*os.File, int64, error) {
+	close(h.started)
+	select {
+	case <-h.proceed:
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+	return h.fakeBatchHydrator.OpenHydrated(ctx, repo, node)
+}
 
 func (g *generationSnapshot) PublishGeneration(context.Context, string, string, []model.BaseNode) (int64, error) {
 	return 0, nil
@@ -292,5 +314,268 @@ func TestFileHandleInvalidatesCacheAfterOverlappingWrite(t *testing.T) {
 	}
 	if string(after) != "new" {
 		t.Fatalf("read after write = %q, want new", after)
+	}
+}
+
+func TestRenameBaseDirectoryHydratesAndMovesContents(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	ov, err := overlaystore.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+
+	cachePath := filepath.Join(tmp, "blob")
+	if err := os.WriteFile(cachePath, []byte("tracked content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &fakeSnapshot{
+		nodes: map[string]model.BaseNode{
+			"src":       {Path: "src", Type: "dir", Mode: 0o40000},
+			"src/a.txt": {Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"},
+		},
+		kids: map[string][]model.BaseNode{
+			"src": {{Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"}},
+		},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+	resolver.SetGeneration(1)
+	engine := &Engine{
+		Repo:     cfg,
+		Resolver: resolver,
+		Overlay:  ov,
+		Hydrator: &fakeBatchHydrator{path: cachePath},
+	}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := engine.Read(context.Background(), "dst/a.txt", 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tracked content" {
+		t.Fatalf("moved content = %q", got)
+	}
+	if _, err := resolver.ResolvePath("src/a.txt"); !os.IsNotExist(err) {
+		t.Fatalf("source child resolve err = %v, want not exist", err)
+	}
+}
+
+func TestRenameBaseDirectoryHydratesBeforeMutatingOverlay(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	ov, err := overlaystore.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+
+	firstCache := filepath.Join(tmp, "first")
+	secondCache := filepath.Join(tmp, "second")
+	if err := os.WriteFile(firstCache, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondCache, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &fakeSnapshot{
+		nodes: map[string]model.BaseNode{
+			"src":       {Path: "src", Type: "dir", Mode: 0o40000},
+			"src/a.txt": {Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "first"},
+			"src/b.txt": {Path: "src/b.txt", Type: "file", Mode: 0o100644, ObjectOID: "second"},
+		},
+		kids: map[string][]model.BaseNode{
+			"src": {
+				{Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "first"},
+				{Path: "src/b.txt", Type: "file", Mode: 0o100644, ObjectOID: "second"},
+			},
+		},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+	resolver.SetGeneration(1)
+	hydrationFailure := errors.New("hydrate second blob")
+	hydrator := &fakeBatchHydrator{
+		pathsByOID:  map[string]string{"first": firstCache, "second": secondCache},
+		errorsByOID: map[string]error{"second": hydrationFailure},
+	}
+	engine := &Engine{Repo: cfg, Resolver: resolver, Overlay: ov, Hydrator: hydrator}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); !errors.Is(err, hydrationFailure) {
+		t.Fatalf("Rename error = %v, want hydration failure", err)
+	}
+	entries, err := ov.ListAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed rename left partial overlay entries: %+v", entries)
+	}
+	for _, path := range []string{"src", "src/a.txt", "src/b.txt"} {
+		if _, err := resolver.ResolvePath(path); err != nil {
+			t.Fatalf("source path %q after failed rename: %v", path, err)
+		}
+	}
+	if _, err := resolver.ResolvePath("dst"); !os.IsNotExist(err) {
+		t.Fatalf("destination after failed rename error = %v, want not exist", err)
+	}
+
+	delete(hydrator.errorsByOID, "second")
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatalf("retry Rename: %v", err)
+	}
+	for path, want := range map[string]string{"dst/a.txt": "first", "dst/b.txt": "second"} {
+		got, err := engine.Read(context.Background(), path, 0, 64)
+		if err != nil {
+			t.Fatalf("read %q after retry: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("read %q after retry = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestRenameBaseDirectoryDoesNotResurrectReplacedDestinationDescendants(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	ov, err := overlaystore.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+
+	snapshot := &fakeSnapshot{
+		nodes: map[string]model.BaseNode{
+			"src":                   {Path: "src", Type: "dir", Mode: 0o40000},
+			"src/overlap":           {Path: "src/overlap", Type: "dir", Mode: 0o40000},
+			"dst":                   {Path: "dst", Type: "dir", Mode: 0o40000},
+			"dst/gone.txt":          {Path: "dst/gone.txt", Type: "file", Mode: 0o100644, ObjectOID: "gone"},
+			"dst/overlap":           {Path: "dst/overlap", Type: "dir", Mode: 0o40000},
+			"dst/overlap/stale.txt": {Path: "dst/overlap/stale.txt", Type: "file", Mode: 0o100644, ObjectOID: "stale"},
+		},
+		kids: map[string][]model.BaseNode{
+			"src": {
+				{Path: "src/overlap", Type: "dir", Mode: 0o40000},
+			},
+			"dst": {
+				{Path: "dst/gone.txt", Type: "file", Mode: 0o100644, ObjectOID: "gone"},
+				{Path: "dst/overlap", Type: "dir", Mode: 0o40000},
+			},
+			"dst/overlap": {
+				{Path: "dst/overlap/stale.txt", Type: "file", Mode: 0o100644, ObjectOID: "stale"},
+			},
+		},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+	resolver.SetGeneration(1)
+	engine := &Engine{
+		Repo:     cfg,
+		Resolver: resolver,
+		Overlay:  ov,
+		Hydrator: &fakeBatchHydrator{},
+	}
+	if err := ov.Remove(context.Background(), "dst"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.Rename(context.Background(), "src", "dst"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.ResolvePath("dst/overlap"); err != nil {
+		t.Fatalf("resolve incoming overlapping directory: %v", err)
+	}
+	for _, path := range []string{"dst/gone.txt", "dst/overlap/stale.txt"} {
+		if _, err := resolver.ResolvePath(path); !os.IsNotExist(err) {
+			t.Fatalf("replaced destination path %q resolve error = %v, want not exist", path, err)
+		}
+	}
+}
+
+func TestRenameDirectoryRejectsDestinationChildCreatedDuringHydration(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		OverlayDir:    filepath.Join(tmp, "overlay"),
+		OverlayDBPath: filepath.Join(tmp, "overlay.db"),
+	}
+	ov, err := overlaystore.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ov.Close() })
+
+	cachePath := filepath.Join(tmp, "blob")
+	if err := os.WriteFile(cachePath, []byte("tracked content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &fakeSnapshot{
+		nodes: map[string]model.BaseNode{
+			"src":       {Path: "src", Type: "dir", Mode: 0o40000},
+			"src/a.txt": {Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"},
+		},
+		kids: map[string][]model.BaseNode{
+			"src": {{Path: "src/a.txt", Type: "file", Mode: 0o100644, ObjectOID: "blob"}},
+		},
+	}
+	resolver := &Resolver{Snapshot: snapshot, Overlay: ov}
+	resolver.SetGeneration(1)
+	hydrator := &blockingRenameHydrator{
+		fakeBatchHydrator: &fakeBatchHydrator{path: cachePath},
+		started:           make(chan struct{}),
+		proceed:           make(chan struct{}),
+	}
+	engine := &Engine{
+		Repo:     cfg,
+		Resolver: resolver,
+		Overlay:  ov,
+		Hydrator: hydrator,
+	}
+	if err := engine.Mkdir(context.Background(), "dst", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	renameDone := make(chan error, 1)
+	go func() {
+		renameDone <- engine.Rename(context.Background(), "src", "dst")
+	}()
+	select {
+	case <-hydrator.started:
+	case <-time.After(time.Second):
+		t.Fatal("rename did not reach hydration")
+	}
+
+	if err := engine.Mkdir(context.Background(), "dst/concurrent", 0o755); err != nil {
+		t.Fatalf("concurrent destination mkdir: %v", err)
+	}
+	close(hydrator.proceed)
+	select {
+	case err := <-renameDone:
+		if !os.IsExist(err) {
+			t.Fatalf("Rename error = %v, want os.ErrExist", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rename did not finish")
+	}
+
+	for _, path := range []string{"src", "src/a.txt", "dst", "dst/concurrent"} {
+		if _, err := resolver.ResolvePath(path); err != nil {
+			t.Fatalf("resolve preserved path %q: %v", path, err)
+		}
+	}
+	if _, err := resolver.ResolvePath("dst/a.txt"); !os.IsNotExist(err) {
+		t.Fatalf("destination source child resolve error = %v, want not exist", err)
 	}
 }
