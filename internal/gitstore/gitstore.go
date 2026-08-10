@@ -1789,11 +1789,17 @@ func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
 
 // EnsureIndexInitialized creates a missing index without replacing staged work.
 func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfig) error {
-	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", "HEAD^{commit}")
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return readTreeTransition(ctx, repo.GitDir, strings.TrimSpace(oid), strings.TrimSpace(oid))
+	if _, err := os.Stat(filepath.Join(repo.GitDir, "index")); err == nil {
+		// Clones already populate the index. Re-reading identical trees can
+		// lazy-fetch every missing blob from a promisor remote.
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return s.ReadTreeHEAD(ctx, repo)
 }
 
 func (s *Store) ConfigureStatusOptimization(ctx context.Context, repo model.RepoConfig, stateRoot string) error {

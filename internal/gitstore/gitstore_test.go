@@ -390,6 +390,63 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	}
 }
 
+func TestEnsureIndexInitializedDoesNotRunGitWhenIndexExists(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	if _, err := os.Stat(filepath.Join(repo, ".git", "index")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initial index stat error = %v, want not exist", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatalf("EnsureIndexInitialized invoked git for existing index: %v", err)
+	}
+}
+
+func TestEnsureIndexInitializedHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := New(nil).EnsureIndexInitialized(ctx, model.RepoConfig{GitDir: t.TempDir()})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnsureIndexInitialized error = %v, want context canceled", err)
+	}
+}
+
+func TestEnsureIndexInitializedCreatesMissingIndex(t *testing.T) {
+	t.Parallel()
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+	indexPath := filepath.Join(repo, ".git", "index")
+	if err := os.Remove(indexPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files")); got != "tracked.txt" {
+		t.Fatalf("index entries = %q, want tracked.txt", got)
+	}
+}
+
 func TestPrepareFetchedBranchPreservesStagedEntries(t *testing.T) {
 	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
