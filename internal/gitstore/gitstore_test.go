@@ -70,6 +70,27 @@ func TestResolveHEADAndBuildTreeIndex(t *testing.T) {
 	}
 }
 
+func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oid := strings.Repeat("a", 40)
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\nls-tree) printf '100644 blob %s\\tfile.txt\\0' ;;\ncat-file) exec sleep 10 ;;\nesac\n", oid)
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := New(nil).BuildTreeIndex(ctx, model.RepoConfig{ID: "repo", GitDir: t.TempDir()}, oid)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("BuildTreeIndex error = %v, want deadline exceeded", err)
+	}
+}
+
 func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")
@@ -390,7 +411,7 @@ func TestEnsureIndexInitializedPreservesStagedEntries(t *testing.T) {
 	}
 }
 
-func TestEnsureIndexInitializedDoesNotRunGitWhenIndexExists(t *testing.T) {
+func TestEnsureIndexInitializedDoesNotReadTreeWhenIndexExists(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "repo")
 	run(t, "git", "init", repo)
 	if _, err := os.Stat(filepath.Join(repo, ".git", "index")); !errors.Is(err, os.ErrNotExist) {
@@ -401,15 +422,30 @@ func TestEnsureIndexInitializedDoesNotRunGitWhenIndexExists(t *testing.T) {
 	}
 	run(t, "git", "-C", repo, "add", "tracked.txt")
 
-	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin)
+	bin := t.TempDir()
+	logPath := filepath.Join(bin, "git.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_LOG\"\nif [ \"$1\" = read-tree ]; then exit 99; fi\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_GIT_LOG", logPath)
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
 	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
-		t.Fatalf("EnsureIndexInitialized invoked git for existing index: %v", err)
+		t.Fatal(err)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(logged)); got != "-c core.fsmonitor=false ls-files --stage --" {
+		t.Fatalf("git invocation = %q, want non-mutating index validation", got)
 	}
 }
 
@@ -419,6 +455,14 @@ func TestEnsureIndexInitializedHonorsCanceledContext(t *testing.T) {
 	err := New(nil).EnsureIndexInitialized(ctx, model.RepoConfig{GitDir: t.TempDir()})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("EnsureIndexInitialized error = %v, want context canceled", err)
+	}
+}
+
+func TestEnsureIndexInitializedRejectsEmptyAlternateIndexPath(t *testing.T) {
+	t.Setenv("GIT_INDEX_FILE", "")
+	err := New(nil).EnsureIndexInitialized(context.Background(), model.RepoConfig{GitDir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "GIT_INDEX_FILE") {
+		t.Fatalf("EnsureIndexInitialized error = %v, want empty GIT_INDEX_FILE error", err)
 	}
 }
 
@@ -444,6 +488,112 @@ func TestEnsureIndexInitializedCreatesMissingIndex(t *testing.T) {
 	}
 	if got := strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files")); got != "tracked.txt" {
 		t.Fatalf("index entries = %q, want tracked.txt", got)
+	}
+}
+
+func TestEnsureIndexInitializedPreservesAlternateIndex(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+
+	gitDir := filepath.Join(repo, ".git")
+	defaultIndex := filepath.Join(gitDir, "index")
+	alternateIndex := filepath.Join(t.TempDir(), "alternate.index")
+	index, err := os.ReadFile(defaultIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alternateIndex, index, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_INDEX_FILE", alternateIndex)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	before := runOutput(t, "git", "-C", repo, "diff", "--cached")
+	if !strings.Contains(before, "+staged") {
+		t.Fatalf("alternate index was not staged: %q", before)
+	}
+	fsmonitorCalled := filepath.Join(t.TempDir(), "fsmonitor-called")
+	fsmonitorHook := filepath.Join(t.TempDir(), "fsmonitor")
+	script := "#!/bin/sh\n: > \"$AFS_FSMONITOR_CALLED\"\ngit read-tree HEAD\nprintf 'token\\n'\n"
+	if err := os.WriteFile(fsmonitorHook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_FSMONITOR_CALLED", fsmonitorCalled)
+	run(t, "git", "-C", repo, "config", "core.fsmonitor", fsmonitorHook)
+	if err := os.Remove(defaultIndex); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fsmonitorCalled); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fsmonitor hook ran during index validation: %v", err)
+	}
+	if after := runOutput(t, "git", "-c", "core.fsmonitor=false", "-C", repo, "diff", "--cached"); after != before {
+		t.Fatalf("alternate staged diff changed:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestEnsureIndexInitializedCreatesMissingAlternateIndex(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	run(t, "git", "init", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "tracked.txt")
+	run(t, "git", "-C", repo, "commit", "-m", "base")
+
+	alternateIndex := filepath.Join(t.TempDir(), "alternate.index")
+	t.Setenv("GIT_INDEX_FILE", alternateIndex)
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(runOutput(t, "git", "-C", repo, "ls-files")); got != "tracked.txt" {
+		t.Fatalf("alternate index entries = %q, want tracked.txt", got)
+	}
+}
+
+func TestEnsureIndexInitializedRejectsCorruptIndex(t *testing.T) {
+	cases := map[string][]byte{
+		"truncated":         []byte("DIRC"),
+		"invalid signature": append([]byte("NOPE"), make([]byte, 28)...),
+		"invalid version":   append([]byte("DIRC\x00\x00\x00\x63"), make([]byte, 24)...),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo := filepath.Join(t.TempDir(), "repo")
+			run(t, "git", "init", repo)
+			run(t, "git", "-C", repo, "config", "user.name", "test")
+			run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("tracked\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run(t, "git", "-C", repo, "add", "tracked.txt")
+			run(t, "git", "-C", repo, "commit", "-m", "base")
+			gitDir := filepath.Join(repo, ".git")
+			if err := os.WriteFile(filepath.Join(gitDir, "index"), contents, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := model.RepoConfig{ID: "x", GitDir: gitDir}
+			if err := New(nil).EnsureIndexInitialized(context.Background(), cfg); err == nil {
+				t.Fatal("EnsureIndexInitialized accepted corrupt index")
+			}
+		})
 	}
 }
 

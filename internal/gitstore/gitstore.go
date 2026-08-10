@@ -38,6 +38,8 @@ const (
 	GitOperationClone GitOperation = "clone"
 	GitOperationFetch GitOperation = "fetch"
 
+	gitCommandWaitDelay = 250 * time.Millisecond
+
 	logGitOperationAttemptFailed = "git operation attempt failed"
 	logGitOperationRetrying      = "retrying transient git operation failure"
 	logGitOperationRecovered     = "git operation recovered"
@@ -1118,15 +1120,22 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 	// Batch-resolve sizes using cat-file --batch-check. This reads from local
 	// pack metadata and doesn't trigger network fetches on blobless clones.
 	if err := s.batchResolveSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		// Non-fatal: sizes remain "unknown" and reads will still work via
 		// hydration. Log so operators can diagnose unexpected attr hydration.
 		s.logger.Warn("batch size resolution failed, some file sizes will resolve on demand", "repo", repo.Name, "error", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return addImplicitDirs(repo.ID, nodes), nil
 }
 
 func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
+	configureCancelableCommand(cmd)
 	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1137,6 +1146,10 @@ func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn fu
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = stdout.Close()
+	})
+	defer stopClose()
 	readErr := readNullDelimited(stdout, fn)
 	waitErr := cmd.Wait()
 	if readErr != nil {
@@ -1232,6 +1245,7 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 		return nil
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check", "--buffer")
+	configureCancelableCommand(cmd)
 	// GIT_NO_LAZY_FETCH prevents batch-check from fetching blob metadata from
 	// the promisor remote on blobless clones. Without it, every blob OID
 	// triggers a network round-trip, turning a millisecond operation into
@@ -1251,6 +1265,11 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = stdin.Close()
+		_ = stdout.Close()
+	})
+	defer stopClose()
 	writeErrCh := make(chan error, 1)
 	go func() {
 		var writeErr error
@@ -1272,6 +1291,9 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 	scanErr := scan.Err()
 	writeErr := <-writeErrCh
 	waitErr := cmd.Wait()
+	if contextErr := ctx.Err(); contextErr != nil {
+		return errors.Join(contextErr, writeErr, scanErr)
+	}
 	if writeErr != nil {
 		return writeErr
 	}
@@ -1792,10 +1814,26 @@ func (s *Store) EnsureIndexInitialized(ctx context.Context, repo model.RepoConfi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(repo.GitDir, "index")); err == nil {
-		// Clones already populate the index. Re-reading identical trees can
-		// lazy-fetch every missing blob from a promisor remote.
-		return nil
+	indexPath := filepath.Join(repo.GitDir, "index")
+	if alternateIndex, ok := os.LookupEnv("GIT_INDEX_FILE"); ok {
+		if alternateIndex == "" {
+			return errors.New("GIT_INDEX_FILE is empty")
+		}
+		indexPath = alternateIndex
+	}
+	if _, err := os.Stat(indexPath); err == nil {
+		// Validate the effective index without refreshing it. Unlike read-tree,
+		// ls-files does not replace staged state or resolve missing blobs.
+		return runGitDiscardOutputWithEnv(
+			ctx,
+			repo.GitDir,
+			[]string{"GIT_NO_LAZY_FETCH=1"},
+			"-c",
+			"core.fsmonitor=false",
+			"ls-files",
+			"--stage",
+			"--",
+		)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -1868,9 +1906,17 @@ func runGit(ctx context.Context, gitDir string, args ...string) (string, error) 
 }
 
 func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) (string, error) {
+	return runGitWithEnvCapture(ctx, gitDir, extraEnv, true, args...)
+}
+
+func runGitDiscardOutputWithEnv(ctx context.Context, gitDir string, extraEnv []string, args ...string) error {
+	_, err := runGitWithEnvCapture(ctx, gitDir, extraEnv, false, args...)
+	return err
+}
+
+func runGitWithEnvCapture(ctx context.Context, gitDir string, extraEnv []string, captureOutput bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	configureCommandProcessGroup(cmd)
-	cmd.Cancel = func() error { return killCommandProcessGroup(cmd) }
+	configureCancelableCommand(cmd)
 	env := os.Environ()
 	if gitDir != "" {
 		env = append(env, "GIT_DIR="+gitDir)
@@ -1879,7 +1925,11 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 	cmd.Env = env
 	buf := &bytes.Buffer{}
 	errBuf := &boundedGitError{limit: maxGitErrorBytes}
-	cmd.Stdout = buf
+	if captureOutput {
+		cmd.Stdout = buf
+	} else {
+		cmd.Stdout = io.Discard
+	}
 	cmd.Stderr = errBuf
 	runErr := cmd.Run()
 	out := strings.TrimSpace(buf.String())
@@ -1914,6 +1964,12 @@ func runGitWithEnv(ctx context.Context, gitDir string, extraEnv []string, args .
 		cause = errors.New(auth.RedactString(runErr.Error()))
 	}
 	return out, &gitCommandError{cause: cause, contextErr: contextErr, retryable: retryable}
+}
+
+func configureCancelableCommand(cmd *exec.Cmd) {
+	configureCommandProcessGroup(cmd)
+	cmd.Cancel = func() error { return killCommandProcessGroup(cmd) }
+	cmd.WaitDelay = gitCommandWaitDelay
 }
 
 // credentialEnv returns a sanitized URL (safe for ps) and env vars that
