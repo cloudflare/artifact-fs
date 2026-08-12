@@ -629,6 +629,50 @@ func TestStartPrepareWorkerTimesOutAndPersistsFailed(t *testing.T) {
 	}
 }
 
+func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.prepareTimeout = 20 * time.Millisecond
+	svc.SetMountRoot(filepath.Join(tmp, "mnt"))
+	defer svc.Close()
+
+	cfg := model.RepoConfig{
+		ID:            "repo",
+		Name:          "repo",
+		Branch:        "main",
+		Enabled:       true,
+		ConfigVersion: "v1",
+	}
+	svc.fillPaths(&cfg)
+	if err := os.MkdirAll(cfg.GitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.registry.AddRepo(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	err = svc.mountRepo(ctx, cfg)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("mountRepo error = %v, want deadline exceeded", err)
+	}
+	if err := svc.withRepoPrepareLock(ctx, cfg.Name, func() error { return nil }); err != nil {
+		t.Fatalf("prepare lock remained held after timeout: %v", err)
+	}
+}
+
 func TestAddRepoSyncFailureIsLoggedAndPersisted(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

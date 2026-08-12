@@ -967,8 +967,10 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	var snap *snapshot.Store
 	var headOID, headRef string
 	var gen int64
-	err := s.withRepoPrepareLock(ctx, cfg.Name, func() error {
-		latest, err := s.registry.GetRepo(ctx, cfg.Name)
+	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
+	defer cancel()
+	err := s.withRepoPrepareLock(prepareCtx, cfg.Name, func() error {
+		latest, err := s.registry.GetRepo(prepareCtx, cfg.Name)
 		if err != nil {
 			return err
 		}
@@ -982,12 +984,12 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		if cfg.PrepareState == "" && cfg.PrepareError != "" {
 			return fmt.Errorf("repo prepare failed: %s", cfg.PrepareError)
 		}
-		snap, headOID, headRef, gen, err = s.ensurePreparedRepo(ctx, cfg, true)
+		snap, headOID, headRef, gen, err = s.ensurePreparedRepo(prepareCtx, cfg, true)
 		if err != nil {
 			return err
 		}
 		if cfg.RequiredCommit == "" {
-			if err := s.git.EnsureIndexInitialized(ctx, cfg); err != nil {
+			if err := s.git.EnsureIndexInitialized(prepareCtx, cfg); err != nil {
 				snap.Close()
 				snap = nil
 				return err
