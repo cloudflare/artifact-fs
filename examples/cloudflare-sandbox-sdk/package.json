@@ -13,10 +13,10 @@
     "types:check": "npm run types -- --check"
   },
   "devDependencies": {
-    "@cloudflare/sandbox": "0.12.4",
-    "@cloudflare/workers-types": "5.20260727.1",
-    "@types/node": "^26.0.1",
-    "typescript": "^6.0.3",
-    "wrangler": "4.114.0"
+    "@cloudflare/sandbox": "0.12.5",
+    "@cloudflare/workers-types": "5.20260812.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "wrangler": "4.121.0"
   }
 }

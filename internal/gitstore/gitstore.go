@@ -708,8 +708,7 @@ func (s *Store) retryGitOperationForRemoteLookup(ctx context.Context, operation 
 }
 
 func gitOperationCauses(err error) (cause error, contextErr error, retryable bool) {
-	var commandErr *gitCommandError
-	if errors.As(err, &commandErr) {
+	if commandErr, ok := errors.AsType[*gitCommandError](err); ok {
 		return commandErr.cause, commandErr.contextErr, commandErr.retryable
 	}
 	return err, nil, isTransientGitError(err)

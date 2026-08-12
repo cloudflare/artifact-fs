@@ -2,7 +2,7 @@
 
 # Build ArtifactFS from this repository, then add it to the stock Sandbox image.
 # Keep the base image's default startup flow intact so the Sandbox SDK still works.
-FROM golang:1.25-bookworm AS artifact-fs-build
+FROM golang:1.26-bookworm AS artifact-fs-build
 
 ARG ARTIFACT_FS_EXTRA_CA_PEM=""
 
@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /artifact-fs ./cmd/artifact-fs
 
-FROM docker.io/cloudflare/sandbox:0.12.4
+FROM docker.io/cloudflare/sandbox:0.12.5
 
 ARG ARTIFACT_FS_EXTRA_CA_PEM=""
 
