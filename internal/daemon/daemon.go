@@ -156,8 +156,7 @@ func withPreparationPhase(phase string, err error) error {
 }
 
 func preparationFailurePhase(err error) string {
-	var phaseErr *preparationPhaseError
-	if errors.As(err, &phaseErr) {
+	if phaseErr, ok := errors.AsType[*preparationPhaseError](err); ok {
 		return phaseErr.phase
 	}
 	return preparePhaseUnknown

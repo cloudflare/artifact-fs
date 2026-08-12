@@ -18,7 +18,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Label low-quality issue or PR
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const label = 'potential-low-quality-pr'
