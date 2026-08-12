@@ -91,6 +91,49 @@ func TestBuildTreeIndexPropagatesBatchCancellation(t *testing.T) {
 	}
 }
 
+func TestBatchResolveSizesDisablesLazyFetch(t *testing.T) {
+	t.Setenv("GIT_NO_LAZY_FETCH", "0")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+if [ "$GIT_NO_LAZY_FETCH" != "1" ]; then
+	echo "GIT_NO_LAZY_FETCH=$GIT_NO_LAZY_FETCH" >&2
+	exit 97
+fi
+if [ "$1" != "cat-file" ] || [ "$2" != "--batch-check" ] || [ "$3" != "--buffer" ]; then
+	echo "unexpected arguments: $*" >&2
+	exit 98
+fi
+while IFS= read -r oid; do
+	printf '%s blob 7\n' "$oid"
+done
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oid := strings.Repeat("a", 40)
+	nodes := []model.BaseNode{
+		{ObjectOID: oid, SizeState: "unknown"},
+		{ObjectOID: oid, SizeState: "unknown"},
+	}
+	err := New(nil).batchResolveSizes(
+		context.Background(),
+		model.RepoConfig{ID: "repo", GitDir: t.TempDir()},
+		nodes,
+		[]string{oid},
+		map[string][]int{oid: {0, 1}},
+	)
+	if err != nil {
+		t.Fatalf("batchResolveSizes: %v", err)
+	}
+	for i, node := range nodes {
+		if node.SizeState != "known" || node.SizeBytes != 7 {
+			t.Fatalf("node %d size = %q/%d, want known/7", i, node.SizeState, node.SizeBytes)
+		}
+	}
+}
+
 func TestBuildTreeIndexPreservesGitlinkAsDirectory(t *testing.T) {
 	t.Parallel()
 	repo := filepath.Join(t.TempDir(), "repo")

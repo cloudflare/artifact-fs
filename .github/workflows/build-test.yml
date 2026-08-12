@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Race test concurrency-sensitive packages
+        run: go test -race ./internal/gitstore ./internal/daemon ./internal/fusefs ./internal/overlay
+
   fuse-e2e:
     runs-on: ubuntu-24.04
     steps:

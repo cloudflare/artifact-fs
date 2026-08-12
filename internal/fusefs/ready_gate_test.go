@@ -44,8 +44,11 @@ func TestReadyGateFailureFailsFastAndCanReset(t *testing.T) {
 	}
 }
 
-func TestReadyGateMarkReadyAfterFailureDoesNotPanic(t *testing.T) {
+func TestReadyGateMarkReadyAfterFailureRecovers(t *testing.T) {
 	g := NewReadyGate(false)
 	g.MarkFailed(errors.New("clone failed"))
 	g.MarkReady()
+	if err := g.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait after failure/ready: %v", err)
+	}
 }

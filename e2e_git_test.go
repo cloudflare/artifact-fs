@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -128,9 +129,12 @@ func (r *mountedE2ERepo) stop(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	select {
-	case <-r.errCh:
+	case err := <-r.errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("daemon exit: %v", err)
+		}
 	case <-time.After(10 * time.Second):
-		t.Log("daemon did not exit within 10s")
+		t.Error("daemon did not exit within 10s")
 	}
 	time.Sleep(200 * time.Millisecond)
 	r.svc = nil
