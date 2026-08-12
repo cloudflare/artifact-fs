@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -119,21 +120,40 @@ func (r *mountedE2ERepo) stop(t *testing.T) {
 	if r.svc == nil {
 		return
 	}
+	svc := r.svc
+	r.svc = nil
 	r.cancel()
-	if err := r.svc.Close(); err != nil {
-		t.Errorf("close daemon: %v", err)
-	}
 	deadline := time.Now().Add(10 * time.Second)
+	shutdownTimer := time.NewTimer(time.Until(deadline))
+	defer shutdownTimer.Stop()
+	closeErrCh := make(chan error, 1)
+	go func() {
+		closeErrCh <- svc.Close()
+	}()
+
+	select {
+	case err := <-closeErrCh:
+		if err != nil {
+			t.Errorf("close daemon: %v", err)
+		}
+	case <-shutdownTimer.C:
+		t.Fatal("Service.Close did not return within 10s")
+	}
 	for isMounted(r.mountPath) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 	}
+	if isMounted(r.mountPath) {
+		t.Fatal("mount remained active after shutdown")
+	}
 	select {
-	case <-r.errCh:
-	case <-time.After(10 * time.Second):
-		t.Log("daemon did not exit within 10s")
+	case err := <-r.errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("daemon exit: %v", err)
+		}
+	case <-shutdownTimer.C:
+		t.Fatal("daemon did not exit within 10s")
 	}
 	time.Sleep(200 * time.Millisecond)
-	r.svc = nil
 }
 
 func (r *mountedE2ERepo) restart(t *testing.T) {

@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -641,7 +642,8 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var logs bytes.Buffer
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -664,9 +666,19 @@ func TestMountRepoPreparationTimesOutAndReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = svc.mountRepo(ctx, cfg)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("mountRepo error = %v, want deadline exceeded", err)
+	started := time.Now()
+	if err := svc.syncRepos(ctx); err != nil {
+		t.Fatalf("syncRepos: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("syncRepos took %v, want bounded mount preparation", elapsed)
+	}
+	failure := findJSONLogRecord(t, logs.Bytes(), "repo mount failed")
+	if got := failure["repo"]; got != "repo" {
+		t.Fatalf("mount failure repo = %v, want repo", got)
+	}
+	if got, _ := failure["error"].(string); !strings.Contains(got, context.DeadlineExceeded.Error()) {
+		t.Fatalf("mount failure error = %q, want deadline exceeded", got)
 	}
 	if err := svc.withRepoPrepareLock(ctx, cfg.Name, func() error { return nil }); err != nil {
 		t.Fatalf("prepare lock remained held after timeout: %v", err)
@@ -1537,6 +1549,25 @@ func waitFor(t *testing.T, timeout time.Duration, ready func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func findJSONLogRecord(t *testing.T, data []byte, message string) map[string]any {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var record map[string]any
+		if err := decoder.Decode(&record); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode log record: %v\n%s", err, data)
+		}
+		if record["msg"] == message {
+			return record
+		}
+	}
+	t.Fatalf("log message %q not found:\n%s", message, data)
+	return nil
 }
 
 func runCmd(t *testing.T, name string, args ...string) {
