@@ -15,14 +15,23 @@ import (
 )
 
 func TestClassifyPriority(t *testing.T) {
-	if got := ClassifyPriority("README.md"); got < PriorityBootstrap {
-		t.Fatalf("README should be boosted, got %d", got)
+	tests := []struct {
+		path string
+		want int
+	}{
+		{path: "README.md", want: PriorityBootstrap},
+		{path: "packages/api/package.json", want: PriorityBootstrap},
+		{path: "src/main.go", want: PriorityLikelyText},
+		{path: "docs/architecture.md", want: PriorityLikelyText},
+		{path: "src/generated", want: PriorityNearbyCode},
+		{path: "assets/logo.png", want: PriorityBinary},
 	}
-	if got := ClassifyPriority("src/main.go"); got < PriorityLikelyText {
-		t.Fatalf("go file should be likely text, got %d", got)
-	}
-	if got := ClassifyPriority("assets/logo.png"); got > PriorityBinary {
-		t.Fatalf("png should be penalized, got %d", got)
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := ClassifyPriority(tt.path); got != tt.want {
+				t.Fatalf("ClassifyPriority(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
 	}
 }
 

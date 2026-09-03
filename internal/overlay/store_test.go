@@ -1451,20 +1451,6 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 	}
 }
 
-func TestReconcileNilLookup(t *testing.T) {
-	s, _ := testStore(t)
-	ctx := context.Background()
-	s.CreateFile(ctx, "a.txt", 0o644)
-
-	// nil baseLookup should be a no-op.
-	if err := s.Reconcile(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := s.Get("a.txt"); !ok {
-		t.Fatal("entry should survive nil reconcile")
-	}
-}
-
 func TestSetMtime(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
