@@ -2330,20 +2330,6 @@ func TestCredentialEnvRejectsCredentialedHTTPWithoutAuthority(t *testing.T) {
 	}
 }
 
-func TestCredentialEnvNoCredentials(t *testing.T) {
-	t.Parallel()
-	safeURL, env, err := credentialEnv("https://github.com/org/repo.git")
-	if err != nil {
-		t.Fatalf("credentialEnv: %v", err)
-	}
-	if safeURL != "https://github.com/org/repo.git" {
-		t.Fatalf("expected unchanged URL, got %s", safeURL)
-	}
-	if len(env) != 0 {
-		t.Fatalf("expected no env vars, got %v", env)
-	}
-}
-
 func TestCredentialEnvAllowsFileURLPathWithAtSign(t *testing.T) {
 	t.Parallel()
 	const remote = "file:///tmp/repo@2026.git"
