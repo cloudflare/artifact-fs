@@ -14,12 +14,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
 	"github.com/cloudflare/artifact-fs/internal/logging"
+	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -30,6 +32,24 @@ type mountedE2ERepo struct {
 	svc       *daemon.Service
 	cancel    context.CancelFunc
 	errCh     chan error
+	logs      *synchronizedBuffer
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
@@ -61,7 +81,8 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := logging.NewJSONLogger(os.Stderr, slog.LevelWarn)
+	logs := &synchronizedBuffer{}
+	logger := logging.NewJSONLogger(io.MultiWriter(os.Stderr, logs), slog.LevelWarn)
 	svc, err := daemon.New(ctx, root, logger)
 	if err != nil {
 		cancel()
@@ -101,6 +122,7 @@ func newMountedE2ERepo(t *testing.T) *mountedE2ERepo {
 		svc:       svc,
 		cancel:    cancel,
 		errCh:     errCh,
+		logs:      logs,
 	}
 	t.Cleanup(func() {
 		repo.close(t)
@@ -161,7 +183,7 @@ func (r *mountedE2ERepo) restart(t *testing.T) {
 	r.stop(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	svc, err := daemon.New(ctx, r.root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	svc, err := daemon.New(ctx, r.root, logging.NewJSONLogger(io.MultiWriter(os.Stderr, r.logs), slog.LevelWarn))
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -192,6 +214,73 @@ func TestE2EGitCleanState(t *testing.T) {
 	if !info.IsDir() {
 		t.Fatalf("gitlink placeholder mode = %s, want directory", info.Mode())
 	}
+}
+
+func TestE2EHEADReconcileRetriesAfterSnapshotLock(t *testing.T) {
+	repo := newMountedE2ERepo(t)
+	gitDir := filepath.Join(repo.root, "repos", repoName, "git")
+	initial, err := repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remoteURL := strings.TrimSpace(run(t, "", "git", "--git-dir", gitDir, "remote", "get-url", "origin"))
+	workDir := filepath.Join(t.TempDir(), "work")
+	run(t, "", "git", "clone", remoteURL, workDir)
+	run(t, workDir, "git", "checkout", "main")
+	run(t, workDir, "git", "config", "user.name", "E2E Reconcile")
+	run(t, workDir, "git", "config", "user.email", "e2e-reconcile@test")
+	wantContent := "# Reconciled after transient snapshot failure\n"
+	writeTestFile(t, workDir, "README.md", wantContent)
+	run(t, workDir, "git", "add", "README.md")
+	run(t, workDir, "git", "commit", "-m", "advance HEAD during snapshot lock")
+	wantOID := strings.TrimSpace(run(t, workDir, "git", "rev-parse", "HEAD"))
+	run(t, "", "git", "--git-dir", gitDir, "fetch", "--no-tags", workDir, wantOID)
+
+	db, err := meta.OpenDB(filepath.Join(repo.root, "meta", repoName+".sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback() })
+	if _, err := tx.Exec(`INSERT INTO repo_state(key,value) VALUES('e2e_reconcile_lock','held')`); err != nil {
+		t.Fatal(err)
+	}
+
+	run(t, "", "git", "--git-dir", gitDir, "update-ref", "refs/heads/main", wantOID, initial.CurrentHEADOID)
+	waitForCondition(t, 15*time.Second, "snapshot publication failure while database is locked", func() (bool, string) {
+		logs := repo.logs.String()
+		return strings.Contains(logs, "snapshot publish failed"), logs
+	})
+	stale, err := repo.svc.Status(context.Background(), repoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.CurrentHEADOID != initial.CurrentHEADOID || stale.SnapshotGeneration != initial.SnapshotGeneration {
+		t.Fatalf("HEAD advanced while snapshot was locked: %+v", stale)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForCondition(t, 15*time.Second, "HEAD reconciliation after snapshot lock release", func() (bool, string) {
+		state, statusErr := repo.svc.Status(context.Background(), repoName)
+		if statusErr != nil {
+			return false, statusErr.Error()
+		}
+		content, readErr := os.ReadFile(filepath.Join(repo.mountPath, "README.md"))
+		if readErr != nil {
+			return false, readErr.Error()
+		}
+		matched := state.CurrentHEADOID == wantOID &&
+			state.SnapshotGeneration == initial.SnapshotGeneration+1 &&
+			string(content) == wantContent
+		return matched, fmt.Sprintf("head=%s generation=%d content=%q", state.CurrentHEADOID, state.SnapshotGeneration, content)
+	})
 }
 
 func TestE2EGitStatusDetectsSameSizeRewriteAfterMtimeRestore(t *testing.T) {
