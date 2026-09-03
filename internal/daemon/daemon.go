@@ -2271,6 +2271,7 @@ func (s *Service) unmount(id model.RepoID) error {
 		s.mu.Lock()
 		rt.stopping = false
 		s.mu.Unlock()
+		s.signalHEADReconcile(rt)
 		return err
 	}
 	s.mu.Lock()

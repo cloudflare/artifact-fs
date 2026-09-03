@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -37,6 +38,19 @@ type headReconcileFixture struct {
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
+}
+
+type delayedUnmountFailure struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (m *delayedUnmountFailure) Join(context.Context) error { return nil }
+
+func (m *delayedUnmountFailure) Unmount() error {
+	close(m.started)
+	<-m.release
+	return errors.New("busy")
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
@@ -380,4 +394,33 @@ func TestHeadReconcileBackoffStopsOnCancellation(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("HEAD reconciliation worker did not stop during retry backoff")
 	}
+}
+
+func TestHeadReconcileResumesAfterUnmountFailure(t *testing.T) {
+	f := newHeadReconcileFixture(t)
+	mfs := &delayedUnmountFailure{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f.svc.mu.Lock()
+	f.rt.mfs = mfs
+	f.svc.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- f.svc.unmount(f.rt.cfg.ID)
+	}()
+	select {
+	case <-mfs.started:
+	case <-time.After(time.Second):
+		t.Fatal("unmount did not start")
+	}
+
+	f.updateMain(f.nextOID)
+	f.signal()
+	close(mfs.release)
+	if err := <-errCh; err == nil {
+		t.Fatal("expected unmount failure")
+	}
+	f.waitForHead(f.nextOID, "main", f.oldGen+1)
 }
