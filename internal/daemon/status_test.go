@@ -66,7 +66,9 @@ func TestRequiredCommitIgnoresHEADWatcher(t *testing.T) {
 		state: model.RepoRuntimeState{CurrentHEADOID: requiredCommit, SnapshotGeneration: 1},
 	}
 	service := &Service{running: map[model.RepoID]*repoRuntime{"verified": runtime}}
-	service.onHEADChanged(context.Background(), runtime)
+	if err := service.reconcileHEAD(context.Background(), runtime); err != nil {
+		t.Fatal(err)
+	}
 	if runtime.state.CurrentHEADOID != requiredCommit || runtime.state.SnapshotGeneration != 1 {
 		t.Fatalf("fixed base changed: %+v", runtime.state)
 	}

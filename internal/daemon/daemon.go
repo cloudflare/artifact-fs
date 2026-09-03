@@ -32,6 +32,8 @@ const DefaultHydrationConcurrency = 4
 
 const (
 	defaultPrepareTimeout    = 30 * time.Minute
+	headReconcileMinBackoff  = time.Second
+	headReconcileMaxBackoff  = 30 * time.Second
 	prepareStateWriteTimeout = 5 * time.Second
 	repoConfigLockRetry      = 25 * time.Millisecond
 	sizeUpdateFlushInterval  = 100 * time.Millisecond
@@ -108,26 +110,27 @@ type mountFailure struct {
 }
 
 type repoRuntime struct {
-	cfg      model.RepoConfig
-	ctx      context.Context
-	cancel   context.CancelFunc
-	snapshot *snapshot.Store
-	overlay  *overlay.Store
-	hydrator *hydrator.Service
-	sizes    *sizeUpdateBatcher
-	resolver *fusefs.Resolver
-	engine   *fusefs.Engine
-	mfs      fusefs.MountedFS
-	gate     *fusefs.ReadyGate
-	state    model.RepoRuntimeState
-	active   bool
-	refresh  chan time.Duration
-	joinDone chan struct{}
-	stopping bool
-	detached bool
-	headMu   sync.Mutex
-	workers  sync.WaitGroup
-	mounts   sync.WaitGroup
+	cfg         model.RepoConfig
+	ctx         context.Context
+	cancel      context.CancelFunc
+	snapshot    *snapshot.Store
+	overlay     *overlay.Store
+	hydrator    *hydrator.Service
+	sizes       *sizeUpdateBatcher
+	resolver    *fusefs.Resolver
+	engine      *fusefs.Engine
+	mfs         fusefs.MountedFS
+	gate        *fusefs.ReadyGate
+	state       model.RepoRuntimeState
+	active      bool
+	refresh     chan time.Duration
+	headChanges chan struct{}
+	joinDone    chan struct{}
+	stopping    bool
+	detached    bool
+	headMu      sync.Mutex
+	workers     sync.WaitGroup
+	mounts      sync.WaitGroup
 }
 
 type aheadBehind struct {
@@ -1589,23 +1592,26 @@ func (s *Service) applyPrepareState(ctx context.Context, cfg model.RepoConfig, s
 	return nil
 }
 
-func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
+func (s *Service) reconcileHEAD(ctx context.Context, rt *repoRuntime) error {
 	rt.headMu.Lock()
 	defer rt.headMu.Unlock()
 	s.mu.Lock()
-	if s.running[rt.cfg.ID] != rt {
+	if s.running[rt.cfg.ID] != rt || rt.stopping {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	cfg := rt.cfg
 	s.mu.Unlock()
 	if cfg.RequiredCommit != "" {
-		return
+		return nil
 	}
 	oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		s.logger.Error("HEAD resolve failed", "repo", cfg.Name, "error", err)
-		return
+		return err
 	}
 	s.mu.Lock()
 	prevOID := rt.state.CurrentHEADOID
@@ -1614,27 +1620,36 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	s.mu.Unlock()
 	if oid == prevOID {
 		if ref == prevRef {
-			return
+			return nil
 		}
 		if err := rt.snapshot.UpdateHEADRef(ctx, ref); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			s.logger.Warn("snapshot head_ref update failed", "repo", cfg.Name, "error", err)
+			return err
 		}
 		s.mu.Lock()
-		rt.state.CurrentHEADRef = ref
+		if s.running[cfg.ID] == rt && !rt.stopping {
+			rt.state.CurrentHEADRef = ref
+		}
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	storedOID, storedRef, gen, stateErr := rt.snapshot.ReadState(ctx)
 	if stateErr != nil || storedOID != oid || storedRef != ref || gen == 0 {
 		var phase string
 		gen, phase, err = s.publishSnapshot(ctx, cfg, rt.snapshot, oid, ref)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			msg := "tree rebuild failed"
 			if phase == snapshotPhasePublish {
 				msg = "snapshot publish failed"
 			}
 			s.logger.Error(msg, "repo", cfg.Name, "error", err)
-			return
+			return err
 		}
 	}
 	baseLookup := func(path string) (model.BaseNode, bool, error) {
@@ -1656,11 +1671,10 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 		s.logger.Warn("overlay reconcile failed", "repo", cfg.Name, "error", err)
-		s.scheduleHEADRetry(rt)
-		return
+		return err
 	}
 
 	s.mu.Lock()
@@ -1671,27 +1685,56 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := rt.snapshot.PruneGenerations(ctx, min(prevGen, gen-1)); err != nil {
 		s.logger.Warn("snapshot generation cleanup failed", "repo", cfg.Name, "error", err)
 	}
+	return nil
 }
 
-func (s *Service) scheduleHEADRetry(rt *repoRuntime) {
+func (s *Service) signalHEADReconcile(rt *repoRuntime) {
 	s.mu.Lock()
-	if rt.stopping {
+	if rt.stopping || s.running[rt.cfg.ID] != rt {
 		s.mu.Unlock()
 		return
 	}
-	rt.workers.Add(1)
+	headChanges := rt.headChanges
 	s.mu.Unlock()
-	go func() {
-		defer rt.workers.Done()
-		timer := time.NewTimer(time.Second)
-		defer timer.Stop()
+	if headChanges == nil {
+		return
+	}
+	select {
+	case headChanges <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) headReconcileLoop(rt *repoRuntime) {
+	backoff := headReconcileMinBackoff
+	for {
 		select {
 		case <-rt.ctx.Done():
 			return
-		case <-timer.C:
-			s.onHEADChanged(rt.ctx, rt)
+		case <-rt.headChanges:
 		}
-	}()
+
+		for {
+			if err := s.reconcileHEAD(rt.ctx, rt); err == nil {
+				backoff = headReconcileMinBackoff
+				break
+			}
+			if rt.ctx.Err() != nil {
+				return
+			}
+
+			timer := time.NewTimer(backoff)
+			select {
+			case <-rt.ctx.Done():
+				timer.Stop()
+				return
+			case <-rt.headChanges:
+				timer.Stop()
+			case <-timer.C:
+			}
+			backoff = min(backoff*2, headReconcileMaxBackoff)
+		}
+	}
 }
 
 func (s *Service) configureStatusOptimization(ctx context.Context, cfg model.RepoConfig) {
@@ -2092,9 +2135,11 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	rt.active = true
 	gitDir := rt.cfg.GitDir
 	fixedBase := rt.cfg.RequiredCommit != ""
-	workerCount := 2
+	workerCount := 3
 	if fixedBase {
 		workerCount = 1
+	} else {
+		rt.headChanges = make(chan struct{}, 1)
 	}
 	rt.workers.Add(workerCount)
 	s.mu.Unlock()
@@ -2105,11 +2150,16 @@ func (s *Service) startRepoBackground(rt *repoRuntime) {
 	}()
 
 	if !fixedBase {
+		go func() {
+			defer rt.workers.Done()
+			s.headReconcileLoop(rt)
+		}()
+
 		w := watcher.New(500 * time.Millisecond)
 		go func() {
 			defer rt.workers.Done()
 			w.Watch(rt.ctx, gitDir, func() {
-				s.onHEADChanged(rt.ctx, rt)
+				s.signalHEADReconcile(rt)
 			})
 		}()
 	}
