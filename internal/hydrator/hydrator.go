@@ -381,6 +381,10 @@ func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig,
 func (s *Service) isVerified(key string, current os.FileInfo) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.isVerifiedLocked(key, current)
+}
+
+func (s *Service) isVerifiedLocked(key string, current os.FileInfo) bool {
 	previous, ok := s.verified[key]
 	if !ok {
 		return false
@@ -413,6 +417,11 @@ func (s *Service) verifyBlobOnce(ctx context.Context, key string, file os.FileIn
 	if s.stopped {
 		s.mu.Unlock()
 		return false, ErrStopped
+	}
+	// A verification can finish between the caller's isVerified check and this lock.
+	if s.isVerifiedLocked(key, file) {
+		s.mu.Unlock()
+		return true, nil
 	}
 	ch := make(chan verifyResult, 1)
 	first := s.verifying.add(key, ch)

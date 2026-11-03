@@ -201,6 +201,47 @@ func TestEnsureHydratedVerifiesUnknownCacheHitOnce(t *testing.T) {
 	}
 }
 
+func TestVerifyBlobOnceReusesVerificationFinishedAfterCheck(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	payload := []byte("content")
+	cfg := model.RepoConfig{ID: "repo", BlobCacheDir: tmp}
+	node := model.BaseNode{RepoID: cfg.ID, Path: "file.txt", ObjectOID: "blob", SizeState: "unknown"}
+	cachePath := filepath.Join(tmp, node.ObjectOID)
+	if err := os.WriteFile(cachePath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &fakeBlobFetcher{payload: payload, verifyOK: true}
+	h := New(fetcher)
+	defer h.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// validateCachedBlob checks isVerified and calls verifyBlobOnce under
+	// separate locks. Replay a reader whose check runs before another reader's
+	// verification finishes and whose verifyBlobOnce runs after it.
+	key := taskKey(cfg.ID, node.ObjectOID)
+	st, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.isVerified(key, st) {
+		t.Fatal("cache file verified before any reader")
+	}
+	if _, _, err := h.EnsureHydrated(ctx, cfg, node); err != nil {
+		t.Fatalf("EnsureHydrated: %v", err)
+	}
+	ok, err := h.verifyBlobOnce(ctx, key, st, cachePath, func(verifyCtx context.Context) (bool, error) {
+		return fetcher.VerifyBlob(verifyCtx, cfg, node.ObjectOID, cachePath)
+	})
+	if err != nil || !ok {
+		t.Fatalf("verifyBlobOnce = %v, %v; want true, nil", ok, err)
+	}
+	if fetcher.VerifyCalls() != 1 {
+		t.Fatalf("verify calls = %d, want 1", fetcher.VerifyCalls())
+	}
+}
+
 func TestEnsureHydratedJoinsActiveFetch(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
