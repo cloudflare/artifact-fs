@@ -1860,8 +1860,11 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 			}
 		}
 	}
-	// Best-effort last fetch time from FETCH_HEAD mtime.
-	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
+	// Best-effort last fetch time from FETCH_HEAD mtime. Git empties
+	// FETCH_HEAD when a fetch starts and fills it once the fetch has the
+	// remote's objects, so an empty FETCH_HEAD is a fetch that failed or is
+	// still running.
+	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil && fi.Size() > 0 {
 		// Verified acquisition itself writes FETCH_HEAD before its receipt.
 		// Only a newer mtime is evidence of a later remote refresh.
 		if cfg.RequiredCommit == "" || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {

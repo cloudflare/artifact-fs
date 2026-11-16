@@ -112,6 +112,36 @@ func TestPersistedVerifiedStatusDoesNotCountAcquisitionAsRefresh(t *testing.T) {
 	}
 }
 
+func TestPersistedStatusDoesNotCountAFailedFetch(t *testing.T) {
+	gitDir := filepath.Join(t.TempDir(), "git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetchHead := filepath.Join(gitDir, "FETCH_HEAD")
+	if err := os.WriteFile(fetchHead, []byte(strings.Repeat("a", 40)+"\t\tbranch 'main' of origin\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(fetchHead, fetchedAt, fetchedAt); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.RepoConfig{ID: "repo", GitDir: gitDir, Branch: "refs/heads/main"}
+	svc := &Service{}
+	st := svc.readPersistedStatus(context.Background(), cfg)
+	if !st.LastFetchAt.Equal(fetchedAt) || st.LastFetchResult != "ok" {
+		t.Fatalf("status after a fetch = %+v, want %v and ok", st, fetchedAt)
+	}
+
+	// A failed fetch leaves FETCH_HEAD empty, with a new mtime.
+	if err := os.WriteFile(fetchHead, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st = svc.readPersistedStatus(context.Background(), cfg)
+	if !st.LastFetchAt.IsZero() || st.LastFetchResult != "never" {
+		t.Fatalf("status after a failed fetch = %+v, want never", st)
+	}
+}
+
 func TestReadPersistedStatusIncludesHydrationStats(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()
