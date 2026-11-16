@@ -1649,7 +1649,7 @@ func TestCloneBloblessPreservesTransportFailureAtCallerDeadline(t *testing.T) {
 	if operationErr.Attempts != 1 || !operationErr.Retryable {
 		t.Fatalf("GitOperationError = %+v, want one retryable attempt", operationErr)
 	}
-	if !strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "signal: killed") {
+	if !strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "signal:") {
 		t.Fatalf("error did not safely preserve transport failure: %v", err)
 	}
 	count, readErr := os.ReadFile(countPath)
@@ -1850,8 +1850,12 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runGit error = %v, want context canceled", err)
+	}
+	if strings.Contains(err.Error(), "signal:") {
+		t.Fatalf("canceled runGit error names the cancellation's signal: %q", err)
 	}
 	time.Sleep(300 * time.Millisecond)
 	if _, err := os.Stat(survived); !errors.Is(err, os.ErrNotExist) {
@@ -1859,14 +1863,14 @@ func TestRunGitCancellationKillsDescendants(t *testing.T) {
 	}
 }
 
-func TestKillCommandProcessGroupReportsExitedProcess(t *testing.T) {
+func TestTerminateCommandProcessGroupReportsExitedProcess(t *testing.T) {
 	cmd := exec.Command("git", "version")
 	configureCommandProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-	if err := killCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
-		t.Fatalf("kill exited process error = %v, want os.ErrProcessDone", err)
+	if err := terminateCommandProcessGroup(cmd); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("terminate exited process error = %v, want os.ErrProcessDone", err)
 	}
 }
 
