@@ -228,6 +228,100 @@ func TestReconcileDoesNotDeleteConcurrentModeChange(t *testing.T) {
 	}
 }
 
+func TestReconcileIgnoresOnlyGroupAndOtherWrite(t *testing.T) {
+	data := []byte("as committed\n")
+	// Each setup leaves an entry at file.txt that holds data with the given
+	// mode. The reconcile compares it with a base at file.txt that holds data.
+	setups := map[string]func(t *testing.T, s *Store, cfg model.RepoConfig, mode uint32){
+		// A file created at a path the commit adds.
+		"create": func(t *testing.T, s *Store, _ model.RepoConfig, mode uint32) {
+			ctx := context.Background()
+			if _, err := s.CreateFile(ctx, "file.txt", mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.WriteFile(ctx, "file.txt", 0, data); err != nil {
+				t.Fatal(err)
+			}
+		},
+		// A tracked file rewritten with what the commit records.
+		"modify": func(t *testing.T, s *Store, cfg model.RepoConfig, mode uint32) {
+			ctx := context.Background()
+			old := []byte("before the commit\n")
+			if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, testBlobOID(old)), old, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.EnsureCopyOnWrite(ctx, cfg, "file.txt", model.BaseNode{Path: "file.txt", Type: "file", Mode: 0o100644, ObjectOID: testBlobOID(old)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Truncate(ctx, "file.txt", 0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.WriteFile(ctx, "file.txt", 0, data); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetMode(ctx, "file.txt", mode); err != nil {
+				t.Fatal(err)
+			}
+		},
+		// A tracked file renamed to the path the commit moves it to.
+		"rename": func(t *testing.T, s *Store, cfg model.RepoConfig, mode uint32) {
+			ctx := context.Background()
+			if err := os.WriteFile(filepath.Join(cfg.BlobCacheDir, testBlobOID(data)), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.EnsureCopyOnWrite(ctx, cfg, "old.txt", model.BaseNode{Path: "old.txt", Type: "file", Mode: 0o100644, ObjectOID: testBlobOID(data)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetMode(ctx, "old.txt", mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Rename(ctx, "old.txt", "file.txt"); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for _, tt := range []struct {
+		name     string
+		setup    string
+		mode     uint32
+		baseMode uint32
+		kept     bool
+	}{
+		{name: "umask 022", setup: "create", mode: 0o644, baseMode: 0o100644},
+		{name: "umask 002", setup: "create", mode: 0o664, baseMode: 0o100644},
+		{name: "umask 000", setup: "create", mode: 0o666, baseMode: 0o100644},
+		{name: "executable under umask 002", setup: "create", mode: 0o775, baseMode: 0o100755},
+		{name: "executable bit", setup: "create", mode: 0o755, baseMode: 0o100644, kept: true},
+		{name: "umask 027", setup: "create", mode: 0o640, baseMode: 0o100644, kept: true},
+		{name: "group read", setup: "create", mode: 0o604, baseMode: 0o100644, kept: true},
+		{name: "modify under umask 002", setup: "modify", mode: 0o664, baseMode: 0o100644},
+		{name: "modify with the executable bit", setup: "modify", mode: 0o755, baseMode: 0o100644, kept: true},
+		{name: "rename under umask 002", setup: "rename", mode: 0o664, baseMode: 0o100644},
+		{name: "rename under umask 027", setup: "rename", mode: 0o640, baseMode: 0o100644, kept: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, cfg := testStore(t)
+			setups[tt.setup](t, s, cfg, tt.mode)
+			if e, ok := s.Get("file.txt"); !ok || e.Mode&0o777 != tt.mode {
+				t.Fatalf("entry before reconcile = %+v, %v; want mode %#o", e, ok, tt.mode)
+			}
+			base := model.BaseNode{Path: "file.txt", Type: "file", Mode: tt.baseMode, ObjectOID: testBlobOID(data)}
+			if err := s.Reconcile(context.Background(), func(path string) (model.BaseNode, bool) {
+				return base, path == base.Path
+			}); err != nil {
+				t.Fatal(err)
+			}
+			e, ok := s.Get("file.txt")
+			switch {
+			case !tt.kept && ok:
+				t.Fatalf("%s entry with mode %#o over a base with mode %#o = %+v, want it reconciled away", tt.setup, tt.mode, tt.baseMode, e)
+			case tt.kept && (!ok || e.Kind != model.OverlayKindModify || e.Mode&0o777 != tt.mode || e.SourceOID != base.ObjectOID || e.SourceMode != tt.baseMode):
+				t.Fatalf("%s entry with mode %#o over a base with mode %#o = %+v, %v; want it kept as a modify of the base with its mode", tt.setup, tt.mode, tt.baseMode, e, ok)
+			}
+		})
+	}
+}
+
 func TestRenameBaseSymlinkReconcilesAfterCommit(t *testing.T) {
 	s, cfg := testStore(t)
 	ctx := context.Background()
