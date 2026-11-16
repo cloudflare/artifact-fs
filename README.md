@@ -90,7 +90,7 @@ Check the state of a mounted repo with `status`:
 | `prepare_error` | Last redacted preparation error, if any |
 | `hydrated_blobs` / `hydrated_bytes` | Blob count and bytes present in the local hydration cache |
 | `overlay_dirty` | `true` if the overlay contains created or modified files; delete-only overlays are not counted |
-| `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when present; otherwise `never` |
+| `last_fetch` / `result` | `FETCH_HEAD` modification time and `ok` when it is present and not empty; otherwise `never`. Git empties `FETCH_HEAD` when a fetch starts, so a failed or running fetch reports `never` |
 
 Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
 
