@@ -982,8 +982,17 @@ func backingMatchesBlobOID(path string, oid string) (bool, error) {
 	return readerMatchesBlobOID(f, st.Size(), oid)
 }
 
+// ignoredModeBits are group and other write. Git ignores them, and each
+// process that writes through the mount applies its own umask, so under
+// umask 002 a file Git writes with its base's content is 0664 where the base
+// records 0644. Every other difference keeps the entry, so a drop only takes
+// away group or other write.
+const ignoredModeBits = 0o022
+
+// overlayEntryMatchesBase reports whether e's content and mode are base's,
+// apart from ignoredModeBits.
 func overlayEntryMatchesBase(e model.OverlayEntry, base model.BaseNode) (bool, error) {
-	if base.Mode != 0 && e.Mode&0o777 != base.Mode&0o777 {
+	if base.Mode != 0 && (e.Mode^base.Mode)&0o777&^ignoredModeBits != 0 {
 		return false, nil
 	}
 	if e.Kind == model.OverlayKindSymlink {
