@@ -3,12 +3,16 @@ package snapshot
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cloudflare/artifact-fs/internal/meta"
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func testStore(t *testing.T) *Store {
@@ -52,6 +56,85 @@ func TestPublishAndGetNode(t *testing.T) {
 	if ok {
 		t.Fatal("expected not found")
 	}
+}
+
+// otherWriter opens a second connection to the database at path, as another
+// process would. Its busy_timeout is 0, so it fails at once instead of waiting
+// for the write lock.
+func otherWriter(t *testing.T, path string) *sql.Conn {
+	t.Helper()
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=busy_timeout(0)"}).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	return conn
+}
+
+// The CLI's sync prepare and the daemon's HEAD reconcile publish into one
+// database. SQLite fails a deferred transaction's upgrade from a read to a
+// write at once with SQLITE_BUSY, without the busy handler, while another
+// connection holds the write lock. So a publish holds the write lock from its
+// read of the current generation, and another writer waits for it.
+func TestPublishHoldsTheWriteLockFromItsGenerationRead(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "snap.sqlite")
+	s, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	conn := otherWriter(t, path)
+	var lockErr error
+	testHookAfterGenerationRead = func() {
+		if _, lockErr = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); lockErr == nil {
+			lockErr = errors.New("the other writer took the write lock")
+		}
+	}
+	defer func() { testHookAfterGenerationRead = nil }()
+
+	gen, err := s.PublishGeneration(ctx, "head1", "main", []model.BaseNode{{RepoID: "r", Path: ".", Type: "dir", Mode: 0o755, SizeState: "known"}})
+	// The other writer holds the lock only when it took it inside the publish.
+	_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+	if err != nil {
+		t.Fatalf("publish with another writer between its read and its write: %v", err)
+	}
+	if sqliteErr, ok := errors.AsType[*sqlite.Error](lockErr); !ok || sqliteErr.Code()&0xff != sqlite3.SQLITE_BUSY {
+		t.Fatalf("other writer inside the publish: %v; want SQLITE_BUSY", lockErr)
+	}
+	if gen != 1 {
+		t.Fatalf("published generation %d, want 1", gen)
+	}
+}
+
+// Opening a store on a current schema only reads, as status does for each
+// repo, so it does not wait for another connection's write.
+func TestNewOnACurrentSchemaDoesNotWaitForAWriter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "snap.sqlite")
+	s, err := New(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	conn := otherWriter(t, path)
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(ctx, `ROLLBACK`)
+
+	s, err = New(ctx, path)
+	if err != nil {
+		t.Fatalf("open while another connection holds the write lock: %v", err)
+	}
+	s.Close()
 }
 
 func TestListChildren(t *testing.T) {

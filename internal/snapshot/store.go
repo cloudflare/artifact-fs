@@ -55,6 +55,10 @@ func New(ctx context.Context, path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// testHookAfterGenerationRead, when set, runs in PublishGeneration between its
+// read of the current generation and its first write.
+var testHookAfterGenerationRead func()
+
 func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref string, nodes []model.BaseNode) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -65,6 +69,9 @@ func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref strin
 	gen, err := s.nextGenerationTx(ctx, tx)
 	if err != nil {
 		return 0, err
+	}
+	if testHookAfterGenerationRead != nil {
+		testHookAfterGenerationRead()
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM base_nodes WHERE generation=?`, gen); err != nil {
 		return 0, err
