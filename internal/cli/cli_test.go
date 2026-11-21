@@ -196,3 +196,18 @@ func TestPrepareCLIReportsQueuedPrepare(t *testing.T) {
 		t.Fatalf("stdout = %q, want preparing repo", got)
 	}
 }
+
+func TestUnimplementedCommandsFail(t *testing.T) {
+	for _, command := range []string{"doctor", "gc", "prefetch", "evict-cache"} {
+		t.Run(command, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := Run(context.Background(), []string{command}, &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("%s reported success without performing its operation", command)
+			}
+			if stdout.Len() != 0 || !strings.Contains(stderr.String(), command+" not implemented yet") {
+				t.Fatalf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}

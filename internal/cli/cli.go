@@ -235,10 +235,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				return nil
 			}),
 		},
-		stubCommand("evict-cache", "evict blob cache", stdout),
-		stubCommand("gc", "garbage collect", stdout),
-		stubCommand("doctor", "check repo health", stdout),
-		stubCommand("prefetch", "prefetch blobs", stdout),
+		stubCommand("evict-cache", "evict blob cache"),
+		stubCommand("gc", "garbage collect"),
+		stubCommand("doctor", "check repo health"),
+		stubCommand("prefetch", "prefetch blobs"),
 	}
 
 	if err := app.Run(append([]string{"artifact-fs"}, args...)); err != nil {
@@ -328,14 +328,13 @@ func formatPrepareError(err string) string {
 	return strings.Join(strings.Fields(auth.RedactString(err)), "_")
 }
 
-func stubCommand(name, usage string, stdout io.Writer) ucli.Command {
+func stubCommand(name, usage string) ucli.Command {
 	return ucli.Command{
 		Name:  name,
 		Usage: usage,
 		Flags: []ucli.Flag{ucli.StringFlag{Name: "name", Usage: "repo name"}},
 		Action: func(c *ucli.Context) error {
-			fmt.Fprintf(stdout, "%s not implemented yet\n", name)
-			return nil
+			return fmt.Errorf("%s not implemented yet", name)
 		},
 	}
 }
