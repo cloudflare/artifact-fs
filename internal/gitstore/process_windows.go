@@ -9,6 +9,8 @@ import (
 
 func configureCommandProcessGroup(_ *exec.Cmd) {}
 
+func configureBatchSession(_ *exec.Cmd) {}
+
 func killCommandProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone

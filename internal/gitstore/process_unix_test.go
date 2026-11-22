@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/artifact-fs/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 func TestRunGitCancellationClosesEscapedDescriptorPipes(t *testing.T) {
@@ -125,4 +127,38 @@ func TestRunGitEscapedDescriptorHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	time.Sleep(10 * time.Second)
+}
+
+func TestBatchCatFileDisablesPrompts(t *testing.T) {
+	repo := t.TempDir()
+	run(t, "git", "init", repo)
+	settings := map[string]string{
+		"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": "",
+		"SSH_ASKPASS_REQUIRE": "never", "GIT_SSH_COMMAND": "custom-ssh",
+	}
+	for key := range settings {
+		t.Setenv(key, "inherited")
+	}
+	t.Setenv("GIT_SSH_COMMAND", "custom-ssh")
+	batch, err := newBatchCatFile(filepath.Join(repo, ".git"), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(batch.kill)
+	for _, entry := range batch.cmd.Environ() {
+		key, value, _ := strings.Cut(entry, "=")
+		if want, ok := settings[key]; ok {
+			if value != want {
+				t.Errorf("%s = %q, want %q", key, value, want)
+			}
+			delete(settings, key)
+		}
+	}
+	if len(settings) > 0 {
+		t.Errorf("missing environment settings: %v", settings)
+	}
+	pid := batch.cmd.Process.Pid
+	if sid, err := unix.Getsid(pid); err != nil || sid != pid {
+		t.Errorf("batch session ID = %d, %v, want %d", sid, err, pid)
+	}
 }
