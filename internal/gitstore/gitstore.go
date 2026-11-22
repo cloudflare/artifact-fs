@@ -1611,9 +1611,16 @@ type batchCatFile struct {
 
 func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
 	cmd := exec.Command("git", "cat-file", "--batch")
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	// Lazy fetches inherit authentication configuration but must never prompt.
+	cmd.Env = append(os.Environ(),
+		"GIT_DIR="+gitDir,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"SSH_ASKPASS=",
+		"SSH_ASKPASS_REQUIRE=never",
+	)
 	cmd.Stderr = os.Stderr
-	configureCommandProcessGroup(cmd)
+	configureBatchSession(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
